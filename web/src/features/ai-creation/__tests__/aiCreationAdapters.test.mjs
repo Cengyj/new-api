@@ -17,6 +17,7 @@ import {
   GROK_VIDEO_MODEL,
   IMAGE_MODEL_WHITELIST,
   TASK_STATUS,
+  VIDEO_MODEL_WHITELIST,
   createImageGenerationParams,
   getImageSizeForModel,
   getImageAdapterKeyForModel,
@@ -52,11 +53,94 @@ import {
   createCreationResultGroupStats,
   normalizeCreationResultGroupStats,
 } from '../creationResultGroupAdapters.js';
+import {
+  getAllowedCreationGroups,
+  getAllowedCreationModels,
+  mergePricingIntoModels,
+} from '../creationModelAccess.js';
 
 const main = async () => {
   assert.equal(resolveCreationTab('image'), 'image');
   assert.equal(resolveCreationTab('unknown'), 'chat');
   assert.equal(resolveCreationTab(undefined), 'chat');
+
+  const mergedModels = mergePricingIntoModels(
+    [{ value: 'gpt-image-2' }, { value: 'grok-imagine-video' }],
+    [
+      {
+        model_name: 'gpt-image-2',
+        quota_type: 1,
+        model_price: 0.42,
+      },
+    ],
+  );
+  assert.equal(mergedModels[0].quota_type, 1);
+  assert.equal(mergedModels[0].model_price, 0.42);
+  assert.equal(mergedModels[1].quota_type, undefined);
+
+  const capturedGroups = [{ value: 'default' }, { value: 'vip' }];
+  const capturedModels = [
+    { value: 'gpt-5.2' },
+    { value: 'gpt-image-2' },
+    { value: 'grok-imagine-video' },
+  ];
+  assert.deepEqual(
+    [...getAllowedCreationGroups({
+      groups: capturedGroups,
+      models: capturedModels,
+      groupModels: undefined,
+      whitelist: IMAGE_MODEL_WHITELIST,
+    })].sort(),
+    ['default', 'vip'],
+  );
+  assert.equal(
+    getAllowedCreationModels({
+      models: capturedModels,
+      groupModels: undefined,
+      whitelist: IMAGE_MODEL_WHITELIST,
+    }).has('gpt-image-2'),
+    true,
+  );
+  assert.equal(
+    getAllowedCreationModels({
+      models: capturedModels,
+      groupModels: undefined,
+      whitelist: VIDEO_MODEL_WHITELIST,
+    }).has('grok-imagine-video'),
+    true,
+  );
+
+  const groupedModels = {
+    default: ['gpt-5.2'],
+    vip: ['gpt-image-2', 'grok-imagine-video'],
+  };
+  assert.deepEqual(
+    [...getAllowedCreationGroups({
+      groups: capturedGroups,
+      models: capturedModels,
+      groupModels: groupedModels,
+      whitelist: IMAGE_MODEL_WHITELIST,
+    })],
+    ['vip'],
+  );
+  assert.equal(
+    getAllowedCreationModels({
+      models: capturedModels,
+      groupModels: groupedModels,
+      whitelist: IMAGE_MODEL_WHITELIST,
+      selectedGroup: 'default',
+    }).size,
+    0,
+  );
+  assert.equal(
+    getAllowedCreationModels({
+      models: capturedModels,
+      groupModels: groupedModels,
+      whitelist: IMAGE_MODEL_WHITELIST,
+      selectedGroup: 'vip',
+    }).has('gpt-image-2'),
+    true,
+  );
 
   const orphanResultItems = createCreationResultGroupItems({
     completedItems: [{ id: 'result-1', url: 'https://example.com/a.png' }],

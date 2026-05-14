@@ -84,6 +84,11 @@ import {
   isCreationTaskActive,
   isCreationTaskCancelled,
 } from './creationTaskUtils.js';
+import {
+  getAllowedCreationGroups,
+  getAllowedCreationModels,
+} from './creationModelAccess.js';
+import { useCreationPricing } from './useCreationPricing.js';
 import VideoSingleTab from './VideoSingleTab.jsx';
 import VideoBatchTab from './VideoBatchTab.jsx';
 import { loadVideoBatchRows } from './videoBatchTable.js';
@@ -149,32 +154,30 @@ export default function VideoGenerationTab() {
     setGroups,
     setGroupModels,
   );
+  const pricedModels = useCreationPricing(models);
 
-  const allowedGroupSet = useMemo(() => {
-    const set = new Set();
-    Object.entries(groupModels || {}).forEach(([group, list]) => {
-      if (
-        Array.isArray(list) &&
-        list.some((m) => VIDEO_MODEL_WHITELIST.includes(m))
-      ) {
-        set.add(group);
-      }
-    });
-    return set;
-  }, [groupModels]);
+  const allowedGroupSet = useMemo(
+    () =>
+      getAllowedCreationGroups({
+        groups,
+        models: pricedModels,
+        groupModels,
+        whitelist: VIDEO_MODEL_WHITELIST,
+      }),
+    [groups, pricedModels, groupModels],
+  );
 
-  const allowedVideoModelSet = useMemo(() => {
-    const set = new Set();
-    const effectiveGroups = inputs.group
-      ? [inputs.group]
-      : Array.from(allowedGroupSet);
-    effectiveGroups.forEach((group) => {
-      (groupModels?.[group] || []).forEach((m) => {
-        if (VIDEO_MODEL_WHITELIST.includes(m)) set.add(m);
-      });
-    });
-    return set;
-  }, [allowedGroupSet, groupModels, inputs.group]);
+  const allowedVideoModelSet = useMemo(
+    () =>
+      getAllowedCreationModels({
+        models: pricedModels,
+        groupModels,
+        whitelist: VIDEO_MODEL_WHITELIST,
+        selectedGroup: inputs.group,
+        allowedGroupSet,
+      }),
+    [pricedModels, groupModels, inputs.group, allowedGroupSet],
+  );
 
   const filteredGroups = useMemo(
     () => (groups || []).filter((g) => allowedGroupSet.has(g.value)),
@@ -183,8 +186,10 @@ export default function VideoGenerationTab() {
 
   const filteredModels = useMemo(
     () =>
-      (models || []).filter((option) => allowedVideoModelSet.has(option.value)),
-    [models, allowedVideoModelSet],
+      (pricedModels || []).filter((option) =>
+        allowedVideoModelSet.has(option.value),
+      ),
+    [pricedModels, allowedVideoModelSet],
   );
 
   const hasAnyVideoModel = allowedGroupSet.size > 0;

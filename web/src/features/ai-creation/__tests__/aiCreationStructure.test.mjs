@@ -79,6 +79,12 @@ const videoSingleSource = read('features/ai-creation/VideoSingleTab.jsx');
 const imageBatchSource = read('features/ai-creation/ImageBatchTab.jsx');
 const videoBatchSource = read('features/ai-creation/VideoBatchTab.jsx');
 const chatTabSource = read('features/ai-creation/ChatTab.jsx');
+const creationModelAccessSource = read(
+  'features/ai-creation/creationModelAccess.js',
+);
+const creationPricingSource = read(
+  'features/ai-creation/useCreationPricing.js',
+);
 const aiCreationSharedSource = read(
   'features/ai-creation/AiCreationShared.jsx',
 );
@@ -128,6 +134,9 @@ for (const required of [
   'ai-creation-route-chip',
   'ImageSingleTab',
   'ImageBatchTab',
+  'getAllowedCreationGroups',
+  'getAllowedCreationModels',
+  'useCreationPricing',
   'useScenePreference',
   'IMAGE_MODEL_WHITELIST',
   'subscribeImageTasks',
@@ -153,6 +162,18 @@ for (const [sourceName, source] of [
     `${sourceName} must not import or render the retired SingleCreationWorks chain.`,
   );
 }
+
+assert(
+  creationModelAccessSource.includes('getWhitelistedModelValues') &&
+    creationModelAccessSource.includes('hasGroupedModelMap'),
+  'creationModelAccess must preserve local whitelist fallback when grouped models are absent.',
+);
+
+assert(
+  creationPricingSource.includes("'/api/pricing'") &&
+    creationPricingSource.includes('mergePricingIntoModels'),
+  'useCreationPricing must load pricing and merge it into model options.',
+);
 
 for (const required of [
   'function ComposerSelect',
@@ -220,6 +241,9 @@ for (const required of [
   'ai-creation-route-chip',
   'VideoSingleTab',
   'VideoBatchTab',
+  'getAllowedCreationGroups',
+  'getAllowedCreationModels',
+  'useCreationPricing',
   'useScenePreference',
   'VIDEO_MODEL_WHITELIST',
   'subscribeVideoTasks',

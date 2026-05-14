@@ -96,6 +96,11 @@ import {
   isCreationTaskActive,
   isCreationTaskCancelled,
 } from './creationTaskUtils.js';
+import {
+  getAllowedCreationGroups,
+  getAllowedCreationModels,
+} from './creationModelAccess.js';
+import { useCreationPricing } from './useCreationPricing.js';
 import ImageSingleTab from './ImageSingleTab.jsx';
 import ImageBatchTab from './ImageBatchTab.jsx';
 import './imageBatchExcel.css';
@@ -163,32 +168,30 @@ export default function ImageGenerationTab() {
     setGroups,
     setGroupModels,
   );
+  const pricedModels = useCreationPricing(models);
 
-  const allowedGroupSet = useMemo(() => {
-    const set = new Set();
-    Object.entries(groupModels || {}).forEach(([group, list]) => {
-      if (
-        Array.isArray(list) &&
-        list.some((m) => IMAGE_MODEL_WHITELIST.includes(m))
-      ) {
-        set.add(group);
-      }
-    });
-    return set;
-  }, [groupModels]);
+  const allowedGroupSet = useMemo(
+    () =>
+      getAllowedCreationGroups({
+        groups,
+        models: pricedModels,
+        groupModels,
+        whitelist: IMAGE_MODEL_WHITELIST,
+      }),
+    [groups, pricedModels, groupModels],
+  );
 
-  const allowedImageModelSet = useMemo(() => {
-    const set = new Set();
-    const effectiveGroups = inputs.group
-      ? [inputs.group]
-      : Array.from(allowedGroupSet);
-    effectiveGroups.forEach((group) => {
-      (groupModels?.[group] || []).forEach((m) => {
-        if (IMAGE_MODEL_WHITELIST.includes(m)) set.add(m);
-      });
-    });
-    return set;
-  }, [allowedGroupSet, groupModels, inputs.group]);
+  const allowedImageModelSet = useMemo(
+    () =>
+      getAllowedCreationModels({
+        models: pricedModels,
+        groupModels,
+        whitelist: IMAGE_MODEL_WHITELIST,
+        selectedGroup: inputs.group,
+        allowedGroupSet,
+      }),
+    [pricedModels, groupModels, inputs.group, allowedGroupSet],
+  );
 
   const filteredGroups = useMemo(
     () => (groups || []).filter((g) => allowedGroupSet.has(g.value)),
@@ -197,8 +200,10 @@ export default function ImageGenerationTab() {
 
   const filteredModels = useMemo(
     () =>
-      (models || []).filter((option) => allowedImageModelSet.has(option.value)),
-    [models, allowedImageModelSet],
+      (pricedModels || []).filter((option) =>
+        allowedImageModelSet.has(option.value),
+      ),
+    [pricedModels, allowedImageModelSet],
   );
 
   const hasAnyImageModel = allowedGroupSet.size > 0;
