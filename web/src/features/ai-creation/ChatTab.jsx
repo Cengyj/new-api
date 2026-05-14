@@ -170,21 +170,54 @@ const ChatTab = () => {
   );
   const hasChatOptions = (models || []).length > 0 && (groups || []).length > 0;
 
+  const hasGroupedModelMap = useMemo(
+    () =>
+      Object.values(groupModels || {}).some((list) => Array.isArray(list)),
+    [groupModels],
+  );
+
+  const filteredGroups = useMemo(() => {
+    if (!hasGroupedModelMap) return groups || [];
+
+    return (groups || []).filter((option) => {
+      const group = getOptionValue(option);
+      const groupList = groupModels?.[group];
+      return (
+        Array.isArray(groupList) &&
+        groupList.some((model) => allowedModelSet.has(String(model)))
+      );
+    });
+  }, [allowedModelSet, groupModels, groups, hasGroupedModelMap]);
+
+  const filteredGroupSet = useMemo(
+    () => new Set(filteredGroups.map((option) => getOptionValue(option))),
+    [filteredGroups],
+  );
+
+  const effectiveChatGroup = useMemo(() => {
+    if (inputs.group && filteredGroupSet.has(inputs.group)) {
+      return inputs.group;
+    }
+    return filteredGroups[0] ? getOptionValue(filteredGroups[0]) : '';
+  }, [filteredGroupSet, filteredGroups, inputs.group]);
+
+  const groupForModelScope = effectiveChatGroup || inputs.group;
+
   const { hydrated } = useScenePreference({
     scene: 'chat',
     inputs,
     handleInputChange: handleChatInputChange,
     allowedModelSet,
-    allowedGroupSet,
+    allowedGroupSet:
+      filteredGroupSet.size > 0 ? filteredGroupSet : allowedGroupSet,
     groupModels,
     ready: hasChatOptions,
   });
 
   const scopedModels = useMemo(() => {
-    const hasGroupedModelMap = Object.values(groupModels || {}).some((list) =>
-      Array.isArray(list),
-    );
-    const groupList = inputs.group ? groupModels?.[inputs.group] : null;
+    const groupList = groupForModelScope
+      ? groupModels?.[groupForModelScope]
+      : null;
     if (!hasGroupedModelMap) return models;
     if (!Array.isArray(groupList) || groupList.length === 0) return [];
 
@@ -192,27 +225,61 @@ const ChatTab = () => {
     return (models || []).filter((option) =>
       allowedModels.has(getOptionValue(option)),
     );
-  }, [groupModels, inputs.group, models]);
+  }, [groupForModelScope, groupModels, hasGroupedModelMap, models]);
+
+  const effectiveChatModel = useMemo(() => {
+    if (
+      inputs.model &&
+      scopedModels.some((option) => getOptionValue(option) === inputs.model)
+    ) {
+      return inputs.model;
+    }
+    return scopedModels[0] ? getOptionValue(scopedModels[0]) : '';
+  }, [inputs.model, scopedModels]);
+
+  const effectiveInputs = useMemo(
+    () => ({
+      ...inputs,
+      group: effectiveChatGroup,
+      model: effectiveChatModel,
+    }),
+    [effectiveChatGroup, effectiveChatModel, inputs],
+  );
+
+  useEffect(() => {
+    if (!hydrated) return;
+    if (effectiveChatGroup && effectiveChatGroup !== inputs.group) {
+      handleChatInputChange('group', effectiveChatGroup);
+    }
+  }, [
+    effectiveChatGroup,
+    handleChatInputChange,
+    hydrated,
+    inputs.group,
+  ]);
 
   useEffect(() => {
     if (!hydrated) return;
     if (!inputs.model || scopedModels.length === 0) return;
-    const hasCurrentModel = scopedModels.some(
-      (option) => getOptionValue(option) === inputs.model,
-    );
-    if (!hasCurrentModel) {
-      handleChatInputChange('model', getOptionValue(scopedModels[0]));
+    if (effectiveChatModel && effectiveChatModel !== inputs.model) {
+      handleChatInputChange('model', effectiveChatModel);
     }
-  }, [handleChatInputChange, hydrated, inputs.model, scopedModels]);
+  }, [
+    effectiveChatModel,
+    handleChatInputChange,
+    hydrated,
+    inputs.model,
+    scopedModels.length,
+  ]);
 
   const chatRuntime = useMemo(
     () =>
       resolveChatRuntime({
-        inputs,
+        inputs: effectiveInputs,
         models: scopedModels,
-        groups,
+        groups: filteredGroups,
       }),
-    [groups, inputs, scopedModels],
+    [effectiveInputs, filteredGroups, scopedModels],
   );
 
   const runtimeStatusText = useMemo(() => {
@@ -361,7 +428,7 @@ const ChatTab = () => {
       const loadingMessage = createLoadingAssistantMessage();
       const messagesWithLoading = [...nextMessages, loadingMessage];
       const requestInputs = {
-        ...inputs,
+        ...effectiveInputs,
         imageEnabled: apiAttachments.some(
           (attachment) => attachment.kind === 'image',
         ),
@@ -396,10 +463,10 @@ const ChatTab = () => {
       chatRuntime.capabilities,
       chatRuntime.sendDisabledReasonKey,
       clearAttachments,
+      effectiveInputs,
       ensureActiveSession,
       getCurrentMessages,
       handleChatInputChange,
-      inputs,
       isGenerating,
       parameterEnabled,
       readAttachmentsForRequest,
@@ -613,8 +680,8 @@ const ChatTab = () => {
             setSidebarCollapsed={setSidebarCollapsed}
             setMobileSidebarOpen={setMobileSidebarOpen}
             models={scopedModels}
-            groups={groups}
-            inputs={inputs}
+            groups={filteredGroups}
+            inputs={effectiveInputs}
             handleInputChange={handleChatInputChange}
             activeTitle={activeSession?.title || t('新对话')}
             updatedAtLabel={getSessionTimestampLabel(activeSession, t)}
@@ -651,7 +718,7 @@ const ChatTab = () => {
             <ChatArea
               chatRef={chatRef}
               message={message}
-              inputs={inputs}
+              inputs={effectiveInputs}
               styleState={styleState}
               showDebugPanel={false}
               roleInfo={roleInfo}

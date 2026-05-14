@@ -181,21 +181,33 @@ export default function ImageGenerationTab() {
     [groups, pricedModels, groupModels],
   );
 
+  const filteredGroups = useMemo(
+    () => (groups || []).filter((g) => allowedGroupSet.has(g.value)),
+    [groups, allowedGroupSet],
+  );
+
+  const effectiveImageGroup = allowedGroupSet.has(inputs.group)
+    ? inputs.group
+    : filteredGroups[0]?.value || inputs.group;
+
+  const effectiveInputs = useMemo(
+    () =>
+      effectiveImageGroup === inputs.group
+        ? inputs
+        : { ...inputs, group: effectiveImageGroup },
+    [effectiveImageGroup, inputs],
+  );
+
   const allowedImageModelSet = useMemo(
     () =>
       getAllowedCreationModels({
         models: pricedModels,
         groupModels,
         whitelist: IMAGE_MODEL_WHITELIST,
-        selectedGroup: inputs.group,
+        selectedGroup: effectiveImageGroup,
         allowedGroupSet,
       }),
-    [pricedModels, groupModels, inputs.group, allowedGroupSet],
-  );
-
-  const filteredGroups = useMemo(
-    () => (groups || []).filter((g) => allowedGroupSet.has(g.value)),
-    [groups, allowedGroupSet],
+    [pricedModels, groupModels, effectiveImageGroup, allowedGroupSet],
   );
 
   const filteredModels = useMemo(
@@ -220,31 +232,29 @@ export default function ImageGenerationTab() {
 
   useEffect(() => {
     if (!hasAnyImageModel) return;
-    if (!hydrated) return;
-    if (!allowedGroupSet.has(inputs.group)) {
-      handleInputChange('group', filteredGroups[0]?.value || '');
+    if (!allowedGroupSet.has(inputs.group) && effectiveImageGroup) {
+      handleInputChange('group', effectiveImageGroup);
     }
   }, [
     hasAnyImageModel,
-    hydrated,
     allowedGroupSet,
     inputs.group,
+    effectiveImageGroup,
     handleInputChange,
-    filteredGroups,
   ]);
 
   useEffect(() => {
     if (!hasAnyImageModel) return;
     if (!hydrated) return;
     if (filteredModels.length === 0) return;
-    if (!allowedImageModelSet.has(inputs.model)) {
+    if (!allowedImageModelSet.has(effectiveInputs.model)) {
       handleInputChange('model', filteredModels[0].value);
     }
   }, [
     hasAnyImageModel,
     hydrated,
     allowedImageModelSet,
-    inputs.model,
+    effectiveInputs.model,
     filteredModels,
     handleInputChange,
   ]);
@@ -613,7 +623,7 @@ export default function ImageGenerationTab() {
           <div className='ai-creation-composer-wrap mx-auto max-w-[1100px]'>
             {hasAnyImageModel ? (
               <ImageSingleTab
-                inputs={inputs}
+                inputs={effectiveInputs}
                 models={filteredModels}
                 groups={filteredGroups}
                 handleInputChange={handleInputChange}
@@ -773,7 +783,7 @@ export default function ImageGenerationTab() {
         <div className='ai-creation-batch-pane ai-creation-image-batch-pane mt-4'>
           {hasAnyImageModel ? (
             <ImageBatchTab
-              inputs={inputs}
+              inputs={effectiveInputs}
               models={filteredModels}
               groups={filteredGroups}
               handleInputChange={handleInputChange}

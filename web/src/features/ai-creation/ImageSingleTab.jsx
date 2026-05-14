@@ -342,13 +342,11 @@ export default function ImageSingleTab({
           >
             <Paperclip size={18} />
           </button>
-          {groupOptions.length > 1 && (
-            <ComposerSelect
-              value={inputs.group || groupOptions[0]?.value || ''}
-              onChange={(value) => handleInputChange('group', value)}
-              options={groupOptions}
-            />
-          )}
+          <ComposerSelect
+            value={inputs.group || groupOptions[0]?.value || ''}
+            onChange={(value) => handleInputChange('group', value)}
+            options={groupOptions}
+          />
           <ComposerSelect
             value={inputs.model || modelOptions[0]?.value || ''}
             onChange={(value) => handleInputChange('model', value)}

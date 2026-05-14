@@ -1840,13 +1840,11 @@ export default function ImageBatchTab({
             }
             right={
               <>
-                {groupOptions.length > 1 && (
-                  <ComposerSelect
-                    value={inputs.group || groupOptions[0]?.value || ''}
-                    options={groupOptions}
-                    onChange={(value) => handleInputChange('group', value)}
-                  />
-                )}
+                <ComposerSelect
+                  value={inputs.group || groupOptions[0]?.value || ''}
+                  options={groupOptions}
+                  onChange={(value) => handleInputChange('group', value)}
+                />
                 <ComposerSelect
                   value={inputs.model || modelOptions[0]?.value || ''}
                   options={modelOptions}
