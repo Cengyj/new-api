@@ -343,6 +343,17 @@ const BatchImageResultTile = ({ item }) => {
   );
 };
 
+const resolveLatestOptionValue = (refValue, inputValue, options = []) => {
+  const optionValues = new Set(options.map((option) => String(option.value)));
+  if (refValue && (!optionValues.size || optionValues.has(String(refValue)))) {
+    return refValue;
+  }
+  if (inputValue && (!optionValues.size || optionValues.has(String(inputValue)))) {
+    return inputValue;
+  }
+  return options[0]?.value || '';
+};
+
 export default function ImageBatchTab({
   inputs,
   models,
@@ -424,6 +435,8 @@ export default function ImageBatchTab({
   const skipNextHistoryRef = useRef(false);
   const tableRef = useRef(null);
   const resultsGridRef = useRef(null);
+  const selectedGroupRef = useRef(inputs.group || '');
+  const selectedModelRef = useRef(inputs.model || '');
 
   // model/group options
   const modelOptions = useMemo(() => {
@@ -453,9 +466,20 @@ export default function ImageBatchTab({
         : [];
   }, [groups, inputs.group]);
 
+  const effectiveImageModel = resolveLatestOptionValue(
+    selectedModelRef.current,
+    inputs.model,
+    modelOptions,
+  );
+  const effectiveImageGroup = resolveLatestOptionValue(
+    selectedGroupRef.current,
+    inputs.group,
+    groupOptions,
+  );
+
   const parameterState = useMemo(
-    () => getImageParameterState(inputs.model),
-    [inputs.model],
+    () => getImageParameterState(effectiveImageModel),
+    [effectiveImageModel],
   );
   const batchSizeOptions = useMemo(
     () => [
@@ -471,6 +495,14 @@ export default function ImageBatchTab({
   );
   const imageQualityOptions = parameterState.qualityOptions;
   const showQuality = parameterState.supportsQuality;
+
+  useEffect(() => {
+    selectedModelRef.current = inputs.model || modelOptions[0]?.value || '';
+  }, [inputs.model, modelOptions]);
+
+  useEffect(() => {
+    selectedGroupRef.current = inputs.group || groupOptions[0]?.value || '';
+  }, [inputs.group, groupOptions]);
 
   useEffect(() => {
     if (!showQuality) return;
@@ -1198,8 +1230,8 @@ export default function ImageBatchTab({
       for (const { row, idx } of validRows) {
         const imageParams = createBatchRowImageParams(row, {
           quality: resolution,
-          model: inputs.model,
-          group: inputs.group,
+          model: selectedModelRef.current || effectiveImageModel,
+          group: selectedGroupRef.current || effectiveImageGroup,
           source: IMAGE_TASK_SOURCE.BATCH,
           batchRowIndex: idx,
         });
@@ -1245,8 +1277,8 @@ export default function ImageBatchTab({
       setIsSubmitting(false);
     }
   }, [
-    inputs.model,
-    inputs.group,
+    effectiveImageModel,
+    effectiveImageGroup,
     selectedRows,
     rows,
     resolution,
@@ -1841,14 +1873,20 @@ export default function ImageBatchTab({
             right={
               <>
                 <ComposerSelect
-                  value={inputs.group || groupOptions[0]?.value || ''}
+                  value={effectiveImageGroup}
                   options={groupOptions}
-                  onChange={(value) => handleInputChange('group', value)}
+                  onChange={(value) => {
+                    selectedGroupRef.current = value;
+                    handleInputChange('group', value);
+                  }}
                 />
                 <ComposerSelect
-                  value={inputs.model || modelOptions[0]?.value || ''}
+                  value={effectiveImageModel}
                   options={modelOptions}
-                  onChange={(value) => handleInputChange('model', value)}
+                  onChange={(value) => {
+                    selectedModelRef.current = value;
+                    handleInputChange('model', value);
+                  }}
                   wide
                 />
                 {showQuality && (

@@ -158,6 +158,17 @@ const makeOptionLabels = (options = []) =>
     return acc;
   }, {});
 
+const resolveLatestOptionValue = (refValue, inputValue, options = []) => {
+  const optionValues = new Set(options.map((option) => String(option.value)));
+  if (refValue && (!optionValues.size || optionValues.has(String(refValue)))) {
+    return refValue;
+  }
+  if (inputValue && (!optionValues.size || optionValues.has(String(inputValue)))) {
+    return inputValue;
+  }
+  return options[0]?.value || '';
+};
+
 const getTaskVideoSourceUrl = (item) =>
   item?.remoteUrl ||
   item?.url ||
@@ -347,6 +358,8 @@ export default function VideoBatchTab({
   const isUndoRedoRef = useRef(false);
   const promptEditStartRef = useRef(new Map());
   const tableRef = useRef(null);
+  const selectedGroupRef = useRef(inputs.group || '');
+  const selectedModelRef = useRef(inputs.model || '');
 
   const modelOptions = useMemo(
     () => normalizeCreationOptions(models, inputs.model),
@@ -357,7 +370,16 @@ export default function VideoBatchTab({
     [groups, inputs.group],
   );
 
-  const effectiveVideoModel = inputs.model || modelOptions[0]?.value || '';
+  const effectiveVideoModel = resolveLatestOptionValue(
+    selectedModelRef.current,
+    inputs.model,
+    modelOptions,
+  );
+  const effectiveVideoGroup = resolveLatestOptionValue(
+    selectedGroupRef.current,
+    inputs.group,
+    groupOptions,
+  );
   const parameterState = useMemo(
     () => getVideoParameterState(effectiveVideoModel),
     [effectiveVideoModel],
@@ -400,6 +422,14 @@ export default function VideoBatchTab({
     [resolutionLabels, videoDefaults.resolution],
   );
   const effectiveMaxReferenceImages = parameterState.maxReferenceImages || 1;
+
+  useEffect(() => {
+    selectedModelRef.current = inputs.model || modelOptions[0]?.value || '';
+  }, [inputs.model, modelOptions]);
+
+  useEffect(() => {
+    selectedGroupRef.current = inputs.group || groupOptions[0]?.value || '';
+  }, [inputs.group, groupOptions]);
 
   useEffect(() => {
     setImagesPerRow((prev) =>
@@ -1166,7 +1196,7 @@ export default function VideoBatchTab({
       for (const { row, idx } of validRows) {
         const videoParams = createBatchRowVideoParams(row, {
           model: effectiveVideoModel,
-          group: inputs.group,
+          group: selectedGroupRef.current || effectiveVideoGroup,
           source: VIDEO_TASK_SOURCE.BATCH,
           batchRowIndex: idx,
         });
@@ -1213,7 +1243,7 @@ export default function VideoBatchTab({
     }
   }, [
     effectiveVideoModel,
-    inputs.group,
+    effectiveVideoGroup,
     selectedRows,
     rows,
     concurrency,
@@ -1838,14 +1868,20 @@ export default function VideoBatchTab({
             right={
               <>
                 <ComposerSelect
-                  value={inputs.group || groupOptions[0]?.value || ''}
+                  value={effectiveVideoGroup}
                   options={groupOptions}
-                  onChange={(value) => handleInputChange('group', value)}
+                  onChange={(value) => {
+                    selectedGroupRef.current = value;
+                    handleInputChange('group', value);
+                  }}
                 />
                 <ComposerSelect
-                  value={inputs.model || modelOptions[0]?.value || ''}
+                  value={effectiveVideoModel}
                   options={modelOptions}
-                  onChange={(value) => handleInputChange('model', value)}
+                  onChange={(value) => {
+                    selectedModelRef.current = value;
+                    handleInputChange('model', value);
+                  }}
                   wide
                 />
                 <ComposerSelect

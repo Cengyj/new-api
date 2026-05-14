@@ -46,6 +46,17 @@ const createCountOptions = (t) =>
     label: t('{{count}} 张', { count: item }),
   }));
 
+const resolveLatestOptionValue = (refValue, inputValue, options = []) => {
+  const optionValues = new Set(options.map((option) => String(option.value)));
+  if (refValue && (!optionValues.size || optionValues.has(String(refValue)))) {
+    return refValue;
+  }
+  if (inputValue && (!optionValues.size || optionValues.has(String(inputValue)))) {
+    return inputValue;
+  }
+  return options[0]?.value || '';
+};
+
 function ComposerSelect(props) {
   return <SharedComposerSelect {...props} />;
 }
@@ -96,6 +107,8 @@ export default function ImageSingleTab({
   const fileInputRef = useRef(null);
   const attachIdRef = useRef(0);
   const dragDepthRef = useRef(0);
+  const selectedGroupRef = useRef(inputs.group || '');
+  const selectedModelRef = useRef(inputs.model || '');
 
   const modelOptions = useMemo(
     () =>
@@ -117,10 +130,20 @@ export default function ImageSingleTab({
     () => normalizeOptions(groups, inputs.group),
     [groups, inputs.group],
   );
+  const selectedGroup = resolveLatestOptionValue(
+    selectedGroupRef.current,
+    inputs.group,
+    groupOptions,
+  );
+  const selectedModel = resolveLatestOptionValue(
+    selectedModelRef.current,
+    inputs.model,
+    modelOptions,
+  );
 
   const parameterState = useMemo(
-    () => getImageParameterState(inputs.model),
-    [inputs.model],
+    () => getImageParameterState(selectedModel),
+    [selectedModel],
   );
   // Model-aware parameter sets: different models have different supported options.
   const availableRatios = parameterState.ratioOptions;
@@ -165,7 +188,7 @@ export default function ImageSingleTab({
   }, [effectiveMaxAttachments]);
 
   const expectedCost = useMemo(() => {
-    const opt = modelOptions.find((item) => item.value === inputs.model);
+    const opt = modelOptions.find((item) => item.value === selectedModel);
     if (!opt) return null;
     if (opt.quota_type === 1 && opt.model_price != null) {
       return opt.model_price * count;
@@ -175,7 +198,15 @@ export default function ImageSingleTab({
       return opt.model_ratio * imgRatio * count;
     }
     return null;
-  }, [modelOptions, inputs.model, count]);
+  }, [modelOptions, selectedModel, count]);
+
+  useEffect(() => {
+    selectedGroupRef.current = inputs.group || groupOptions[0]?.value || '';
+  }, [groupOptions, inputs.group]);
+
+  useEffect(() => {
+    selectedModelRef.current = inputs.model || modelOptions[0]?.value || '';
+  }, [modelOptions, inputs.model]);
 
   useEffect(() => {
     const el = promptRef.current;
@@ -250,8 +281,8 @@ export default function ImageSingleTab({
       prompt: prompt.trim(),
       ratio,
       quality: resolution,
-      model: inputs.model,
-      group: inputs.group,
+      model: selectedModelRef.current || selectedModel,
+      group: selectedGroupRef.current || selectedGroup,
       referenceImages: attachments.map((item) => item.dataUrl),
     });
     const queuedTasks = createImageBatchQueueItems(imageParams);
@@ -343,13 +374,19 @@ export default function ImageSingleTab({
             <Paperclip size={18} />
           </button>
           <ComposerSelect
-            value={inputs.group || groupOptions[0]?.value || ''}
-            onChange={(value) => handleInputChange('group', value)}
+            value={selectedGroup}
+            onChange={(value) => {
+              selectedGroupRef.current = value;
+              handleInputChange('group', value);
+            }}
             options={groupOptions}
           />
           <ComposerSelect
-            value={inputs.model || modelOptions[0]?.value || ''}
-            onChange={(value) => handleInputChange('model', value)}
+            value={selectedModel}
+            onChange={(value) => {
+              selectedModelRef.current = value;
+              handleInputChange('model', value);
+            }}
             options={modelOptions}
           />
           <ComposerSelect
