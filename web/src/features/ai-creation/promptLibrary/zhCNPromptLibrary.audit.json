@@ -1,0 +1,68 @@
+{
+  "generatedAt": "2026-05-14T17:52:34.221Z",
+  "total": 866,
+  "emitted": 428,
+  "translated": 0,
+  "derived": 172,
+  "skipped": {
+    "missingPrompt": 2,
+    "missingImage": 0,
+    "imageCopyFailed": 0,
+    "jsonPrompt": 126,
+    "untranslated": 310,
+    "translationInvalid": 0
+  },
+  "localImages": {
+    "copied": 428,
+    "totalBytes": 124565162
+  },
+  "byCategory": {
+    "ecommerce": {
+      "label": "电商",
+      "emitted": 31,
+      "localImages": 31
+    },
+    "ad-creative": {
+      "label": "广告创意",
+      "emitted": 31,
+      "localImages": 31
+    },
+    "portrait": {
+      "label": "人像摄影",
+      "emitted": 54,
+      "localImages": 54
+    },
+    "poster": {
+      "label": "海报插画",
+      "emitted": 144,
+      "localImages": 144
+    },
+    "character": {
+      "label": "角色设计",
+      "emitted": 15,
+      "localImages": 15
+    },
+    "ui": {
+      "label": "UI / 社交媒体",
+      "emitted": 103,
+      "localImages": 103
+    },
+    "comparison": {
+      "label": "对比案例",
+      "emitted": 50,
+      "localImages": 50
+    }
+  },
+  "bySource": {
+    "EvoLinkAI": {
+      "total": 438,
+      "emitted": 100,
+      "skipped": 338
+    },
+    "freestylefly": {
+      "total": 428,
+      "emitted": 328,
+      "skipped": 100
+    }
+  }
+}
