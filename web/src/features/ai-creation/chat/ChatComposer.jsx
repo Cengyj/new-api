@@ -321,7 +321,7 @@ const ChatComposer = ({ detailProps }) => {
     <div
       className='ai-chat-composer-wrap'
       ref={containerRef}
-      onPaste={handlePaste}
+      onPasteCapture={handlePaste}
       onDragOver={handleDragOver}
       onDrop={handleDrop}
     >

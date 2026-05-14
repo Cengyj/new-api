@@ -28,6 +28,7 @@ import { isAdmin } from '../../helpers/utils';
 const MessageContent = ({
   message,
   className,
+  userMarkdownClassName = '',
   styleState,
   onToggleReasoningExpansion,
   isEditing = false,
@@ -39,6 +40,15 @@ const MessageContent = ({
   const { t } = useTranslation();
   const previousContentLengthRef = useRef(0);
   const lastContentRef = useRef('');
+  const scopedUserMarkdownClassName = userMarkdownClassName || 'user-message';
+  const rootClassName = [
+    className,
+    message.role === 'user' && userMarkdownClassName
+      ? 'ai-chat-message-user'
+      : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
 
   const isThinkingStatus =
     message.status === 'loading' || message.status === 'incomplete';
@@ -67,7 +77,7 @@ const MessageContent = ({
 
     if (message.errorCode === 'model_price_error') {
       return (
-        <div className={`${className}`}>
+        <div className={`${rootClassName}`}>
           <div
             className='rounded-lg p-3 space-y-2'
             style={{
@@ -104,7 +114,7 @@ const MessageContent = ({
     }
 
     return (
-      <div className={`${className}`}>
+      <div className={`${rootClassName}`}>
         <Typography.Text className='text-white'>{errorText}</Typography.Text>
       </div>
     );
@@ -226,7 +236,7 @@ const MessageContent = ({
   }
 
   return (
-    <div className={className}>
+    <div className={rootClassName}>
       {message.role === 'system' && (
         <div className='mb-2 sm:mb-4'>
           <div
@@ -335,12 +345,14 @@ const MessageContent = ({
                   typeof textContent.text === 'string' &&
                   textContent.text.trim() !== '' && (
                     <div
-                      className={`prose prose-xs sm:prose-sm prose-gray max-w-none overflow-x-auto text-xs sm:text-sm ${message.role === 'user' ? 'user-message' : ''}`}
+                      className={`prose prose-xs sm:prose-sm prose-gray max-w-none overflow-x-auto text-xs sm:text-sm ${message.role === 'user' ? scopedUserMarkdownClassName : ''}`}
                     >
                       <MarkdownRenderer
                         content={textContent.text}
                         className={
-                          message.role === 'user' ? 'user-message' : ''
+                          message.role === 'user'
+                            ? scopedUserMarkdownClassName
+                            : ''
                         }
                         animated={false}
                         previousContentLength={0}
@@ -389,11 +401,13 @@ const MessageContent = ({
             } else {
               return (
                 <div
-                  className={`prose prose-xs sm:prose-sm prose-gray max-w-none overflow-x-auto text-xs sm:text-sm ${message.role === 'user' ? 'user-message' : ''}`}
+                  className={`prose prose-xs sm:prose-sm prose-gray max-w-none overflow-x-auto text-xs sm:text-sm ${message.role === 'user' ? scopedUserMarkdownClassName : ''}`}
                 >
                   <MarkdownRenderer
                     content={message.content}
-                    className={message.role === 'user' ? 'user-message' : ''}
+                    className={
+                      message.role === 'user' ? scopedUserMarkdownClassName : ''
+                    }
                     animated={false}
                     previousContentLength={0}
                   />
