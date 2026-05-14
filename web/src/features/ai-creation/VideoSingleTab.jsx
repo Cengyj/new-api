@@ -350,15 +350,13 @@ export default function VideoSingleTab({
           >
             <Paperclip size={18} />
           </button>
-          {groupOptions.length > 1 && (
-            <div className='ai-creation-video-param'>
-              <ComposerSelect
-                value={inputs.group || groupOptions[0]?.value || ''}
-                onChange={(value) => handleInputChange('group', value)}
-                options={groupOptions}
-              />
-            </div>
-          )}
+          <div className='ai-creation-video-param'>
+            <ComposerSelect
+              value={inputs.group || groupOptions[0]?.value || ''}
+              onChange={(value) => handleInputChange('group', value)}
+              options={groupOptions}
+            />
+          </div>
           <div className='ai-creation-video-param ai-creation-video-param--model'>
             <ComposerSelect
               value={inputs.model || modelOptions[0]?.value || ''}

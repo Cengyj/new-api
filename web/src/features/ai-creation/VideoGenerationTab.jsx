@@ -167,21 +167,33 @@ export default function VideoGenerationTab() {
     [groups, pricedModels, groupModels],
   );
 
+  const filteredGroups = useMemo(
+    () => (groups || []).filter((g) => allowedGroupSet.has(g.value)),
+    [groups, allowedGroupSet],
+  );
+
+  const effectiveVideoGroup = allowedGroupSet.has(inputs.group)
+    ? inputs.group
+    : filteredGroups[0]?.value || inputs.group;
+
+  const effectiveInputs = useMemo(
+    () =>
+      effectiveVideoGroup === inputs.group
+        ? inputs
+        : { ...inputs, group: effectiveVideoGroup },
+    [effectiveVideoGroup, inputs],
+  );
+
   const allowedVideoModelSet = useMemo(
     () =>
       getAllowedCreationModels({
         models: pricedModels,
         groupModels,
         whitelist: VIDEO_MODEL_WHITELIST,
-        selectedGroup: inputs.group,
+        selectedGroup: effectiveVideoGroup,
         allowedGroupSet,
       }),
-    [pricedModels, groupModels, inputs.group, allowedGroupSet],
-  );
-
-  const filteredGroups = useMemo(
-    () => (groups || []).filter((g) => allowedGroupSet.has(g.value)),
-    [groups, allowedGroupSet],
+    [pricedModels, groupModels, effectiveVideoGroup, allowedGroupSet],
   );
 
   const filteredModels = useMemo(
@@ -207,31 +219,29 @@ export default function VideoGenerationTab() {
   // 若用户当前选中的分组/模型不可用于视频生成，自动切到首个允许项
   useEffect(() => {
     if (!hasAnyVideoModel) return;
-    if (!hydrated) return;
-    if (!allowedGroupSet.has(inputs.group)) {
-      handleInputChange('group', filteredGroups[0]?.value || '');
+    if (!allowedGroupSet.has(inputs.group) && effectiveVideoGroup) {
+      handleInputChange('group', effectiveVideoGroup);
     }
   }, [
     hasAnyVideoModel,
-    hydrated,
     allowedGroupSet,
     inputs.group,
+    effectiveVideoGroup,
     handleInputChange,
-    filteredGroups,
   ]);
 
   useEffect(() => {
     if (!hasAnyVideoModel) return;
     if (!hydrated) return;
     if (filteredModels.length === 0) return;
-    if (!allowedVideoModelSet.has(inputs.model)) {
+    if (!allowedVideoModelSet.has(effectiveInputs.model)) {
       handleInputChange('model', filteredModels[0].value);
     }
   }, [
     hasAnyVideoModel,
     hydrated,
     allowedVideoModelSet,
-    inputs.model,
+    effectiveInputs.model,
     filteredModels,
     handleInputChange,
   ]);
@@ -520,7 +530,7 @@ export default function VideoGenerationTab() {
             <div className='ai-creation-composer-wrap mx-auto max-w-[760px]'>
               {hasAnyVideoModel ? (
                 <VideoSingleTab
-                  inputs={inputs}
+                  inputs={effectiveInputs}
                   models={filteredModels}
                   groups={filteredGroups}
                   handleInputChange={handleInputChange}
@@ -610,7 +620,7 @@ export default function VideoGenerationTab() {
         <div className='ai-creation-video-batch-pane mt-4'>
           {hasAnyVideoModel ? (
             <VideoBatchTab
-              inputs={inputs}
+              inputs={effectiveInputs}
               models={filteredModels}
               groups={filteredGroups}
               handleInputChange={handleInputChange}
