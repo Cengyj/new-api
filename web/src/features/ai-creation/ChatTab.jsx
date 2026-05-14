@@ -181,8 +181,12 @@ const ChatTab = () => {
   });
 
   const scopedModels = useMemo(() => {
+    const hasGroupedModelMap = Object.values(groupModels || {}).some((list) =>
+      Array.isArray(list),
+    );
     const groupList = inputs.group ? groupModels?.[inputs.group] : null;
-    if (!Array.isArray(groupList) || groupList.length === 0) return models;
+    if (!hasGroupedModelMap) return models;
+    if (!Array.isArray(groupList) || groupList.length === 0) return [];
 
     const allowedModels = new Set(groupList);
     return (models || []).filter((option) =>

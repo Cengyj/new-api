@@ -28,8 +28,33 @@ export const useDataLoader = (
   handleInputChange,
   setModels,
   setGroups,
+  setGroupModels,
 ) => {
   const { t } = useTranslation();
+
+  const loadGroupModels = useCallback(
+    async (groupOptions) => {
+      if (typeof setGroupModels !== 'function') return;
+
+      const entries = await Promise.all(
+        (groupOptions || []).map(async (groupOption) => {
+          const group = groupOption?.value;
+          if (!group) return null;
+
+          const res = await API.get(API_ENDPOINTS.USER_MODELS, {
+            params: { group },
+          });
+          const { success, data } = res.data;
+          return [group, success && Array.isArray(data) ? data : []];
+        }),
+      );
+
+      setGroupModels(
+        Object.fromEntries(entries.filter((entry) => Array.isArray(entry))),
+      );
+    },
+    [setGroupModels],
+  );
 
   const loadModels = useCallback(async () => {
     try {
@@ -65,20 +90,27 @@ export const useDataLoader = (
           JSON.parse(localStorage.getItem('user'))?.group;
         const groupOptions = processGroupsData(data, userGroup);
         setGroups(groupOptions);
-
         const hasCurrentGroup = groupOptions.some(
           (option) => option.value === inputs.group,
         );
         if (!hasCurrentGroup) {
           handleInputChange('group', groupOptions[0]?.value || '');
         }
+        await loadGroupModels(groupOptions);
       } else {
         showError(t(message));
       }
     } catch (error) {
       showError(t('加载分组失败'));
     }
-  }, [userState, inputs.group, handleInputChange, setGroups, t]);
+  }, [
+    userState,
+    inputs.group,
+    handleInputChange,
+    setGroups,
+    loadGroupModels,
+    t,
+  ]);
 
   // 自动加载数据
   useEffect(() => {

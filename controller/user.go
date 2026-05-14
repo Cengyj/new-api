@@ -527,10 +527,43 @@ func GetUserModels(c *gin.Context) {
 	}
 	groups := service.GetUserUsableGroups(user.Group)
 	var models []string
-	for group := range groups {
-		for _, g := range model.GetGroupEnabledModels(group) {
-			if !common.StringsContains(models, g) {
-				models = append(models, g)
+	requestedGroup := strings.TrimSpace(c.Query("group"))
+	if requestedGroup != "" {
+		if _, ok := groups[requestedGroup]; !ok {
+			c.JSON(http.StatusOK, gin.H{
+				"success": true,
+				"message": "",
+				"data":    models,
+			})
+			return
+		}
+		if requestedGroup == "auto" {
+			for _, autoGroup := range service.GetUserAutoGroup(user.Group) {
+				for _, g := range model.GetGroupEnabledModels(autoGroup) {
+					if !common.StringsContains(models, g) {
+						models = append(models, g)
+					}
+				}
+			}
+		} else {
+			models = model.GetGroupEnabledModels(requestedGroup)
+		}
+	} else {
+		for group := range groups {
+			if group == "auto" {
+				for _, autoGroup := range service.GetUserAutoGroup(user.Group) {
+					for _, g := range model.GetGroupEnabledModels(autoGroup) {
+						if !common.StringsContains(models, g) {
+							models = append(models, g)
+						}
+					}
+				}
+				continue
+			}
+			for _, g := range model.GetGroupEnabledModels(group) {
+				if !common.StringsContains(models, g) {
+					models = append(models, g)
+				}
 			}
 		}
 	}
