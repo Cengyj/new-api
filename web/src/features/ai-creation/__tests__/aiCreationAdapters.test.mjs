@@ -597,6 +597,46 @@ const main = async () => {
     globalThis.window = originalWindow;
   }
 
+  globalThis.window = { location: { origin: 'https://foropencode.com' } };
+  try {
+    const normalizedWwwVideo = normalizeVideoTaskResponse(
+      {
+        data: {
+          code: 'success',
+          data: {
+            task_id: 'task-www',
+            status: 'SUCCESS',
+            result_url: 'https://www.foropencode.com/v1/videos/task-www/content',
+            progress: '100%',
+          },
+        },
+      },
+      { prompt: 'move', ratio: '16:9', duration: '5s', resolution: '720p' },
+    );
+    assert.equal(normalizedWwwVideo.url, '/v1/videos/task-www/content');
+
+    const normalizedExternalVideo = normalizeVideoTaskResponse(
+      {
+        data: {
+          code: 'success',
+          data: {
+            task_id: 'task-external',
+            status: 'SUCCESS',
+            result_url: 'https://cdn.example.test/v1/videos/task-external/content',
+            progress: '100%',
+          },
+        },
+      },
+      { prompt: 'move', ratio: '16:9', duration: '5s', resolution: '720p' },
+    );
+    assert.equal(
+      normalizedExternalVideo.url,
+      'https://cdn.example.test/v1/videos/task-external/content',
+    );
+  } finally {
+    globalThis.window = originalWindow;
+  }
+
   console.log('ai-creation adapter regression checks passed');
 };
 

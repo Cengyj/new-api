@@ -42,6 +42,7 @@ import {
   isCreationTaskActive,
   isCreationTaskCancelled,
 } from './creationTaskUtils.js';
+import { normalizeVideoContentUrl } from './videoAdapters.js';
 
 const CACHE_WARNING_BY_TYPE = {
   image: IMAGE_CACHE_WARN_MS,
@@ -113,9 +114,15 @@ export const getTaskImageSourceUrl = (item = {}) => {
 export const getTaskVideoSourceUrl = (item = {}) => {
   const url = typeof item.url === 'string' ? item.url : '';
   const remoteUrl = typeof item.remoteUrl === 'string' ? item.remoteUrl : '';
-  if (remoteUrl && !isSessionVideoBlobUrl(remoteUrl)) return remoteUrl;
-  if (isSessionVideoBlobUrl(url)) return remoteUrl || url;
-  return url || (isSessionVideoBlobUrl(remoteUrl) ? '' : remoteUrl);
+  if (remoteUrl && !isSessionVideoBlobUrl(remoteUrl)) {
+    return normalizeVideoContentUrl(remoteUrl);
+  }
+  if (isSessionVideoBlobUrl(url)) {
+    return normalizeVideoContentUrl(remoteUrl) || url;
+  }
+  return normalizeVideoContentUrl(
+    url || (isSessionVideoBlobUrl(remoteUrl) ? '' : remoteUrl),
+  );
 };
 
 export const getCreationWorkSourceUrl = (item, mediaType) =>

@@ -73,6 +73,15 @@ const isObject = (value) => value && typeof value === 'object';
 const isLoopbackHostname = (hostname) =>
   LOOPBACK_HOSTNAMES.has(String(hostname || '').replace(/^\[|\]$/g, ''));
 
+const trimWwwPrefix = (hostname) =>
+  String(hostname || '').toLowerCase().replace(/^www\./, '');
+
+const isSameSiteHostname = (left, right) => {
+  const normalizedLeft = trimWwwPrefix(left);
+  const normalizedRight = trimWwwPrefix(right);
+  return normalizedLeft && normalizedLeft === normalizedRight;
+};
+
 const getSubmitEndpoint = (config) =>
   config?.request?.endpoint || DEFAULT_VIDEO_ENDPOINT;
 
@@ -125,13 +134,16 @@ export const normalizeVideoContentUrl = (value) => {
 
     const current = new URL(currentOrigin);
     const sameOrigin = parsed.origin === current.origin;
+    const sameSite =
+      parsed.protocol === current.protocol &&
+      isSameSiteHostname(parsed.hostname, current.hostname);
     const sameLocalServer =
       isLoopbackHostname(parsed.hostname) &&
       isLoopbackHostname(current.hostname) &&
       parsed.port === current.port &&
       parsed.protocol === current.protocol;
 
-    return sameOrigin || sameLocalServer
+    return sameOrigin || sameSite || sameLocalServer
       ? `${parsed.pathname}${parsed.search}${parsed.hash}`
       : url;
   } catch {

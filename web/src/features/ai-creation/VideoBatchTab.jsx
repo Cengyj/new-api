@@ -60,6 +60,7 @@ import {
   VIDEO_TASK_SOURCE,
   createVideoBatchQueueItems,
 } from './videoBatchQueue.js';
+import { normalizeVideoContentUrl } from './videoAdapters.js';
 import {
   VIDEO_BATCH_TABLE_MAX_ROWS,
   createVideoBatchRow,
@@ -170,11 +171,13 @@ const resolveLatestOptionValue = (refValue, inputValue, options = []) => {
 };
 
 const getTaskVideoSourceUrl = (item) =>
-  item?.remoteUrl ||
-  item?.url ||
-  item?.task?.remoteUrl ||
-  item?.task?.url ||
-  '';
+  normalizeVideoContentUrl(
+    item?.remoteUrl ||
+      item?.url ||
+      item?.task?.remoteUrl ||
+      item?.task?.url ||
+      '',
+  );
 
 const compactErrorMessage = (msg) => {
   if (!msg) return '';
