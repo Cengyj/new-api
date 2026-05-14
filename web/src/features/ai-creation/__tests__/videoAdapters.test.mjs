@@ -42,6 +42,7 @@ const main = async () => {
     ratio: '16:9',
     duration: '10s',
     resolution: '720p',
+    group: 'vip',
     referenceImages: ['data:image/png;base64,cmVm'],
   });
   assert.equal(submitRequest.endpoint, DEFAULT_VIDEO_ENDPOINT);
@@ -50,10 +51,12 @@ const main = async () => {
   assert.equal(submitRequest.provider, 'grok');
   assert.equal(submitRequest.params.size, '1792x1024');
   assert.equal(submitRequest.params.seconds, 10);
+  assert.equal(submitRequest.params.group, 'vip');
   assert.equal(submitRequest.polling.intervalMs, 2000);
   assert.equal(submitRequest.polling.timeoutMs, 10 * 60 * 1000);
   assert.equal(typeof submitRequest.normalizeTaskResponse, 'function');
   assert.equal(submitRequest.body.get('model'), GROK_VIDEO_MODEL);
+  assert.equal(submitRequest.body.get('group'), 'vip');
   assert.equal(submitRequest.body.get('size'), '1792x1024');
   assert.equal(submitRequest.body.getAll('input_reference[]').length, 1);
 
@@ -63,9 +66,11 @@ const main = async () => {
     ratio: '16:9',
     duration: '10s',
     resolution: '720p',
+    group: 'vip',
     referenceImages: ['data:image/png;base64,cmVm'],
   });
   assert.equal(formData.get('model'), GROK_VIDEO_MODEL);
+  assert.equal(formData.get('group'), 'vip');
   assert.equal(formData.get('prompt'), 'move');
   assert.equal(formData.get('seconds'), '10');
   assert.equal(formData.get('size'), '1792x1024');

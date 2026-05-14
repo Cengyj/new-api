@@ -455,9 +455,11 @@ const main = async () => {
     ratio: '16:9',
     duration: '10s',
     resolution: '720p',
+    group: 'vip',
     referenceImages: ['data:image/png;base64,abc'],
   });
   assert.equal(grokVideo720FormData.get('model'), GROK_VIDEO_MODEL);
+  assert.equal(grokVideo720FormData.get('group'), 'vip');
   assert.equal(grokVideo720FormData.get('prompt'), 'move');
   assert.equal(grokVideo720FormData.get('seconds'), '10');
   assert.equal(grokVideo720FormData.get('size'), '1792x1024');
@@ -508,11 +510,12 @@ const main = async () => {
     duration: '6s',
     resolution: '720p',
     model: GROK_VIDEO_MODEL,
-    group: 'default',
+    group: 'vip',
     referenceImages: ['data:image/png;base64,cmVm'],
   })[0];
   const batchVideoFormData = await buildVideoFormData(batchVideoTask.params);
   assert.equal(batchVideoFormData.get('model'), GROK_VIDEO_MODEL);
+  assert.equal(batchVideoFormData.get('group'), 'vip');
   assert.equal(batchVideoFormData.get('prompt'), 'batch move');
   assert.equal(batchVideoFormData.get('seconds'), '6');
   assert.equal(batchVideoFormData.get('size'), '1792x1024');

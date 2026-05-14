@@ -159,6 +159,9 @@ export const buildGrokVideoFormDataWithConfig = async (params = {}) => {
   formData.append('size', videoParams.size);
   formData.append('resolution_name', videoParams.resolution);
   formData.append('preset', videoParams.preset);
+  if (videoParams.group) {
+    formData.append('group', videoParams.group);
+  }
 
   for (const [index, image] of videoParams.referenceImages.entries()) {
     const blob = await referenceImageToBlob(image);
