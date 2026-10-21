@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/gin-gonic/gin"
@@ -17,6 +18,7 @@ func RouteTag(tag string) gin.HandlerFunc {
 }
 
 func SetUpLogger(server *gin.Engine) {
+	server.Use(redactTaskArtifactAccessQuery())
 	server.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
 		var requestID string
 		if param.Keys != nil {
@@ -26,6 +28,20 @@ func SetUpLogger(server *gin.Engine) {
 		if tag == "" {
 			tag = "web"
 		}
+		path := param.Path
+		requestPath, _, _ := strings.Cut(path, "?")
+		paymentCallback := false
+		switch requestPath {
+		case "/api/user/epay/notify", "/api/subscription/epay/notify", "/api/subscription/epay/return",
+			"/api/stripe/webhook", "/api/creem/webhook", "/api/waffo/webhook":
+			paymentCallback = true
+		}
+		// Payment and OAuth callbacks can carry usable signatures, one-time
+		// codes and state. Only redact the log; verification needs the full query.
+		if paymentCallback || strings.HasPrefix(requestPath, "/api/waffo-pancake/webhook/") ||
+			strings.HasPrefix(requestPath, "/api/oauth/") || strings.HasPrefix(requestPath, "/oauth/") {
+			path = requestPath
+		}
 		return fmt.Sprintf("[GIN] %s | %s | %s | %3d | %13v | %15s | %7s %s\n",
 			param.TimeStamp.Format("2006/01/02 - 15:04:05"),
 			tag,
@@ -34,7 +50,7 @@ func SetUpLogger(server *gin.Engine) {
 			param.Latency,
 			param.ClientIP,
 			param.Method,
-			param.Path,
+			path,
 		)
 	}))
 }
