@@ -1,0 +1,188 @@
+name: Publish GHCR image (x86_64)
+
+on:
+  push:
+    branches:
+      - referral-rebate-rc45
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ghcr-amd64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, verify and publish linux/amd64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the requested commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Prepare image identity and application version
+        id: image
+        env:
+          SOURCE_REF: ${{ github.ref_name }}
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          PREFIX=$(printf '%s' "$SOURCE_REF" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_.-]+/-/g; s/^[.-]+//; s/[.-]+$//')
+          PREFIX=${PREFIX:0:80}
+          if [ -z "$PREFIX" ]; then
+            echo "::error::The source ref cannot be used as an image tag"
+            exit 1
+          fi
+          VERSION="${PREFIX}-${GITHUB_SHA:0:12}-amd64"
+          printf '%s\n' "$VERSION" > VERSION
+          echo "name=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "immutable=$IMAGE:sha-$GITHUB_SHA-amd64" >> "$GITHUB_OUTPUT"
+          echo "stable=$IMAGE:$PREFIX-amd64" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the commit image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.immutable }}
+          labels: |
+            org.opencontainers.image.title=new-api
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.image.outputs.version }}
+          cache-from: type=gha,scope=ghcr-amd64
+          cache-to: type=gha,scope=ghcr-amd64,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify the published image on an isolated amd64 container
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          EXPECTED_VERSION: ${{ steps.image.outputs.version }}
+        run: |
+          docker pull --platform linux/amd64 "$IMAGE_REF"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE_REF")" = linux/amd64
+          CONTAINER_ID=$(docker run -d --network none \
+            -e SQL_DSN= -e LOG_SQL_DSN= -e REDIS_CONN_STRING= \
+            -e SQLITE_PATH=/data/image-verification.db \
+            -e TZ=Asia/Shanghai \
+            -e SESSION_SECRET="image-verification-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            "$IMAGE_REF")
+          export CONTAINER_ID
+          trap 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true' EXIT
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import time
+          from html.parser import HTMLParser
+          from urllib.parse import urlsplit
+
+          container = os.environ["CONTAINER_ID"]
+
+          def fetch(path):
+              return subprocess.check_output(
+                  ["docker", "exec", container, "wget", "-qO-", "http://127.0.0.1:3000" + path],
+                  stderr=subprocess.DEVNULL, timeout=10,
+              )
+
+          deadline = time.monotonic() + 90
+          while True:
+              try:
+                  status = json.loads(fetch("/api/status"))
+                  break
+              except (subprocess.SubprocessError, ValueError):
+                  if time.monotonic() >= deadline:
+                      subprocess.run(["docker", "logs", "--tail", "80", container], check=False)
+                      raise RuntimeError("The image did not become ready")
+                  time.sleep(2)
+          assert status["success"] is True, status
+          assert status["data"]["version"] == os.environ["EXPECTED_VERSION"]
+
+          class Assets(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.paths = set()
+
+              def handle_starttag(self, tag, attrs):
+                  for key, value in attrs:
+                      if key not in ("src", "href") or not value:
+                          continue
+                      url = urlsplit(value)
+                      if not url.netloc and url.path.startswith("/") and url.path.endswith((".js", ".css")):
+                          self.paths.add(url.path)
+
+          assets = Assets()
+          assets.feed(fetch("/").decode())
+          assert any(path.endswith(".js") for path in assets.paths), "Missing production JavaScript"
+          assert any(path.endswith(".css") for path in assets.paths), "Missing production CSS"
+          for path in sorted(assets.paths):
+              body = fetch(path)
+              assert body and not body.lstrip().lower().startswith(b"<!doctype html"), path
+          print("Verified linux/amd64, application version, startup and", len(assets.paths), "production assets")
+          PY
+          docker stop --time 15 "$CONTAINER_ID" >/dev/null
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$CONTAINER_ID")" = 0
+
+      - name: Promote the verified image to the branch tag
+        id: promote
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          STABLE_TAG: ${{ steps.image.outputs.stable }}
+          SOURCE_REF: ${{ github.ref_name }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" != branch ]; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          REMOTE_REF=$(git ls-remote --exit-code origin "refs/heads/$SOURCE_REF")
+          HEAD_SHA=$(printf '%s\n' "$REMOTE_REF" | awk '{print $1}')
+          if [ "$HEAD_SHA" != "$GITHUB_SHA" ]; then
+            echo "The branch has advanced; retain the commit image without replacing its current branch tag."
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          docker buildx imagetools create --tag "$STABLE_TAG" "$IMAGE_REF"
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      - name: Record image references
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          IMMUTABLE_TAG: ${{ steps.image.outputs.immutable }}
+          STABLE_TAG: ${{ steps.image.outputs.stable }}
+          APP_VERSION: ${{ steps.image.outputs.version }}
+          BRANCH_TAG_PUBLISHED: ${{ steps.promote.outputs.published }}
+        run: |
+          {
+            echo '### new-api image — linux/amd64 (x86_64)'
+            echo "Source commit: $GITHUB_SHA"
+            echo "Application version: $APP_VERSION"
+            if [ "$BRANCH_TAG_PUBLISHED" = true ]; then
+              echo "Updated branch image: $STABLE_TAG"
+            else
+              echo 'The branch tag was not changed because this run does not represent its current head.'
+            fi
+            echo "Commit image: $IMMUTABLE_TAG"
+            echo "Pinned image: $IMAGE_NAME@$IMAGE_DIGEST"
+            echo 'The published digest passed isolated startup, version, frontend asset and graceful exit checks.'
+          } >> "$GITHUB_STEP_SUMMARY"
