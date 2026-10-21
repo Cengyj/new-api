@@ -29,7 +29,7 @@ import { IconBadge } from '@/components/ui/icon-badge'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { toIntlLocale } from '@/i18n/languages'
-import { formatNumber, formatPercent, formatQuota } from '@/lib/format'
+import { formatNumber, formatPercent } from '@/lib/format'
 import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 import {
@@ -70,9 +70,22 @@ export function AffiliateRewardsCard(props: {
           <IconBadge tone='chart-3'>
             <Share2 />
           </IconBadge>
-          <h3 className='min-w-0 text-sm font-semibold break-words'>
-            {t('Referral Program')}
-          </h3>
+          <div className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'>
+            <h3 className='min-w-0 text-sm font-semibold break-words'>
+              {t('Referral Program')}
+            </h3>
+            {data && !affiliate.query.isError && (
+              <StatusBadge
+                copyable={false}
+                label={
+                  data.rule.enabled
+                    ? t('Activity active')
+                    : t('Activity paused')
+                }
+                variant={data.rule.enabled ? 'success' : 'neutral'}
+              />
+            )}
+          </div>
         </div>
         <CardAction className='row-span-1 flex flex-col gap-2 sm:flex-row'>
           <Button
@@ -174,20 +187,6 @@ export function AffiliateRewardsCard(props: {
               aria-label={t('Invitation top-up rebates')}
               className='flex min-w-0 flex-col gap-2'
             >
-              <div className='flex flex-wrap items-center gap-2'>
-                <h4 className='text-sm font-medium'>
-                  {t('Invitation top-up rebates')}
-                </h4>
-                <StatusBadge
-                  copyable={false}
-                  label={
-                    data.rule.enabled
-                      ? t('Activity active')
-                      : t('Activity paused')
-                  }
-                  variant={data.rule.enabled ? 'success' : 'neutral'}
-                />
-              </div>
               <ul className='text-muted-foreground list-disc space-y-1.5 pl-4 text-xs leading-relaxed'>
                 <li>
                   {data.rule.rate_bps > 0 && data.rule.valid_days > 0
@@ -207,11 +206,6 @@ export function AffiliateRewardsCard(props: {
                 </li>
                 <li>
                   {t(
-                    'Pausing does not extend eligibility or make up missed rebates. Previously earned rewards remain available under the original rules.'
-                  )}
-                </li>
-                <li>
-                  {t(
                     'Rewards can only be used on this site and cannot be withdrawn.'
                   )}
                 </li>
@@ -222,11 +216,6 @@ export function AffiliateRewardsCard(props: {
                 {t(
                   'Payment compliance must be confirmed before rebates and reward transfers are available.'
                 )}
-              </p>
-            )}
-            {!validAmount && !affiliate.pending && (
-              <p className='text-muted-foreground text-xs'>
-                {t('Minimum:')} {formatQuota(minimum)}
               </p>
             )}
             <div className='flex flex-wrap items-center gap-2'>

@@ -91,8 +91,13 @@ test('the card keeps four responsive statistics, disables below-threshold transf
   expect(grid).toHaveClass('grid-cols-2', 'sm:grid-cols-4')
   expect(screen.queryByText(/quota units/)).not.toBeInTheDocument()
   expect(
-    screen.getByRole('region', { name: 'Invitation top-up rebates' })
+    screen
+      .getByRole('heading', { name: 'Referral Program' })
+      .closest('[data-slot="card-header"]')
   ).toHaveTextContent('Activity paused')
+  expect(
+    screen.queryByRole('heading', { name: 'Invitation top-up rebates' })
+  ).not.toBeInTheDocument()
   expect(
     screen.queryByRole('button', { name: 'Top-up rebate records' })
   ).not.toBeInTheDocument()

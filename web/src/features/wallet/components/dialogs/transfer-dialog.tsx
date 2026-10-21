@@ -215,9 +215,6 @@ export function TransferDialog({
             step={minimumAmount}
             className='font-mono text-lg'
           />
-          <p className='text-muted-foreground text-xs'>
-            {t('Minimum:')} {formatQuota(minimumQuota)}
-          </p>
         </div>
       </div>
     </Dialog>
