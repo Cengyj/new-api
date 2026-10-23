@@ -781,3 +781,138 @@ func signedPaymentRouteRequest(t *testing.T, keys *waffoutils.KeyPair, provider,
 	}
 	return request
 }
+
+func TestRefreshRoutePreservesValidCredentialDuringSessionLookupOutage(t *testing.T) {
+	previousDB, previousLogDB, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+	previousType, previousSecret := common.MainDatabaseType(), common.SessionSecret
+	previousSecure, previousTrusted := common.SessionCookieSecure, common.SessionCookieTrustedURLs
+	previousGlobalLimit, previousCriticalLimit := common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable
+	path := filepath.Join(t.TempDir(), "refresh-outage.db")
+	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}))
+	model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	common.SessionSecret = "isolated-refresh-outage-regression-secret"
+	common.SessionCookieSecure, common.SessionCookieTrustedURLs = true, nil
+	common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable = false, false
+	t.Cleanup(func() {
+		if sqlDB, err := model.DB.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+		model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+		common.SetMainDatabaseType(previousType)
+		common.SessionSecret = previousSecret
+		common.SessionCookieSecure, common.SessionCookieTrustedURLs = previousSecure, previousTrusted
+		common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable = previousGlobalLimit, previousCriticalLimit
+	})
+	user := &model.User{Username: "refresh-outage-user", Password: "unused", Role: common.RoleCommonUser,
+		Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1}
+	require.NoError(t, db.Create(user).Error)
+	bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "isolated-regression")
+	require.NoError(t, err)
+	storedBefore, err := model.GetUserSessionBySID(bundle.Session.SID)
+	require.NoError(t, err)
+	originalHash := storedBefore.RefreshHash
+	engine := newAccessTokenScopeTestEngine(t)
+	requestRefresh := func(t *testing.T, rawToken, sid string) (*httptest.ResponseRecorder, map[string]any, bool) {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, "https://refresh-test.invalid/api/user/auth/refresh", nil)
+		request.Header.Set("Origin", "https://refresh-test.invalid")
+		request.Header.Set("X-Auth-Session", sid)
+		request.AddCookie(&http.Cookie{Name: service.RefreshCookieName, Value: rawToken})
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		var result map[string]any
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+		cleared := false
+		for _, cookie := range response.Result().Cookies() {
+			if cookie.Name == service.RefreshCookieName && cookie.MaxAge < 0 {
+				cleared = true
+			}
+		}
+		return response, result, cleared
+	}
+	t.Run("lookup outage preserves the credential", func(t *testing.T) {
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, sqlDB.Close())
+		// This is a real database/sql failure, not a mocked authentication error.
+		// Redis is disabled, so the lookup necessarily takes the database path.
+		_, err = model.GetUserSessionCached(bundle.Session.SID)
+		require.ErrorContains(t, err, "database is closed")
+		response, result, cleared := requestRefresh(t, bundle.RefreshToken, bundle.Session.SID)
+		assert.Equal(t, http.StatusInternalServerError, response.Code)
+		assert.Equal(t, "AUTH_INTERNAL_ERROR", result["code"])
+		assert.Equal(t, false, result["success"])
+		assert.NotContains(t, result, "data", "an unavailable session store cannot issue authentication data")
+		assert.False(t, cleared, "transient lookup failure must preserve the valid refresh credential")
+	})
+	restored, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB, model.LOG_DB = restored, restored
+	storedAfter, err := model.GetUserSessionBySID(bundle.Session.SID)
+	require.NoError(t, err)
+	require.Equal(t, originalHash, storedAfter.RefreshHash)
+	require.Equal(t, model.UserSessionStatusActive, storedAfter.Status)
+	t.Run("original credential succeeds after database recovery", func(t *testing.T) {
+		response, result, cleared := requestRefresh(t, bundle.RefreshToken, bundle.Session.SID)
+		require.Equal(t, http.StatusOK, response.Code)
+		require.Equal(t, true, result["success"])
+		assert.False(t, cleared)
+		renewed := false
+		for _, cookie := range response.Result().Cookies() {
+			if cookie.Name == service.RefreshCookieName && cookie.Value != "" && cookie.MaxAge > 0 {
+				renewed = true
+				assert.True(t, cookie.Secure)
+				assert.True(t, cookie.HttpOnly)
+				assert.Equal(t, http.SameSiteStrictMode, cookie.SameSite)
+			}
+		}
+		require.True(t, renewed)
+		stored, err := model.GetUserSessionBySID(bundle.Session.SID)
+		require.NoError(t, err)
+		assert.Equal(t, model.UserSessionStatusActive, stored.Status)
+		assert.NotEqual(t, originalHash, stored.RefreshHash)
+	})
+	for _, tc := range []struct{ name, code string }{
+		{"missing", "AUTH_UNAUTHORIZED"},
+		{"invalid secret", "AUTH_UNAUTHORIZED"},
+		{"revoked", "AUTH_SESSION_REVOKED"},
+		{"expired", "AUTH_SESSION_REVOKED"},
+	} {
+		t.Run(tc.name+" session remains rejected", func(t *testing.T) {
+			sid, rawToken := "00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000001.nonexistent-test-secret"
+			if tc.name == "missing" {
+				_, err := model.GetUserSessionBySID(sid)
+				require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+			} else {
+				control, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "rejection-control")
+				require.NoError(t, err)
+				sid, rawToken = control.Session.SID, control.RefreshToken
+				switch tc.name {
+				case "invalid secret":
+					rawToken = sid + ".incorrect-test-secret"
+				case "revoked":
+					revoked, err := model.RevokeUserSession(user.Id, sid, "regression_control")
+					require.NoError(t, err)
+					require.True(t, revoked)
+				case "expired":
+					require.NoError(t, restored.Model(&model.UserSession{}).Where("sid = ?", sid).Update("expires_at", time.Now().Unix()-1).Error)
+				}
+			}
+			response, result, cleared := requestRefresh(t, rawToken, sid)
+			assert.Equal(t, http.StatusUnauthorized, response.Code)
+			assert.Equal(t, tc.code, result["code"])
+			assert.Equal(t, false, result["success"])
+			assert.True(t, cleared)
+			assert.NotContains(t, result, "data")
+			if tc.name == "invalid secret" {
+				stored, err := model.GetUserSessionBySID(sid)
+				require.NoError(t, err)
+				assert.Equal(t, model.UserSessionStatusActive, stored.Status, "an unknown secret must not revoke the legitimate session")
+			}
+		})
+	}
+}

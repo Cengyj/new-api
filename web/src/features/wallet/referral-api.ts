@@ -122,7 +122,8 @@ export async function referralRequest<T>(
       data: options.data,
       params: options.params,
       signal: controller.signal,
-      skipAuthRefresh: true,
+      // Reads may recover within the same login; writes must never auto-replay.
+      skipAuthRefresh: (options.method ?? 'get') !== 'get',
       skipErrorHandler: true,
       disableDuplicate: true,
     })

@@ -117,6 +117,7 @@ type User struct {
 	ReferralExpiresAt   int64  `json:"-" gorm:"type:bigint;default:0"`
 	RegistrationAffCode string `json:"-" gorm:"-:all"`
 
+	registrationNewUserQuota int
 	registrationInviteeQuota int
 	registrationInviterQuota int
 }
@@ -668,8 +669,8 @@ func (user *User) Insert(inviterId int) error {
 // finishInsert contains only non-financial effects. Re-running it can never
 // mint a registration reward or change the registration snapshot.
 func (user *User) finishInsert(_ int) {
-	if common.QuotaForNewUser > 0 {
-		RecordLog(user.Id, LogTypeSystem, common.NewMessage("New user sign-up bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForNewUser)}))
+	if user.registrationNewUserQuota > 0 {
+		RecordLog(user.Id, LogTypeSystem, common.NewMessage("New user sign-up bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(user.registrationNewUserQuota)}))
 	}
 	if user.registrationInviteeQuota > 0 {
 		RecordLog(user.Id, LogTypeSystem, common.NewMessage("Invitation code bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(user.registrationInviteeQuota)}))
@@ -708,7 +709,13 @@ func (user *User) InsertWithTx(tx *gorm.DB, inviterId int) error {
 		if err := PrepareReferralRegistrationTx(tx, user); err != nil {
 			return err
 		}
-		user.Quota = common.QuotaForNewUser
+		// Fixed gifts use one configuration snapshot for validation, credit and
+		// post-commit logging. Never hold the option lock across database work.
+		common.OptionMapRWMutex.RLock()
+		user.registrationNewUserQuota = common.QuotaForNewUser
+		inviteeQuota, inviterQuota := common.QuotaForInvitee, common.QuotaForInviter
+		common.OptionMapRWMutex.RUnlock()
+		user.Quota = user.registrationNewUserQuota
 		user.AffQuota, user.AffHistoryQuota, user.AffCount = 0, 0, 0
 		user.registrationInviteeQuota, user.registrationInviterQuota = 0, 0
 		if err := common.ValidateWalletQuota(user.Quota); err != nil {
@@ -721,19 +728,19 @@ func (user *User) InsertWithTx(tx *gorm.DB, inviterId int) error {
 				return err
 			}
 			if err == nil {
-				if common.QuotaForInvitee > 0 {
-					if common.QuotaForInvitee > common.MaxWalletQuota || user.Quota > common.MaxWalletQuota-common.QuotaForInvitee {
+				if inviteeQuota > 0 {
+					if inviteeQuota > common.MaxWalletQuota || user.Quota > common.MaxWalletQuota-inviteeQuota {
 						return ErrWalletQuotaLimitExceeded
 					}
-					user.registrationInviteeQuota = common.QuotaForInvitee
+					user.registrationInviteeQuota = inviteeQuota
 					user.Quota += user.registrationInviteeQuota
 				}
-				if common.QuotaForInviter > 0 {
-					if common.QuotaForInviter > common.MaxWalletQuota || inviter.AffQuota < 0 || inviter.AffHistoryQuota < 0 ||
-						inviter.AffQuota > common.MaxWalletQuota-common.QuotaForInviter || inviter.AffHistoryQuota > common.MaxWalletQuota-common.QuotaForInviter || inviter.AffCount >= math.MaxInt {
+				if inviterQuota > 0 {
+					if inviterQuota > common.MaxWalletQuota || inviter.AffQuota < 0 || inviter.AffHistoryQuota < 0 ||
+						inviter.AffQuota > common.MaxWalletQuota-inviterQuota || inviter.AffHistoryQuota > common.MaxWalletQuota-inviterQuota || inviter.AffCount >= math.MaxInt {
 						return ErrReferralRewardLimit
 					}
-					user.registrationInviterQuota = common.QuotaForInviter
+					user.registrationInviterQuota = inviterQuota
 					if err := tx.Model(&User{}).Where("id = ?", inviter.Id).Updates(map[string]any{
 						"aff_count":   gorm.Expr("aff_count + ?", 1),
 						"aff_quota":   gorm.Expr("aff_quota + ?", user.registrationInviterQuota),

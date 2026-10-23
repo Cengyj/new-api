@@ -26,20 +26,27 @@ import {
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { AxiosError, type AxiosRequestConfig } from 'axios'
+import {
+  AxiosError,
+  AxiosHeaders,
+  type AxiosRequestConfig,
+  type InternalAxiosRequestConfig,
+} from 'axios'
 import { toast } from 'sonner'
-import { beforeEach, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import { api } from '@/lib/api'
-import { applyAuthBundle } from '@/lib/auth-session'
+import { applyAuthBundle, clearAuthentication } from '@/lib/auth-session'
 import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
 import {
   DEFAULT_CURRENCY_CONFIG,
   useSystemConfigStore,
 } from '@/stores/system-config-store'
 
+import { getUserBillingHistory, requestPayment } from '../api'
 import { BillingHistoryDialog } from '../components/dialogs/billing-history-dialog'
 import { useBillingHistory } from '../hooks/use-billing-history'
+import { usePaymentOperation } from '../hooks/use-payment-operation'
 
 const original: AuthBundle = {
   access_token: 'test-admin-access',
@@ -74,6 +81,217 @@ beforeEach(() => {
   applyAuthBundle(original, false)
   useSystemConfigStore.getState().setConfig({
     currency: { ...DEFAULT_CURRENCY_CONFIG },
+  })
+})
+
+describe('billing history authentication recovery', () => {
+  const originalAdapter = api.defaults.adapter
+  let requests: InternalAxiosRequestConfig[]
+  let refreshStatus: number
+  let refreshBundle: AuthBundle
+  let holdRefresh: boolean
+  let finishRefresh: (() => void) | undefined
+
+  beforeEach(() => {
+    window.history.replaceState({}, '', '/sign-in')
+    requests = []
+    refreshStatus = 200
+    refreshBundle = { ...original, access_token: 'fresh-history-access' }
+    holdRefresh = false
+    finishRefresh = undefined
+    vi.spyOn(XMLHttpRequest.prototype, 'open')
+    vi.spyOn(XMLHttpRequest.prototype, 'send').mockImplementation(function (
+      this: XMLHttpRequest
+    ) {
+      finishRefresh = () => {
+        Object.defineProperties(this, {
+          status: { value: refreshStatus, configurable: true },
+          statusText: { value: 'Refresh response', configurable: true },
+          responseText: {
+            value: JSON.stringify({
+              success: refreshStatus === 200,
+              data: refreshStatus === 200 ? refreshBundle : undefined,
+            }),
+            configurable: true,
+          },
+          readyState: { value: 4, configurable: true },
+        })
+        this.onloadend?.(new ProgressEvent('loadend'))
+      }
+      if (!holdRefresh) finishRefresh()
+    })
+    api.defaults.adapter = async (config) => {
+      requests.push({ ...config, headers: new AxiosHeaders(config.headers) })
+      if (config.method === 'post') {
+        throw new AxiosError('Response lost', 'ERR_NETWORK', config)
+      }
+      if (config.headers.get('Authorization') === 'Bearer test-admin-access') {
+        throw new AxiosError('HTTP 401', 'ERR_BAD_REQUEST', config, undefined, {
+          config,
+          status: 401,
+          statusText: 'Unauthorized',
+          headers: {},
+          data: { success: false, message: 'Access token expired' },
+        })
+      }
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: history.data,
+      }
+    }
+  })
+
+  afterEach(() => {
+    api.defaults.adapter = originalAdapter
+    clearAuthentication(false)
+    window.history.replaceState({}, '', '/')
+  })
+
+  test.each([
+    { role: 1, endpoint: '/api/user/topup/self?p=1&page_size=10' },
+    { role: 100, endpoint: '/api/user/topup?p=1&page_size=10' },
+  ])(
+    'an expired role $role query refreshes once and shows its order history',
+    async ({ role, endpoint }) => {
+      applyAuthBundle({ ...original, user: { ...original.user, role } }, false)
+      refreshBundle.user = { ...original.user, role }
+      render(<BillingHistoryDialog open onOpenChange={vi.fn()} />)
+      expect(await screen.findByText(record.trade_no)).toBeVisible()
+      expect(requests.map((request) => request.url)).toEqual([
+        endpoint,
+        endpoint,
+      ])
+      expect(requests[1].headers.get('Authorization')).toBe(
+        'Bearer fresh-history-access'
+      )
+      expect(XMLHttpRequest.prototype.open).toHaveBeenCalledExactlyOnceWith(
+        'POST',
+        '/api/user/auth/refresh',
+        true
+      )
+      expect(requests.every((request) => request.method === 'get')).toBe(true)
+    }
+  )
+
+  test.each(['user', 'session', 'role'])(
+    '%s changing during refresh cancels the old query before retry and preserves the new identity',
+    async (change) => {
+      holdRefresh = true
+      const { result } = renderHook(() => useBillingHistory())
+      await waitFor(() => expect(finishRefresh).toBeTypeOf('function'))
+      const next: AuthBundle = {
+        ...original,
+        access_token: 'next-history-access',
+        user: {
+          ...original.user,
+          id: change === 'user' ? 2 : original.user.id,
+          role: change === 'role' ? 1 : original.user.role,
+        },
+        session: {
+          ...original.session,
+          sid: change === 'role' ? original.session.sid : 'next-session',
+        },
+      }
+      act(() => applyAuthBundle(next, false))
+      await waitFor(() => expect(result.current.records).toHaveLength(1))
+      await act(async () => finishRefresh?.())
+      expect(requests).toHaveLength(2)
+      expect(requests[0].signal?.aborted).toBe(true)
+      expect(requests[1].headers.get('Authorization')).toBe(
+        'Bearer next-history-access'
+      )
+      expect(requests[1].url).toBe(
+        change === 'role'
+          ? '/api/user/topup/self?p=1&page_size=10'
+          : '/api/user/topup?p=1&page_size=10'
+      )
+      expect(useAuthStore.getState().auth.accessToken).toBe(next.access_token)
+      expect(useAuthStore.getState().auth.user).toEqual(next.user)
+      expect(useAuthStore.getState().auth.session?.sid).toBe(next.session.sid)
+    }
+  )
+
+  test.each([401, 503])(
+    'refresh HTTP %i rejects the query without returning an empty or stale history',
+    async (status) => {
+      refreshStatus = status
+      await expect(getUserBillingHistory(1, 10)).rejects.toMatchObject({
+        response: { status: 401 },
+      })
+      expect(requests).toHaveLength(1)
+      expect(XMLHttpRequest.prototype.open).toHaveBeenCalledTimes(1)
+      expect(useAuthStore.getState().auth.accessToken).toBe(
+        status === 401 ? null : original.access_token
+      )
+    }
+  )
+
+  test('a transient refresh failure shows unconfirmed history until explicit retry recovers', async () => {
+    refreshStatus = 503
+    render(<BillingHistoryDialog open onOpenChange={vi.fn()} />)
+    expect(
+      await screen.findByText('Failed to load billing history')
+    ).toBeVisible()
+    expect(
+      screen.queryByText('No billing records found')
+    ).not.toBeInTheDocument()
+    refreshStatus = 200
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    expect(await screen.findByText(record.trade_no)).toBeVisible()
+    expect(requests).toHaveLength(3)
+    expect(XMLHttpRequest.prototype.open).toHaveBeenCalledTimes(2)
+  })
+
+  test('concurrent queries share refresh while one cancellation cannot cancel the other history read', async () => {
+    holdRefresh = true
+    const canceled = new AbortController()
+    const first = getUserBillingHistory(
+      1,
+      10,
+      undefined,
+      canceled.signal
+    ).catch((error: unknown) => error)
+    const second = getUserBillingHistory(2, 10)
+    await waitFor(() => {
+      expect(requests).toHaveLength(2)
+      expect(finishRefresh).toBeTypeOf('function')
+    })
+    canceled.abort()
+    finishRefresh?.()
+    expect(await first).toMatchObject({ code: 'ERR_CANCELED' })
+    await expect(second).resolves.toEqual(history.data)
+    expect(XMLHttpRequest.prototype.open).toHaveBeenCalledTimes(1)
+    expect(requests).toHaveLength(3)
+    expect(requests[2].url).toBe('/api/user/topup/self?p=2&page_size=10')
+  })
+
+  test('after an unknown payment response history can recover authentication without resubmitting payment', async () => {
+    const notify = vi.spyOn(toast, 'error')
+    const { result } = renderHook(() => usePaymentOperation())
+    await act(async () => {
+      expect(
+        await result.current.runPayment(
+          (signal) =>
+            requestPayment({ amount: 1, payment_method: 'alipay' }, signal),
+          () => true
+        )
+      ).toBe(false)
+    })
+    expect(notify).toHaveBeenCalledWith(
+      'Payment request result is unknown. Check Order History before trying again.'
+    )
+    render(<BillingHistoryDialog open onOpenChange={vi.fn()} />)
+    expect(await screen.findByText(record.trade_no)).toBeVisible()
+    expect(
+      requests.filter((request) => request.method === 'post')
+    ).toHaveLength(1)
+    expect(requests.filter((request) => request.method === 'get')).toHaveLength(
+      2
+    )
+    expect(XMLHttpRequest.prototype.open).toHaveBeenCalledTimes(1)
   })
 })
 

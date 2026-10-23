@@ -26,16 +26,22 @@ import {
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import {
+  AxiosError,
+  AxiosHeaders,
+  type InternalAxiosRequestConfig,
+} from 'axios'
 import { createInstance } from 'i18next'
 import type { ReactNode } from 'react'
 import { I18nextProvider, initReactI18next } from 'react-i18next'
-import { beforeEach, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import en from '@/i18n/locales/en.json'
 import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
+import { applyAuthBundle, clearAuthentication } from '@/lib/auth-session'
 import { ROLE } from '@/lib/roles'
-import { useAuthStore } from '@/stores/auth-store'
+import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
 import {
   DEFAULT_CURRENCY_CONFIG,
   useSystemConfigStore,
@@ -45,6 +51,7 @@ import { AffiliateRewardsCard } from '../components/affiliate-rewards-card'
 import { ReferralInviteesDialog } from '../components/dialogs/referral-invitees-dialog'
 import { ReferralRecordsDialog } from '../components/dialogs/referral-records-dialog'
 import { ReferralQuota } from '../components/referral-quota'
+import { getReferralRecords, referralRequest } from '../referral-api'
 
 const success = (data: unknown) => ({ data: { success: true, data } })
 const summary = {
@@ -55,6 +62,260 @@ const summary = {
   rebate_quota: '500000',
   direct_count: 2,
 }
+
+describe('referral query authentication recovery', () => {
+  const originalAdapter = api.defaults.adapter
+  const original: AuthBundle = {
+    access_token: 'expired-referral-access',
+    token_type: 'Bearer',
+    access_expires_at: 1,
+    user: { id: 1, username: 'first', role: ROLE.ADMIN },
+    session: {
+      sid: 'referral-session',
+      current: true,
+      login_method: 'password',
+      ip: '',
+      user_agent: '',
+      created_at: 1,
+      last_active_at: 1,
+      expires_at: 2_000_000_000,
+    },
+  }
+  const fresh: AuthBundle = {
+    ...original,
+    access_token: 'fresh-referral-access',
+    access_expires_at: 2_000_000_000,
+  }
+  const records = {
+    items: [],
+    total: 0,
+    credited_quota: '0',
+    reward_quota: '0',
+  }
+  const filters = {
+    inviter_id: '',
+    invitee_id: '',
+    trade_no: '',
+    start_time: '',
+    end_time: '',
+  }
+  let requests: InternalAxiosRequestConfig[]
+  let refreshStatus: number
+  let refreshBundle: AuthBundle
+  let holdRefresh: boolean
+  let finishRefresh: (() => void) | undefined
+
+  beforeEach(() => {
+    applyAuthBundle(original, false)
+    window.history.replaceState({}, '', '/sign-in')
+    requests = []
+    refreshStatus = 200
+    refreshBundle = fresh
+    holdRefresh = false
+    finishRefresh = undefined
+    vi.spyOn(XMLHttpRequest.prototype, 'open')
+    vi.spyOn(XMLHttpRequest.prototype, 'send').mockImplementation(function (
+      this: XMLHttpRequest
+    ) {
+      finishRefresh = () => {
+        Object.defineProperties(this, {
+          status: { value: refreshStatus, configurable: true },
+          statusText: { value: 'Refresh response', configurable: true },
+          responseText: {
+            value: JSON.stringify({
+              success: refreshStatus === 200,
+              data: refreshStatus === 200 ? refreshBundle : undefined,
+            }),
+            configurable: true,
+          },
+          readyState: { value: 4, configurable: true },
+        })
+        this.onloadend?.(new ProgressEvent('loadend'))
+      }
+      if (!holdRefresh) finishRefresh()
+    })
+    api.defaults.adapter = async (config) => {
+      requests.push({ ...config, headers: new AxiosHeaders(config.headers) })
+      if (!config.authRetry) {
+        throw new AxiosError('HTTP 401', 'ERR_BAD_REQUEST', config, undefined, {
+          data: { message: 'Access token expired' },
+          status: 401,
+          statusText: 'Unauthorized',
+          headers: {},
+          config,
+        })
+      }
+      return {
+        data: { success: true, data: records },
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        config,
+      }
+    }
+  })
+
+  afterEach(() => {
+    api.defaults.adapter = originalAdapter
+    clearAuthentication(false)
+    window.history.replaceState({}, '', '/')
+  })
+
+  test('an expired read-only query refreshes the same session and returns its records', async () => {
+    await expect(getReferralRecords(1, 10, filters)).resolves.toEqual(records)
+    expect(XMLHttpRequest.prototype.open).toHaveBeenCalledTimes(1)
+    expect(XMLHttpRequest.prototype.open).toHaveBeenCalledWith(
+      'POST',
+      '/api/user/auth/refresh',
+      true
+    )
+    expect(requests).toHaveLength(2)
+    expect(requests[0].headers.get('Authorization')).toBe(
+      'Bearer expired-referral-access'
+    )
+    expect(requests[1].headers.get('Authorization')).toBe(
+      'Bearer fresh-referral-access'
+    )
+    expect(requests[1].params).toEqual({ p: 1, page_size: 10, ...filters })
+    expect(useAuthStore.getState().auth.session?.sid).toBe(original.session.sid)
+  })
+
+  test.each([1, 2])(
+    'switching to user %i and a new session during refresh never replays the old query or restores old credentials',
+    async (userID) => {
+      holdRefresh = true
+      const result = getReferralRecords(1, 10, filters).catch(
+        (error: unknown) => error
+      )
+      await waitFor(() => expect(finishRefresh).toBeTypeOf('function'))
+      const next: AuthBundle = {
+        ...fresh,
+        user: { id: userID, username: 'next', role: ROLE.ADMIN },
+        session: { ...fresh.session, sid: 'next-session' },
+        access_token: 'next-access',
+      }
+      applyAuthBundle(next, false)
+      finishRefresh?.()
+      expect(await result).toBeInstanceOf(Error)
+      expect(requests).toHaveLength(1)
+      expect(requests[0].signal?.aborted).toBe(true)
+      expect(useAuthStore.getState().auth.accessToken).toBe(next.access_token)
+      expect(useAuthStore.getState().auth.user?.id).toBe(userID)
+      expect(useAuthStore.getState().auth.session?.sid).toBe(next.session.sid)
+    }
+  )
+
+  test('changing accounts after refresh discards the late retried query response', async () => {
+    const adapter = api.defaults.adapter
+    if (typeof adapter !== 'function') throw new Error('Missing test adapter')
+    let finishQuery: (() => void) | undefined
+    api.defaults.adapter = async (config) => {
+      const response = await adapter(config)
+      await new Promise<void>((resolve) => {
+        finishQuery = resolve
+      })
+      return response
+    }
+    const result = getReferralRecords(1, 10, filters).catch(
+      (error: unknown) => error
+    )
+    await waitFor(() => expect(finishQuery).toBeTypeOf('function'))
+    applyAuthBundle(
+      {
+        ...fresh,
+        user: { id: 2, username: 'next', role: ROLE.ADMIN },
+        session: { ...fresh.session, sid: 'next-session' },
+        access_token: 'next-access',
+      },
+      false
+    )
+    finishQuery?.()
+    expect(await result).toMatchObject({ code: 'ERR_CANCELED' })
+    expect(requests).toHaveLength(2)
+    expect(requests[1].headers.get('Authorization')).toBe(
+      'Bearer fresh-referral-access'
+    )
+    expect(useAuthStore.getState().auth.accessToken).toBe('next-access')
+  })
+
+  test.each([401, 503])(
+    'refresh HTTP %i keeps the query failed and never invents records or retries with stale credentials',
+    async (status) => {
+      refreshStatus = status
+      await expect(getReferralRecords(1, 10, filters)).rejects.toMatchObject({
+        response: { status: 401 },
+      })
+      expect(XMLHttpRequest.prototype.open).toHaveBeenCalledTimes(1)
+      expect(requests).toHaveLength(1)
+      expect(useAuthStore.getState().auth.accessToken).toBe(
+        status === 401 ? null : original.access_token
+      )
+    }
+  )
+
+  test('concurrent queries share one refresh and canceling one does not cancel the other', async () => {
+    holdRefresh = true
+    const canceled = new AbortController()
+    const first = getReferralRecords(1, 10, filters, canceled.signal).catch(
+      (error: unknown) => error
+    )
+    const second = getReferralRecords(2, 10, filters)
+    await waitFor(() => {
+      expect(requests).toHaveLength(2)
+      expect(finishRefresh).toBeTypeOf('function')
+    })
+    expect(XMLHttpRequest.prototype.open).toHaveBeenCalledTimes(1)
+    canceled.abort()
+    finishRefresh?.()
+    expect(await first).toMatchObject({ code: 'ERR_CANCELED' })
+    await expect(second).resolves.toEqual(records)
+    expect(requests).toHaveLength(3)
+    expect(requests[2].params.p).toBe(2)
+    expect(useAuthStore.getState().auth.accessToken).toBe(fresh.access_token)
+  })
+
+  test('a second 401 in the same session clears only the rejected session without a refresh loop', async () => {
+    const adapter = api.defaults.adapter
+    if (typeof adapter !== 'function') throw new Error('Missing test adapter')
+    api.defaults.adapter = async (config) => {
+      if (!config.authRetry) return adapter(config)
+      requests.push({ ...config, headers: new AxiosHeaders(config.headers) })
+      throw new AxiosError('Second 401', 'ERR_BAD_REQUEST', config, undefined, {
+        data: { message: 'Session revoked' },
+        status: 401,
+        statusText: 'Unauthorized',
+        headers: {},
+        config,
+      })
+    }
+    await expect(getReferralRecords(1, 10, filters)).rejects.toMatchObject({
+      response: { status: 401 },
+    })
+    expect(requests).toHaveLength(2)
+    expect(XMLHttpRequest.prototype.open).toHaveBeenCalledTimes(1)
+    expect(useAuthStore.getState().auth.accessToken).toBeNull()
+  })
+
+  test.each([
+    ['post', '/api/user/aff_transfer'],
+    ['put', '/api/option/referral_rebate'],
+  ] as const)(
+    'a rejected %s mutation never refreshes or automatically replays',
+    async (method, path) => {
+      await expect(
+        referralRequest(path, { method, data: {} })
+      ).rejects.toMatchObject({
+        response: { status: 401 },
+      })
+      expect(requests).toHaveLength(1)
+      expect(XMLHttpRequest.prototype.open).not.toHaveBeenCalled()
+      expect(useAuthStore.getState().auth.accessToken).toBe(
+        original.access_token
+      )
+    }
+  )
+})
+
 function mount(children: ReactNode) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },

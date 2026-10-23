@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -844,5 +845,126 @@ func TestReferralComplianceReadersDuringOptionPublication(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestReferralRegistrationRewardsKeepConfigSnapshotAcrossDatabases(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			db, _ := newReferralIntegrationDatabase(t, dialect)
+			previousDB, previousLogDB, previousRedis := DB, LOG_DB, common.RedisEnabled
+			previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+			previousPayment := *operation_setting.GetPaymentSetting()
+			previousOptions := common.OptionMap
+			previousNew, previousInvitee, previousInviter := common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter
+			DB, LOG_DB, common.RedisEnabled = db, db, false
+			kind := map[string]common.DatabaseType{"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL}[dialect]
+			common.SetDatabaseTypes(kind, kind)
+			operation_setting.GetPaymentSetting().ComplianceConfirmed = true
+			operation_setting.GetPaymentSetting().ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+			common.OptionMap = make(map[string]string)
+			t.Cleanup(func() {
+				DB, LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+				common.SetDatabaseTypes(previousMain, previousLog)
+				*operation_setting.GetPaymentSetting() = previousPayment
+				common.OptionMapRWMutex.Lock()
+				common.OptionMap = previousOptions
+				common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter = previousNew, previousInvitee, previousInviter
+				common.OptionMapRWMutex.Unlock()
+			})
+			require.NoError(t, db.AutoMigrate(&User{}, &Option{}, &Log{}))
+			require.NoError(t, InitializeReferralRebateRule(db))
+			require.NoError(t, SaveReferralRebateRule(ReferralRebateRule{Enabled: true, RateBPS: 1000, ValidDays: 1}))
+			for _, scenario := range []string{"commit", "rollback", "concurrent"} {
+				t.Run(scenario, func(t *testing.T) {
+					common.OptionMapRWMutex.Lock()
+					common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter = 20, 30, 40
+					common.OptionMapRWMutex.Unlock()
+					inviter := User{Username: "snapshot-owner-" + scenario, AffCode: "snapshot-owner-" + scenario,
+						Status: common.UserStatusEnabled, AffQuota: 100, AffHistoryQuota: 200}
+					require.NoError(t, db.Create(&inviter).Error)
+					user := User{Username: "snapshot-user-" + scenario, Status: common.UserStatusEnabled}
+					published := make(chan struct{})
+					var publicationErr error
+					userQueries := 0
+					hook := "test_registration_reward_publication"
+					require.NoError(t, db.Callback().Query().After("gorm:query").Register(hook, func(tx *gorm.DB) {
+						if tx.Statement.Table != "users" {
+							return
+						}
+						userQueries++
+						if userQueries != 2 {
+							return
+						}
+						// The existing inviter read is a real wait boundary. Publish a changed
+						// configuration after the initial grant was read but before invite awards.
+						// The concurrent case keeps the same value and is also checked with -race.
+						if scenario == "concurrent" {
+							go func() { publicationErr = updateOptionMap("QuotaForInviter", "40"); close(published) }()
+							return
+						}
+						for _, option := range [][2]string{{"QuotaForNewUser", "200"}, {"QuotaForInvitee", "300"}, {"QuotaForInviter", "400"}} {
+							if publicationErr = updateOptionMap(option[0], option[1]); publicationErr != nil {
+								break
+							}
+						}
+						close(published)
+					}))
+					t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove(hook)) })
+					rollback := errors.New("identity association failed after user creation")
+					err := db.Transaction(func(tx *gorm.DB) error {
+						if err := user.InsertWithTx(tx, inviter.Id); err != nil {
+							return err
+						}
+						if scenario == "rollback" {
+							return rollback
+						}
+						return nil
+					})
+					require.GreaterOrEqual(t, userQueries, 2)
+					<-published
+					require.NoError(t, publicationErr)
+					var storedOwner User
+					require.NoError(t, db.First(&storedOwner, inviter.Id).Error)
+					if scenario == "rollback" {
+						require.ErrorIs(t, err, rollback)
+						var count int64
+						require.NoError(t, db.Model(&User{}).Where("username = ?", user.Username).Count(&count).Error)
+						assert.Zero(t, count)
+						assert.Equal(t, 100, storedOwner.AffQuota)
+						assert.Equal(t, 200, storedOwner.AffHistoryQuota)
+						assert.Zero(t, storedOwner.AffCount)
+						require.NoError(t, db.Model(&Log{}).Where("user_id IN ?", []int{inviter.Id, user.Id}).Count(&count).Error)
+						assert.Zero(t, count)
+						return
+					}
+					require.NoError(t, err)
+					var storedUser User
+					require.NoError(t, db.First(&storedUser, user.Id).Error)
+					assert.Equal(t, 50, storedUser.Quota, "one registration uses one observed fixed-reward configuration")
+					assert.Equal(t, 140, storedOwner.AffQuota)
+					assert.Equal(t, 240, storedOwner.AffHistoryQuota)
+					assert.Equal(t, 1, storedOwner.AffCount)
+					assert.Equal(t, inviter.Id, storedUser.InviterId)
+					assert.Equal(t, 1000, storedUser.ReferralRateBPS)
+					assert.Equal(t, storedUser.CreatedAt+86400, storedUser.ReferralExpiresAt)
+					user.FinishInsert(inviter.Id)
+					var logs []Log
+					require.NoError(t, db.Where("user_id IN ? AND type = ?", []int{inviter.Id, user.Id}, LogTypeSystem).Order("id").Find(&logs).Error)
+					require.Len(t, logs, 3)
+					for i, expected := range []struct {
+						key   string
+						quota int
+					}{
+						{"New user sign-up bonus {{quota}}", 20},
+						{"Invitation code bonus {{quota}}", 30},
+						{"Bonus for inviting a user {{quota}}", 40},
+					} {
+						assert.Equal(t, common.NewMessage(expected.key, map[string]any{"quota": logger.FormatQuota(expected.quota)}).Error(), logs[i].Content,
+							"post-commit logs describe the actual award, not the newly published rule")
+					}
+				})
+			}
+		})
 	}
 }

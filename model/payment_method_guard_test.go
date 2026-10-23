@@ -1401,9 +1401,9 @@ func TestReferralColdCacheAndWalletCreditAcrossProcesses(t *testing.T) {
 	}
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		for _, scenario := range []string{"fill_first_without_snapshot", "credit_first_paused", "credit_first_qualified", "fill_loses_sql_connection"} {
-			// Both lock orders and ineligible branches run on every engine. One
-			// additional qualified case checks the positive persisted fact.
-			if scenario == "credit_first_qualified" && dialect != "mysql" || scenario == "fill_loses_sql_connection" && dialect == "sqlite" {
+			// Both lock orders and the qualified rebate run on every engine.
+			// SQLite has no independent server connection to terminate.
+			if scenario == "fill_loses_sql_connection" && dialect == "sqlite" {
 				continue
 			}
 			t.Run(dialect+"/"+scenario, func(t *testing.T) {

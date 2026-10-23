@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/alicebob/miniredis/v2"
+	miniredisserver "github.com/alicebob/miniredis/v2/server"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
@@ -69,6 +70,18 @@ func useIndependentAuthSessionRedis(t *testing.T) (*miniredis.Miniredis, *redis.
 	previousSyncFrequency := common.SyncFrequency
 	serverA := miniredis.RunT(t)
 	serverB := miniredis.RunT(t)
+	// Fixture-only: miniredis does not implement INFO server. Keep each
+	// independent server identity stable; all application Lua stays unchanged.
+	for index, server := range []*miniredis.Miniredis{serverA, serverB} {
+		runID := fmt.Sprintf("%040x", index+1)
+		server.Server().SetPreHook(func(peer *miniredisserver.Peer, command string, args ...string) bool {
+			if command == "INFO" && len(args) == 1 && args[0] == "server" {
+				peer.WriteBulk("# Server\r\nrun_id:" + runID + "\r\n")
+				return true
+			}
+			return false
+		})
+	}
 	clientA := redis.NewClient(&redis.Options{Addr: serverA.Addr()})
 	clientB := redis.NewClient(&redis.Options{Addr: serverB.Addr()})
 	common.RedisEnabled = true

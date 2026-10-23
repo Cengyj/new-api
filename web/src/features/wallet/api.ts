@@ -240,7 +240,6 @@ export async function getUserBillingHistory(
   const res = await api.get(`/api/user/topup/self?${params.toString()}`, {
     signal,
     disableDuplicate: true,
-    skipAuthRefresh: true,
     skipErrorHandler: true,
   })
   return res.data
@@ -265,7 +264,6 @@ export async function getAllBillingHistory(
   const res = await api.get(`/api/user/topup?${params.toString()}`, {
     signal,
     disableDuplicate: true,
-    skipAuthRefresh: true,
     skipErrorHandler: true,
   })
   return res.data
