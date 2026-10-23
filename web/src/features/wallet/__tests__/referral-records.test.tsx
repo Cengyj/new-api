@@ -1052,6 +1052,56 @@ test('exact quota strings remain exact after switching interface languages', asy
 })
 
 test.each([
+  { quotaDisplayType: 'USD', quotaPerUnit: 500000 },
+  { quotaDisplayType: 'TOKENS', quotaPerUnit: 500000 },
+  { quotaDisplayType: 'USD', quotaPerUnit: 1000000 },
+  { quotaDisplayType: 'TOKENS', quotaPerUnit: 3 },
+] as const)(
+  '$quotaDisplayType display preserves a safe integer quota when currency conversion would change it with $quotaPerUnit units per USD',
+  async ({ quotaDisplayType, quotaPerUnit }) => {
+    const i18n = createInstance()
+    await i18n.use(initReactI18next).init({
+      lng: 'en',
+      resources: { en },
+      interpolation: { escapeValue: false },
+    })
+    useSystemConfigStore.getState().setConfig({
+      currency: { ...DEFAULT_CURRENCY_CONFIG, quotaDisplayType, quotaPerUnit },
+    })
+    render(
+      <I18nextProvider i18n={i18n}>
+        <ReferralQuota value='9007199254740991' />
+      </I18nextProvider>
+    )
+    expect(screen.getByText('9,007,199,254,740,991 quota units')).toBeVisible()
+  }
+)
+
+test('exact quota conversions preserve ordinary currency rounding, token display, and the safe-limit currency format', () => {
+  useSystemConfigStore.getState().setConfig({
+    currency: {
+      ...DEFAULT_CURRENCY_CONFIG,
+      quotaDisplayType: 'CUSTOM',
+      customCurrencySymbol: 'C',
+      customCurrencyExchangeRate: 0.9,
+    },
+  })
+  const view = render(<ReferralQuota value='1000003' />)
+  expect(screen.getByText('C 1.800005')).toBeVisible()
+  useSystemConfigStore.getState().setConfig({
+    currency: { ...DEFAULT_CURRENCY_CONFIG, quotaDisplayType: 'TOKENS' },
+  })
+  view.rerender(<ReferralQuota value='1000' />)
+  expect(screen.getByText('1000')).toBeVisible()
+  useSystemConfigStore.getState().setConfig({
+    currency: { ...DEFAULT_CURRENCY_CONFIG, quotaPerUnit: 1 },
+  })
+  view.rerender(<ReferralQuota value='9007199254740991' />)
+  expect(screen.getByText('$9,007,199,254,740,991')).toBeVisible()
+  expect(screen.queryByText(/quota units/)).not.toBeInTheDocument()
+})
+
+test.each([
   ['zhCN', '9,007,199,254,740,993'],
   ['zhTW', '9,007,199,254,740,993'],
   ['en', '9,007,199,254,740,993'],
@@ -1073,10 +1123,16 @@ test.each([
     render(
       <I18nextProvider i18n={i18n}>
         <ReferralQuota value='9007199254740993' />
+        <ReferralQuota value='9007199254740991' />
       </I18nextProvider>
     )
     expect(
       screen.getByText(`${amount} quota units`, {
+        normalizer: (value) => value,
+      })
+    ).toBeVisible()
+    expect(
+      screen.getByText(`${amount.slice(0, -1)}1 quota units`, {
         normalizer: (value) => value,
       })
     ).toBeVisible()

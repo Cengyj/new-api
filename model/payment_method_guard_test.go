@@ -118,6 +118,69 @@ func TestRechargeWaffoPancake_RejectsMismatchedPaymentMethod(t *testing.T) {
 	assert.Equal(t, 0, getUserQuotaForPaymentGuardTest(t, 101))
 }
 
+func TestTopUpHistoryQueriesKeepOneSnapshotAcrossDatabases(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			db, _ := newReferralIntegrationDatabase(t, dialect)
+			previousDB := DB
+			previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+			DB = db
+			kind := map[string]common.DatabaseType{"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL}[dialect]
+			common.SetDatabaseTypes(kind, kind)
+			t.Cleanup(func() {
+				DB = previousDB
+				common.SetDatabaseTypes(previousMain, previousLog)
+			})
+			if dialect == "sqlite" {
+				require.NoError(t, db.Exec("PRAGMA journal_mode=WAL").Error)
+			}
+			require.NoError(t, db.AutoMigrate(&TopUp{}))
+			for _, query := range []string{"user", "admin", "search_user", "search_admin"} {
+				t.Run(query, func(t *testing.T) {
+					require.NoError(t, db.Where("1 = 1").Delete(&TopUp{}).Error)
+					original := TopUp{UserId: 1, TradeNo: "snapshot-original", CreateTime: time.Now().Unix(), Status: common.TopUpStatusPending}
+					require.NoError(t, db.Create(&original).Error)
+					inserted := false
+					hook := "test_topup_history_concurrent_insert"
+					require.NoError(t, db.Callback().Query().After("gorm:query").Register(hook, func(tx *gorm.DB) {
+						if inserted || tx.Statement.Table != "top_ups" {
+							return
+						}
+						inserted = true
+						// The first query is COUNT. Commit through another connection before
+						// the page read to reproduce a normal concurrently created checkout.
+						concurrent := TopUp{UserId: 1, TradeNo: "snapshot-concurrent", CreateTime: original.CreateTime, Status: common.TopUpStatusPending}
+						require.NoError(t, db.Create(&concurrent).Error)
+					}))
+					t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove(hook)) })
+					page := &common.PageInfo{Page: 1, PageSize: 10}
+					var rows []*TopUp
+					var total int64
+					var err error
+					switch query {
+					case "user":
+						rows, total, err = GetUserTopUps(t.Context(), 1, page)
+					case "admin":
+						rows, total, err = GetAllTopUps(t.Context(), page)
+					case "search_user":
+						rows, total, err = SearchUserTopUps(t.Context(), 1, "snapshot%", page)
+					case "search_admin":
+						rows, total, err = SearchAllTopUps(t.Context(), "snapshot%", page)
+					}
+					require.NoError(t, err)
+					require.True(t, inserted)
+					assert.EqualValues(t, 1, total)
+					require.Len(t, rows, 1, "count and page must use the same committed snapshot")
+					assert.Equal(t, original.TradeNo, rows[0].TradeNo)
+					var committedCount int64
+					require.NoError(t, db.Model(&TopUp{}).Count(&committedCount).Error)
+					assert.EqualValues(t, 2, committedCount, "the concurrent order was durably created")
+				})
+			}
+		})
+	}
+}
+
 func TestUpdatePendingTopUpStatus_RejectsMismatchedPaymentProvider(t *testing.T) {
 	testCases := []struct {
 		name                    string

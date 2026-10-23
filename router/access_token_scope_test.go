@@ -265,6 +265,10 @@ func TestReferralRoutesEnforceIdentityRolesAndTokenScopes(t *testing.T) {
 		{name: "admin read scope cannot complete orders", method: "POST", path: "/api/user/topup/complete", scope: "billing:read", user: 1, status: http.StatusForbidden, body: `{"trade_no":"referral-route-completion"}`},
 		{name: "admin billing write completes pending order", method: "POST", path: "/api/user/topup/complete", scope: "billing:write", user: 1, status: http.StatusOK, body: `{"trade_no":"referral-route-completion"}`},
 		{name: "root replay cannot credit completed order again", method: "POST", path: "/api/user/topup/complete", scope: "billing:write", user: 2, status: http.StatusOK, body: `{"trade_no":"referral-route-completion"}`},
+		{name: "anonymous cannot transfer rewards", method: "POST", path: "/api/user/aff_transfer", user: -1, status: http.StatusUnauthorized, body: `{"quota":25,"request_id":"referral-route-transfer"}`},
+		{name: "wallet read cannot transfer rewards", method: "POST", path: "/api/user/aff_transfer", scope: "wallet:read", user: 0, status: http.StatusForbidden, body: `{"quota":25,"request_id":"referral-route-transfer"}`},
+		{name: "wallet write transfers only own rewards", method: "POST", path: "/api/user/aff_transfer", scope: "wallet:write", user: 0, status: http.StatusOK, body: `{"quota":25,"request_id":"referral-route-transfer","user_id":2}`},
+		{name: "transfer replay remains successful while paused", method: "POST", path: "/api/user/aff_transfer", scope: "wallet:write", user: 0, status: http.StatusOK, body: `{"quota":25,"request_id":"referral-route-transfer"}`},
 		{name: "admin cannot change root settings", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 1, status: http.StatusForbidden},
 		{name: "root needs read scope", method: "GET", path: "/api/option/referral_rebate", scope: "wallet:read", user: 2, status: http.StatusForbidden},
 		{name: "root reads rule", method: "GET", path: "/api/option/referral_rebate", scope: "option:read", user: 2, status: http.StatusOK},
@@ -274,6 +278,15 @@ func TestReferralRoutesEnforceIdentityRolesAndTokenScopes(t *testing.T) {
 		{name: "general option endpoint cannot bypass rule validation", method: "PUT", path: "/api/option/", scope: "option:write", user: 2, status: http.StatusOK, body: `{"key":"ReferralRebateRule","value":"{}"}`, failure: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "wallet write transfers only own rewards" || tc.name == "transfer replay remains successful while paused" {
+				previousPayment, previousUnit := *operation_setting.GetPaymentSetting(), common.QuotaPerUnit
+				operation_setting.GetPaymentSetting().ComplianceConfirmed = tc.name == "wallet write transfers only own rewards"
+				operation_setting.GetPaymentSetting().ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+				common.QuotaPerUnit = 10
+				t.Cleanup(func() {
+					*operation_setting.GetPaymentSetting(), common.QuotaPerUnit = previousPayment, previousUnit
+				})
+			}
 			request := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
 			request.Header.Set("Content-Type", "application/json")
 			if tc.user >= 0 {
@@ -303,8 +316,17 @@ func TestReferralRoutesEnforceIdentityRolesAndTokenScopes(t *testing.T) {
 	}
 	var creditedUser model.User
 	require.NoError(t, db.First(&creditedUser, users[0].Id).Error)
-	assert.Equal(t, credit, creditedUser.Quota)
-	assert.Equal(t, 321, creditedUser.AffQuota)
+	assert.Equal(t, credit+25, creditedUser.Quota)
+	assert.Equal(t, 321-25, creditedUser.AffQuota)
+	var unaffectedUser model.User
+	require.NoError(t, db.First(&unaffectedUser, users[1].Id).Error)
+	assert.Zero(t, unaffectedUser.Quota)
+	assert.Equal(t, 654, unaffectedUser.AffQuota)
+	var transfers []model.AffiliateTransfer
+	require.NoError(t, db.Find(&transfers).Error)
+	require.Len(t, transfers, 1)
+	assert.Equal(t, users[0].Id, transfers[0].UserID)
+	assert.Equal(t, 25, transfers[0].Quota)
 	require.NoError(t, db.First(&order, order.Id).Error)
 	assert.Equal(t, common.TopUpStatusSuccess, order.Status)
 	assert.Positive(t, order.CompleteTime)
@@ -352,7 +374,7 @@ func TestReferralRoutesEnforceIdentityRolesAndTokenScopes(t *testing.T) {
 				}
 				assert.Equal(t, expectedStatus, response.Code, response.Body.String())
 				if userIndex == 0 && strings.Contains(path, "/user/referral") {
-					assert.Contains(t, response.Body.String(), `"aff_quota":"321"`)
+					assert.Contains(t, response.Body.String(), `"aff_quota":"296"`)
 					assert.NotContains(t, response.Body.String(), `"aff_quota":"654"`)
 				}
 			}

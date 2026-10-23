@@ -36,7 +36,7 @@ import { toast } from 'sonner'
 import { beforeEach, expect, test, vi } from 'vitest'
 
 import * as systemConfigHooks from '@/hooks/use-system-config'
-import { api, applyAuthBundle } from '@/lib/api'
+import { api, applyAuthBundle, clearAuthentication } from '@/lib/api'
 import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
 import {
   DEFAULT_CURRENCY_CONFIG,
@@ -1316,6 +1316,136 @@ test('a late wallet read failure cannot replace the next account balance with an
     screen.queryByText('Oops! Something went wrong')
   ).not.toBeInTheDocument()
 })
+
+test.each([
+  { phase: 'retried', userId: 1 },
+  { phase: 'retried', userId: 2 },
+  { phase: 'retried', userId: null },
+  { phase: 'initial', userId: 1 },
+  { phase: 'initial', userId: 2 },
+  { phase: 'initial', userId: null },
+])(
+  'a late $phase wallet 401 preserves user $userId after an identity change',
+  async ({ phase, userId }) => {
+    const original: AuthBundle = {
+      access_token: 'wallet-expired-access',
+      token_type: 'Bearer',
+      access_expires_at: 1,
+      user: { id: 1, username: 'first', role: 1 },
+      session: {
+        sid: 'wallet-first-session',
+        current: true,
+        login_method: 'password',
+        ip: '',
+        user_agent: '',
+        created_at: 1,
+        last_active_at: 1,
+        expires_at: 2_000_000_000,
+      },
+    }
+    applyAuthBundle(original, false)
+    window.history.replaceState({}, '', '/sign-in')
+    vi.spyOn(walletStats, 'WalletStatsCard').mockImplementation((props) => (
+      <output aria-label='Wallet balance'>
+        {props.user?.quota ?? 'loading'}
+      </output>
+    ))
+    vi.spyOn(topupInfoHooks, 'useTopupInfo').mockReturnValue({
+      topupInfo,
+      presetAmounts: [],
+      loading: false,
+      refetch: vi.fn(),
+    })
+    vi.spyOn(XMLHttpRequest.prototype, 'send').mockImplementation(function (
+      this: XMLHttpRequest
+    ) {
+      Object.defineProperties(this, {
+        status: { value: 200, configurable: true },
+        statusText: { value: 'OK', configurable: true },
+        responseText: {
+          value: JSON.stringify({
+            success: true,
+            data: {
+              ...original,
+              access_token: 'wallet-refreshed-access',
+              access_expires_at: 2_000_000_000,
+            },
+          }),
+          configurable: true,
+        },
+        readyState: { value: 4, configurable: true },
+      })
+      this.onloadend?.(new ProgressEvent('loadend'))
+    })
+    const originalAdapter = api.defaults.adapter
+    let rejectOld: (() => void) | undefined
+    api.defaults.adapter = async (config) => {
+      const response = {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: { success: true, data: {} as unknown },
+      }
+      if (config.url !== '/api/user/self') {
+        response.data.data = '1'
+        return response
+      }
+      if (config.headers.get('Authorization') === 'Bearer wallet-next-access') {
+        response.data.data = { id: userId, quota: 1000000 }
+        return response
+      }
+      const unauthorized = new AxiosError(
+        'Session revoked',
+        'ERR_BAD_REQUEST',
+        config,
+        undefined,
+        { ...response, status: 401 }
+      )
+      if (!config.authRetry && phase === 'retried') throw unauthorized
+      return new Promise((_, reject) => {
+        rejectOld = () => reject(unauthorized)
+      })
+    }
+    try {
+      render(<Wallet />)
+      await waitFor(() => expect(rejectOld).toBeTypeOf('function'))
+      const next: AuthBundle = {
+        ...original,
+        access_token: 'wallet-next-access',
+        user: { ...original.user, id: userId ?? 1 },
+        session: { ...original.session, sid: 'wallet-next-session' },
+      }
+      act(() => {
+        if (userId === null) clearAuthentication(false)
+        else applyAuthBundle(next, false)
+      })
+      if (userId !== null) {
+        await waitFor(() =>
+          expect(
+            screen.getByRole('status', { name: 'Wallet balance' })
+          ).toHaveTextContent('1000000')
+        )
+      }
+      await act(async () => rejectOld?.())
+      expect(XMLHttpRequest.prototype.send).toHaveBeenCalledTimes(
+        phase === 'retried' ? 1 : 0
+      )
+      expect(useAuthStore.getState().auth.accessToken).toBe(
+        userId === null ? null : next.access_token
+      )
+      expect(useAuthStore.getState().auth.session?.sid).toBe(
+        userId === null ? undefined : next.session.sid
+      )
+      expect(
+        screen.getByRole('status', { name: 'Wallet balance' })
+      ).toHaveTextContent(userId === null ? 'loading' : '1000000')
+    } finally {
+      api.defaults.adapter = originalAdapter
+      window.history.replaceState({}, '', '/')
+    }
+  }
+)
 
 test.each([
   { description: 'a different account', id: 2 },

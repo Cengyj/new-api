@@ -1776,3 +1776,196 @@ test('a delayed unpersisted rejection cannot release an operation still being re
   expect(replacement).toBe(false)
   expect(posts).toEqual([original, original])
 })
+
+test('deleting an unresolved durable key in another tab retains and retries the original operation', async () => {
+  const operation = { request_id: 'r2-peer-deleted-pending', quota: 500000 }
+  const key = `new-api:affiliate-transfer:1:${operation.request_id}`
+  localStorage.setItem(key, JSON.stringify(operation))
+  const posts: unknown[] = []
+  const request = vi
+    .spyOn(api, 'request')
+    .mockImplementation(async (config) => {
+      if (config.method === 'post') {
+        expect(localStorage.getItem(key)).toBe(JSON.stringify(operation))
+        posts.push(config.data)
+        return success({ id: 1, ...operation, created_at: 1 })
+      }
+      if (config.url?.includes('/aff_transfer/')) {
+        return success({ found: false, transfer: null })
+      }
+      if (config.url === '/api/user/aff') return success('invite-first')
+      return success(summary)
+    })
+  mountCard()
+  await screen.findByRole('textbox', { name: 'Invitation link' })
+  await userEvent.click(
+    await screen.findByRole('button', { name: 'Check transfer result' })
+  )
+  act(() => {
+    localStorage.removeItem(key)
+    window.dispatchEvent(new StorageEvent('storage', { key }))
+  })
+  expect(screen.getByText(operation.request_id)).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'Retry original transfer' })
+  ).toBeDisabled()
+  await userEvent.click(
+    within(screen.getByRole('dialog')).getByRole('button', {
+      name: 'Check transfer result',
+    })
+  )
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Retry original transfer' })
+  )
+  expect(posts).toEqual([operation])
+  expect(
+    request.mock.calls.filter(([config]) =>
+      config.url?.includes('/aff_transfer/')
+    )
+  ).toHaveLength(1)
+  expect(localStorage.getItem(key)).toBeNull()
+})
+
+test.each(['confirmed', 'rejected'] as const)(
+  'another tab retires a %s key while local cleanup failed without deleting its next operation',
+  async (terminal) => {
+    const operation = {
+      request_id: 'r2-local-terminal-operation',
+      quota: 500000,
+    }
+    const other = { request_id: 'r2-peer-next-operation', quota: 1000000 }
+    const key = `new-api:affiliate-transfer:1:${operation.request_id}`
+    const otherKey = `new-api:affiliate-transfer:1:${other.request_id}`
+    localStorage.setItem(key, JSON.stringify(operation))
+    const posts: unknown[] = []
+    vi.spyOn(api, 'request').mockImplementation(async (config) => {
+      if (config.method === 'post') posts.push(config.data)
+      if (config.url?.includes('/aff_transfer/')) {
+        if (terminal === 'confirmed') {
+          return success({
+            found: true,
+            transfer: { id: 1, ...operation, created_at: 1 },
+          })
+        }
+        return success({
+          found: false,
+          transfer: null,
+          rejection: {
+            ...operation,
+            message_key: 'Invitation quota is insufficient!',
+          },
+        })
+      }
+      if (config.url === '/api/user/aff') return success('invite-first')
+      return success(summary)
+    })
+    mountCard()
+    await screen.findByRole('textbox', { name: 'Invitation link' })
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Check transfer result' })
+    )
+    const remove = vi
+      .spyOn(durableStorageMethods, 'removeItem')
+      .mockImplementation(() => {
+        throw new DOMException('Storage unavailable', 'SecurityError')
+      })
+    await userEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', {
+        name: 'Check transfer result',
+      })
+    )
+    expect(localStorage.getItem(key)).toBe(JSON.stringify(operation))
+    remove.mockRestore()
+    act(() => {
+      localStorage.removeItem(key)
+      localStorage.setItem(otherKey, JSON.stringify(other))
+      window.dispatchEvent(new StorageEvent('storage', { key }))
+      window.dispatchEvent(new StorageEvent('storage', { key: otherKey }))
+    })
+    if (terminal === 'confirmed') {
+      await userEvent.click(
+        screen.getByRole('button', { name: 'Check transfer result' })
+      )
+      expect(screen.getByText(operation.request_id)).toBeVisible()
+      await userEvent.click(
+        within(screen.getByRole('dialog')).getByRole('button', {
+          name: 'Check transfer result',
+        })
+      )
+      await userEvent.click(
+        screen.getByRole('button', { name: 'Check transfer result' })
+      )
+    } else {
+      await userEvent.click(
+        within(screen.getByRole('dialog')).getByRole('button', {
+          name: 'Retry',
+        })
+      )
+    }
+    expect(screen.getByText(other.request_id)).toBeVisible()
+    expect(
+      screen.getByRole('spinbutton', { name: 'Transfer Amount' })
+    ).toHaveValue(2)
+    expect(
+      screen.getByRole('button', { name: 'Retry original transfer' })
+    ).toBeDisabled()
+    expect(localStorage.getItem(otherKey)).toBe(JSON.stringify(other))
+    expect(posts).toEqual([])
+  }
+)
+
+test('a storage event for the previous account cannot replace the current account pending transfer', async () => {
+  const first = { request_id: 'first-account-pending-transfer', quota: 500000 }
+  const second = {
+    request_id: 'second-account-pending-transfer',
+    quota: 1000000,
+  }
+  const firstKey = `new-api:affiliate-transfer:1:${first.request_id}`
+  const secondKey = `new-api:affiliate-transfer:2:${second.request_id}`
+  localStorage.setItem(firstKey, JSON.stringify(first))
+  localStorage.setItem(secondKey, JSON.stringify(second))
+  const request = vi
+    .spyOn(api, 'request')
+    .mockImplementation(async (config) => {
+      if (config.url?.includes('/aff_transfer/')) {
+        return success({ found: false, transfer: null })
+      }
+      if (config.url === '/api/user/aff') return success('invite-current')
+      return success(summary)
+    })
+  mountCard()
+  await screen.findByRole('textbox', { name: 'Invitation link' })
+  act(() => {
+    useAuthStore.getState().auth.setUser({ id: 2, username: 'second', role: 1 })
+  })
+  await screen.findByRole('textbox', { name: 'Invitation link' })
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Check transfer result' })
+  )
+  act(() => {
+    localStorage.removeItem(firstKey)
+    window.dispatchEvent(new StorageEvent('storage', { key: firstKey }))
+  })
+  expect(screen.getByText(second.request_id)).toBeVisible()
+  expect(screen.queryByText(first.request_id)).not.toBeInTheDocument()
+  expect(
+    screen.getByRole('spinbutton', { name: 'Transfer Amount' })
+  ).toHaveValue(2)
+  await userEvent.click(
+    within(screen.getByRole('dialog')).getByRole('button', {
+      name: 'Check transfer result',
+    })
+  )
+  expect(
+    screen.getByRole('button', { name: 'Retry original transfer' })
+  ).toBeEnabled()
+  expect(
+    request.mock.calls
+      .filter(([config]) => config.url?.includes('/aff_transfer/'))
+      .map(([config]) => config.url)
+  ).toEqual([`/api/user/aff_transfer/${second.request_id}`])
+  expect(
+    request.mock.calls.filter(([config]) => config.method === 'post')
+  ).toEqual([])
+  expect(localStorage.getItem(secondKey)).toBe(JSON.stringify(second))
+})

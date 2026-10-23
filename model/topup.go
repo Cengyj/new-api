@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"maps"
@@ -365,12 +366,23 @@ func validateTopUpPagination(pageInfo *common.PageInfo) error {
 	return nil
 }
 
+// Count and page reads must observe the same committed orders even when a new
+// checkout is created between them. PostgreSQL's default READ COMMITTED gives
+// each statement a different snapshot; SQLite already snapshots its reads.
+func beginTopUpHistorySnapshot(ctx context.Context) *gorm.DB {
+	db := DB.WithContext(ctx)
+	if common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+		return db.Begin()
+	}
+	return db.Begin(&sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+}
+
 func GetUserTopUps(ctx context.Context, userId int, pageInfo *common.PageInfo) (topups []*TopUp, total int64, err error) {
 	if err := validateTopUpPagination(pageInfo); err != nil {
 		return nil, 0, err
 	}
 	// Start transaction
-	tx := DB.WithContext(ctx).Begin()
+	tx := beginTopUpHistorySnapshot(ctx)
 	if tx.Error != nil {
 		return nil, 0, tx.Error
 	}
@@ -409,7 +421,7 @@ func GetAllTopUps(ctx context.Context, pageInfo *common.PageInfo) (topups []*Top
 	if err := validateTopUpPagination(pageInfo); err != nil {
 		return nil, 0, err
 	}
-	tx := DB.WithContext(ctx).Begin()
+	tx := beginTopUpHistorySnapshot(ctx)
 	if tx.Error != nil {
 		return nil, 0, tx.Error
 	}
@@ -445,7 +457,7 @@ func SearchUserTopUps(ctx context.Context, userId int, keyword string, pageInfo 
 	if err := validateTopUpPagination(pageInfo); err != nil {
 		return nil, 0, err
 	}
-	tx := DB.WithContext(ctx).Begin()
+	tx := beginTopUpHistorySnapshot(ctx)
 	if tx.Error != nil {
 		return nil, 0, tx.Error
 	}
@@ -488,7 +500,7 @@ func SearchAllTopUps(ctx context.Context, keyword string, pageInfo *common.PageI
 	if err := validateTopUpPagination(pageInfo); err != nil {
 		return nil, 0, err
 	}
-	tx := DB.WithContext(ctx).Begin()
+	tx := beginTopUpHistorySnapshot(ctx)
 	if tx.Error != nil {
 		return nil, 0, tx.Error
 	}

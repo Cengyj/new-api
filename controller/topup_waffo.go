@@ -346,24 +346,13 @@ func RequestWaffoPay(c *gin.Context) {
 		paymentError(c, common.NewMessage("Failed to start payment"))
 		return
 	}
-	if !resp.IsSuccess() {
-		logger.LogWarn(c.Request.Context(), common.LogText("Waffo order creation rejected user_id=%d trade_no=%s code=%s", id, merchantOrderId, resp.Code))
-		topUp.Status = common.TopUpStatusFailed
-		_ = topUp.Update()
-		paymentError(c, common.NewMessage("Failed to start payment"))
-		return
-	}
-
-	orderData := resp.GetData()
-	paymentUrl := ""
-	if orderData != nil {
-		paymentUrl = orderData.FetchRedirectURL()
-		if paymentUrl == "" {
-			paymentUrl = orderData.OrderAction
+	paymentUrl, err := resolveWaffoCheckoutResponse(topUp, resp)
+	if err != nil {
+		if resp != nil && strings.TrimSpace(resp.Code) != "" && !resp.IsSuccess() {
+			logger.LogWarn(c.Request.Context(), common.LogText("Waffo order creation rejected user_id=%d trade_no=%s code=%s", id, merchantOrderId, resp.Code))
+		} else {
+			logger.LogError(c.Request.Context(), common.LogText("Waffo failed to create order user_id=%d trade_no=%s error_type=%T", id, merchantOrderId, err))
 		}
-	}
-	if paymentUrl == "" {
-		// An incomplete response does not prove the provider rejected the order.
 		paymentError(c, common.NewMessage("Failed to start payment"))
 		return
 	}
@@ -376,6 +365,33 @@ func RequestWaffoPay(c *gin.Context) {
 			"order_id":    merchantOrderId,
 		},
 	})
+}
+
+// resolveWaffoCheckoutResponse only fails the stored order when the provider
+// supplies an explicit rejection. Missing results must remain recoverable by
+// a later verified notification, including JSON null decoded by the SDK.
+func resolveWaffoCheckoutResponse(topUp *model.TopUp, resp *core.ApiResponse[order.CreateOrderData]) (string, error) {
+	if resp == nil || strings.TrimSpace(resp.Code) == "" {
+		return "", common.NewMessage("Failed to start payment")
+	}
+	if !resp.IsSuccess() {
+		topUp.Status = common.TopUpStatusFailed
+		return "", errors.Join(common.NewMessage("Failed to start payment"), topUp.Update())
+	}
+
+	orderData := resp.GetData()
+	paymentURL := ""
+	if orderData != nil {
+		paymentURL = orderData.FetchRedirectURL()
+		if paymentURL == "" {
+			paymentURL = orderData.OrderAction
+		}
+	}
+	if paymentURL == "" {
+		// An incomplete response does not prove the provider rejected the order.
+		return "", common.NewMessage("Failed to start payment")
+	}
+	return paymentURL, nil
 }
 
 // webhookPayloadWithSubInfo 扩展 PAYMENT_NOTIFICATION，包含 SDK 未定义的 subscriptionInfo 字段

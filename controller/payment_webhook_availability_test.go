@@ -36,6 +36,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stripe/stripe-go/v81"
 	"github.com/stripe/stripe-go/v81/webhook"
+	waffo "github.com/waffo-com/waffo-go"
+	"github.com/waffo-com/waffo-go/core"
+	waffonet "github.com/waffo-com/waffo-go/net"
+	"github.com/waffo-com/waffo-go/types/order"
 	waffoutils "github.com/waffo-com/waffo-go/utils"
 	"gorm.io/gorm"
 )
@@ -4458,4 +4462,125 @@ func TestWalletPricingReadersSynchronizeWithSaveAndReload(t *testing.T) {
 			assert.ElementsMatch(t, []string{"alipay", "stripe", model.PaymentMethodWaffo, model.PaymentMethodWaffoPancake}, methods)
 		}
 	})
+}
+
+// walletWaffoSDKTransport preserves SDK serialization, response verification
+// and decoding while keeping regression tests off the real payment network.
+type walletWaffoSDKTransport func(context.Context, *waffonet.HttpRequest) (*waffonet.HttpResponse, error)
+
+func (transport walletWaffoSDKTransport) Send(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+	return transport(ctx, request)
+}
+
+func TestWalletWaffoMissingCheckoutOutcomePreservesLateSettlement(t *testing.T) {
+	for _, tc := range []struct {
+		name, body    string
+		nilResponse   bool
+		wantFailed    bool
+		sdkError      bool
+		settledBefore bool
+		wantURL       string
+	}{
+		{name: "nil_response", nilResponse: true},
+		{name: "empty_object", body: "{}"},
+		{name: "json_null", body: "null"},
+		{name: "null_code", body: "{\"code\":null}"},
+		{name: "empty_code", body: "{\"code\":\"\"}"},
+		{name: "whitespace_code", body: "{\"code\":\" \\t\\n\"}"},
+		{name: "missing_code_with_checkout", body: "{\"data\":{\"orderAction\":\"https://checkout.example.invalid/accepted\"}}"},
+		{name: "success_missing_checkout", body: "{\"code\":\"0\",\"data\":{}}"},
+		{name: "unknown_status", body: "{\"code\":\"E0001\"}", sdkError: true},
+		{name: "explicit_rejection", body: "{\"code\":\"A0003\"}", wantFailed: true},
+		{name: "rejection_after_payment", body: "{\"code\":\"A0003\"}", settledBefore: true},
+		{name: "successful_checkout", body: "{\"code\":\"0\",\"data\":{\"orderAction\":\"https://checkout.example.invalid/accepted\"}}", wantURL: "https://checkout.example.invalid/accepted"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, keys := walletWebhookFixture(t)
+			topUp := walletWebhookOrder(t, model.PaymentProviderWaffo, "waffo-missing-outcome")
+			if tc.settledBefore {
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, walletWebhookRequest(t, keys, model.PaymentProviderWaffo, topUp.TradeNo, "90", true))
+				assert.JSONEq(t, "{\"message\":\"success\"}", response.Body.String())
+			}
+			var sdkResponse *core.ApiResponse[order.CreateOrderData]
+			if !tc.nilResponse {
+				sdk, err := getWaffoSDK()
+				require.NoError(t, err)
+				cfg := sdk.GetConfig()
+				requests := 0
+				cfg.CustomTransport = walletWaffoSDKTransport(func(_ context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+					requests++
+					assert.True(t, waffoutils.Verify(string(request.Body), request.Headers["X-SIGNATURE"], keys.PublicKey))
+					signature, err := waffoutils.Sign(tc.body, keys.PrivateKey)
+					if err != nil {
+						return nil, err
+					}
+					return waffonet.NewHttpResponse(http.StatusOK, map[string]string{"X-SIGNATURE": signature}, []byte(tc.body)), nil
+				})
+				sdk = waffo.New(cfg)
+				sdkResponse, err = sdk.Order().Create(t.Context(), &order.CreateOrderParams{MerchantOrderID: topUp.TradeNo}, nil)
+				assert.Equal(t, 1, requests)
+				if tc.sdkError {
+					require.Error(t, err)
+					require.Nil(t, sdkResponse)
+				} else {
+					require.NoError(t, err)
+					require.NotNil(t, sdkResponse, "the installed SDK decodes JSON null into a response with an empty code")
+				}
+			}
+			if !tc.sdkError {
+				paymentURL, err := resolveWaffoCheckoutResponse(topUp, sdkResponse)
+				assert.Equal(t, tc.wantURL, paymentURL)
+				if tc.wantURL == "" {
+					require.Error(t, err)
+				} else {
+					require.NoError(t, err)
+				}
+			}
+			var stored model.TopUp
+			require.NoError(t, model.DB.First(&stored, topUp.Id).Error)
+			wantStatus := common.TopUpStatusPending
+			if tc.wantFailed {
+				wantStatus = common.TopUpStatusFailed
+			}
+			if tc.settledBefore {
+				wantStatus = common.TopUpStatusSuccess
+			}
+			assert.Equal(t, wantStatus, stored.Status)
+			require.NotNil(t, stored.CreditedQuota)
+			assert.Equal(t, 1000, *stored.CreditedQuota)
+			for range 2 {
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, walletWebhookRequest(t, keys, model.PaymentProviderWaffo, topUp.TradeNo, "90", true))
+				wantBody := "{\"message\":\"success\"}"
+				if tc.wantFailed {
+					wantBody = "{\"message\":\"failed\"}"
+				}
+				assert.JSONEq(t, wantBody, response.Body.String())
+			}
+			var buyer, inviter model.User
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			require.NoError(t, model.DB.First(&stored, topUp.Id).Error)
+			var facts []model.ReferralRebate
+			require.NoError(t, model.DB.Where("top_up_id = ?", topUp.Id).Find(&facts).Error)
+			if tc.wantFailed {
+				assert.Equal(t, common.TopUpStatusFailed, stored.Status)
+				assert.Zero(t, stored.CompleteTime)
+				assert.Equal(t, -10, buyer.Quota)
+				assert.Equal(t, 7, inviter.AffQuota)
+				assert.Equal(t, 11, inviter.AffHistoryQuota)
+				assert.Empty(t, facts)
+			} else {
+				assert.Equal(t, common.TopUpStatusSuccess, stored.Status)
+				assert.Equal(t, 990, buyer.Quota)
+				assert.Equal(t, 107, inviter.AffQuota)
+				assert.Equal(t, 111, inviter.AffHistoryQuota)
+				require.Len(t, facts, 1)
+				assert.EqualValues(t, 1000, facts[0].CreditedQuota)
+				assert.EqualValues(t, 100, facts[0].RewardQuota)
+				assert.Equal(t, stored.CompleteTime, facts[0].SettledAt)
+			}
+		})
+	}
 }

@@ -167,7 +167,15 @@ export function useAffiliate(onBalanceChanged?: () => Promise<void>) {
       if (event.key !== null && !event.key.startsWith(`${storageKey}:`)) return
       // Another tab may complete or create its own operation. Preserve this
       // tab's unresolved identity; never infer its result from key deletion.
-      setSaved((current) => readPendingTransfer(storageKey, current.pending))
+      setSaved((current) => {
+        const recovered = readPendingTransfer(storageKey, current.pending)
+        // A successful read cannot prove an earlier cleanup completed. Keep
+        // recovery available until retry or verification releases the exact ID.
+        return {
+          pending: recovered.pending,
+          storageError: current.storageError || recovered.storageError,
+        }
+      })
     }
     window.addEventListener('storage', update)
     return () => window.removeEventListener('storage', update)

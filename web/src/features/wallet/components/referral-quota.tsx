@@ -19,7 +19,10 @@ For commercial licensing, please contact support@quantumnous.com
 import { useTranslation } from 'react-i18next'
 
 import { toIntlLocale } from '@/i18n/languages'
-import { formatQuotaWithCurrency } from '@/lib/currency'
+import { formatQuotaWithCurrency, getCurrencyDisplay } from '@/lib/currency'
+import { quotaUnitsToDollars } from '@/lib/format'
+
+import { parseAffiliateTransferQuota } from '../lib/affiliate'
 
 /** Keep ordinary amounts compact without rounding unsafe integer totals. */
 export function ReferralQuota(props: { value: string }) {
@@ -33,15 +36,30 @@ export function ReferralQuota(props: { value: string }) {
   const raw = new Intl.NumberFormat(locale, {
     maximumFractionDigits: 0,
   }).format(exact)
+  let display = t('{{amount}} quota units', { amount: raw })
+  if (safe) {
+    const quota = Number(exact)
+    // Even a safe integer can lose quota units during currency conversion.
+    // Check the unrounded amount so normal six-decimal display rounding stays
+    // unchanged; token mode also checks the formatter's USD round trip.
+    const amount =
+      getCurrencyDisplay().meta.kind === 'tokens'
+        ? formatQuotaWithCurrency(Math.abs(quota), { abbreviate: false })
+        : String(Math.abs(quotaUnitsToDollars(quota)))
+    if (
+      quota === 0 ||
+      parseAffiliateTransferQuota(amount) === Math.abs(quota)
+    ) {
+      display = formatQuotaWithCurrency(quota, {
+        abbreviate: false,
+        digitsLarge: 6,
+        digitsSmall: 6,
+      })
+    }
+  }
   return (
     <span className='max-w-full min-w-0 [overflow-wrap:anywhere] break-words whitespace-normal tabular-nums'>
-      {safe
-        ? formatQuotaWithCurrency(Number(exact), {
-            abbreviate: false,
-            digitsLarge: 6,
-            digitsSmall: 6,
-          })
-        : t('{{amount}} quota units', { amount: raw })}
+      {display}
     </span>
   )
 }
