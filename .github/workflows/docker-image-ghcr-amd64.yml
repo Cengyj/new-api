@@ -38,10 +38,17 @@ jobs:
             echo "::error::The source ref cannot be used as an image tag"
             exit 1
           fi
-          VERSION="${PREFIX}-${GITHUB_SHA:0:12}-amd64"
+          # Keep the application version independent of the compatibility branch tag.
+          BASE_VERSION=$(cat VERSION)
+          if [[ ! "$BASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::VERSION must contain the merged upstream release, for example v1.0.0-rc.46"
+            exit 1
+          fi
+          VERSION="${BASE_VERSION}-referral-${GITHUB_SHA:0:12}-amd64"
           printf '%s\n' "$VERSION" > VERSION
           echo "name=$IMAGE" >> "$GITHUB_OUTPUT"
           echo "immutable=$IMAGE:sha-$GITHUB_SHA-amd64" >> "$GITHUB_OUTPUT"
+          echo "release=$IMAGE:$BASE_VERSION" >> "$GITHUB_OUTPUT"
           echo "stable=$IMAGE:$PREFIX-amd64" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -143,25 +150,37 @@ jobs:
           docker stop --time 15 "$CONTAINER_ID" >/dev/null
           test "$(docker inspect --format '{{.State.ExitCode}}' "$CONTAINER_ID")" = 0
 
-      - name: Promote the verified image to the branch tag
+      - name: Promote the verified image to release and compatibility tags
         id: promote
         env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
           IMAGE_REF: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          RELEASE_TAG: ${{ steps.image.outputs.release }}
           STABLE_TAG: ${{ steps.image.outputs.stable }}
           SOURCE_REF: ${{ github.ref_name }}
         run: |
-          if [ "$GITHUB_REF_TYPE" != branch ]; then
+          # Other branches must not overwrite release/latest or compatibility aliases.
+          if [ "$GITHUB_REF" != refs/heads/referral-rebate-rc45 ]; then
             echo "published=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           REMOTE_REF=$(git ls-remote --exit-code origin "refs/heads/$SOURCE_REF")
           HEAD_SHA=$(printf '%s\n' "$REMOTE_REF" | awk '{print $1}')
           if [ "$HEAD_SHA" != "$GITHUB_SHA" ]; then
-            echo "The branch has advanced; retain the commit image without replacing its current branch tag."
+            echo "The branch has advanced; retain the commit image without replacing published aliases."
             echo "published=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          docker buildx imagetools create --tag "$STABLE_TAG" "$IMAGE_REF"
+          docker buildx imagetools create \
+            --tag "$RELEASE_TAG" \
+            --tag "$RELEASE_TAG-amd64" \
+            --tag "$IMAGE_NAME:latest" \
+            --tag "$IMAGE_NAME:latest-amd64" \
+            --tag "$STABLE_TAG" "$IMAGE_REF"
+          for TAG in "$RELEASE_TAG" "$RELEASE_TAG-amd64" "$IMAGE_NAME:latest" "$IMAGE_NAME:latest-amd64" "$STABLE_TAG"; do
+            PUBLISHED_DIGEST=$(docker buildx imagetools inspect "$TAG" --format '{{.Manifest.Digest}}')
+            test "$PUBLISHED_DIGEST" = "${IMAGE_REF##*@}"
+          done
           echo "published=true" >> "$GITHUB_OUTPUT"
 
       - name: Record image references
@@ -169,18 +188,22 @@ jobs:
           IMAGE_NAME: ${{ steps.image.outputs.name }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           IMMUTABLE_TAG: ${{ steps.image.outputs.immutable }}
+          RELEASE_TAG: ${{ steps.image.outputs.release }}
           STABLE_TAG: ${{ steps.image.outputs.stable }}
           APP_VERSION: ${{ steps.image.outputs.version }}
-          BRANCH_TAG_PUBLISHED: ${{ steps.promote.outputs.published }}
+          ALIASES_PUBLISHED: ${{ steps.promote.outputs.published }}
         run: |
           {
             echo '### new-api image — linux/amd64 (x86_64)'
             echo "Source commit: $GITHUB_SHA"
             echo "Application version: $APP_VERSION"
-            if [ "$BRANCH_TAG_PUBLISHED" = true ]; then
-              echo "Updated branch image: $STABLE_TAG"
+            if [ "$ALIASES_PUBLISHED" = true ]; then
+              echo "Release image: $RELEASE_TAG"
+              echo "Architecture tag: $RELEASE_TAG-amd64"
+              echo "Latest aliases: $IMAGE_NAME:latest and $IMAGE_NAME:latest-amd64"
+              echo "Compatibility alias: $STABLE_TAG"
             else
-              echo 'The branch tag was not changed because this run does not represent its current head.'
+              echo 'Release and compatibility aliases were not changed because this run is not the current head of the publishing branch.'
             fi
             echo "Commit image: $IMMUTABLE_TAG"
             echo "Pinned image: $IMAGE_NAME@$IMAGE_DIGEST"

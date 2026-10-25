@@ -56,6 +56,13 @@
 
 ---
 
+> [!IMPORTANT]
+> 此定制仓库包含邀请充值返利，已合并上游 new-api `v1.0.0-rc.46`。GHCR 工作流将定制镜像发布到 `ghcr.io/cengyj/new-api`，版本标签与上游对应：`v1.0.0-rc.46`、`v1.0.0-rc.46-amd64`、`latest` 和 `latest-amd64`。四个标签当前均仅提供 `linux/amd64`。旧标签 `referral-rebate-rc45-amd64` 保留为兼容别名，不代表上游版本。
+>
+> 下方保留的上游 Docker 示例使用 `calciumion/new-api`，不会安装本仓库的定制功能。示例 Compose 支持设置 `NEW_API_IMAGE=ghcr.io/cengyj/new-api:v1.0.0-rc.46`，新标签须等待对应工作流成功后使用。生产部署应使用 GHCR 工作流记录并验证的固定 digest。已有生产服务器更换镜像时应保留自己的 Compose 配置。
+>
+> `VERSION` 记录已经合并的上游版本。GHCR 工作流为应用版本附加 `referral`、源码提交和架构，保留定制产物的可追溯性；版本和 latest 别名仅在发布分支当前提交的镜像验证通过后更新。修改这些文件只影响后续构建，已经发布的镜像 digest 仍保留原版本标识。
+
 ## 📝 项目说明
 
 New API 是面向应用、Agent 和团队的自托管 AI 网关。将不同厂商的模型服务接入统一入口，在同一套控制台中管理渠道、访问权限、用量与成本。
