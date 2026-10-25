@@ -93,7 +93,7 @@ func ParseReferralRebateRule(enabled bool, percentage, days string) (ReferralReb
 }
 
 func InitializeReferralRebateRule(db *gorm.DB) error {
-	value, err := common.Marshal(ReferralRebateRule{})
+	value, err := common.Marshal(ReferralRebateRule{Enabled: false, RateBPS: 500, ValidDays: 7})
 	if err != nil {
 		return err
 	}

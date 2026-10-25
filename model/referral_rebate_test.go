@@ -33,6 +33,44 @@ func referralFixture(t *testing.T, rate int) (User, User) {
 	return inviter, invitee
 }
 
+func TestReferralRuleInitializationDefaultsAndPreservesExistingAcrossDatabases(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			db, _ := newReferralIntegrationDatabase(t, dialect)
+			for range 2 {
+				require.NoError(t, db.AutoMigrate(&Option{}))
+				require.NoError(t, InitializeReferralRebateRule(db))
+				rule, err := readReferralRebateRule(db, false)
+				require.NoError(t, err)
+				assert.Equal(t, ReferralRebateRule{Enabled: false, RateBPS: 500, ValidDays: 7}, rule)
+			}
+			for _, tc := range []struct {
+				name string
+				rule ReferralRebateRule
+			}{
+				{"legacy_unconfigured", ReferralRebateRule{}},
+				{"configured_pause", ReferralRebateRule{RateBPS: 1250, ValidDays: 20}},
+				{"configured_enabled", ReferralRebateRule{Enabled: true, RateBPS: 2500, ValidDays: 60}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					value, err := common.Marshal(tc.rule)
+					require.NoError(t, err)
+					require.NoError(t, db.Model(&Option{}).Where(&Option{Key: ReferralRebateOptionKey}).Update("value", string(value)).Error)
+					for range 2 {
+						require.NoError(t, InitializeReferralRebateRule(db))
+						rule, err := readReferralRebateRule(db, false)
+						require.NoError(t, err)
+						assert.Equal(t, tc.rule, rule, "startup must preserve the existing rule")
+					}
+				})
+			}
+			var count int64
+			require.NoError(t, db.Model(&Option{}).Where(&Option{Key: ReferralRebateOptionKey}).Count(&count).Error)
+			assert.EqualValues(t, 1, count)
+		})
+	}
+}
+
 func TestReferralRuleRejectsInvalidPrecisionAndPreservesCommittedRule(t *testing.T) {
 	referralFixture(t, 1000)
 	for _, percentage := range []string{"0", "-1", "NaN", "Inf", "100.01", "0.001", "10.000", "1e1", "", "0x10", "10%"} {
@@ -505,7 +543,7 @@ func TestReferralCorruptRulesRollbackSettlementAcrossDatabases(t *testing.T) {
 			require.NoError(t, InitializeReferralRebateRule(db))
 			initial, err := GetReferralRebateRule()
 			require.NoError(t, err)
-			assert.Equal(t, ReferralRebateRule{}, initial, "first initialization remains a complete disabled rule")
+			assert.Equal(t, ReferralRebateRule{Enabled: false, RateBPS: 500, ValidDays: 7}, initial, "first initialization remains a complete disabled rule")
 			for _, state := range []string{"default_disabled", "configured_pause", "unqualified_corrupt_rule"} {
 				t.Run(state, func(t *testing.T) {
 					inviter := User{Username: state, AffCode: state, Status: common.UserStatusEnabled}

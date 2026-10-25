@@ -167,6 +167,41 @@ test('closing and reopening records preserves one rule form and identity changes
   )
 })
 
+test('server defaults keep rebates off and preserve five percent and seven days when enabled', async () => {
+  const defaults = { enabled: false, rate_bps: 500, valid_days: 7 }
+  const puts: AxiosRequestConfig[] = []
+  vi.spyOn(api, 'request').mockImplementation(async (config) => {
+    if (config.method === 'put') {
+      puts.push(config)
+      return success({ ...defaults, enabled: true })
+    }
+    return success(defaults)
+  })
+  await mountSettings()
+  const user = userEvent.setup()
+  const toggle = screen.getByRole('switch', {
+    name: 'Enable invitation top-up rebates',
+  })
+  expect(toggle).not.toBeChecked()
+  expect(
+    screen.getByRole('textbox', { name: 'Rebate percentage (%)' })
+  ).toHaveValue('5')
+  expect(
+    screen.getByRole('textbox', { name: 'Valid days after registration' })
+  ).toHaveValue('7')
+
+  await user.click(toggle)
+  await user.click(screen.getByRole('button', { name: 'Save Changes' }))
+  await waitFor(() => expect(puts).toHaveLength(1))
+  expect(puts[0]).toMatchObject({
+    url: '/api/option/referral_rebate',
+    data: { enabled: true, percentage: '5', valid_days: '7' },
+  })
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeDisabled()
+  )
+})
+
 test('enabling an unconfigured rule validates both fields and saves all three fields in one request', async () => {
   const puts: AxiosRequestConfig[] = []
   vi.spyOn(api, 'request').mockImplementation(async (config) => {
