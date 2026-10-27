@@ -1815,7 +1815,7 @@ func TestWalletReferralCheckoutLocalFailurePreservesCompletionPolicy(t *testing.
 }
 
 func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.T) {
-	for _, scenario := range []string{"late_callback", "manual_then_callback", "callback_before_response_loss", "non_json_remote_error"} {
+	for _, scenario := range []string{"late_callback", "manual_then_callback", "callback_before_response_loss", "non_json_remote_error", "session_http500", "session_http401", "token_http500", "token_http401", "successful_checkout"} {
 		t.Run(scenario, func(t *testing.T) {
 			router, keys := walletCheckoutFixture(t)
 			observed := make(chan model.TopUp, 1)
@@ -1841,6 +1841,11 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 				}
 				if request.URL.Path == "/v1/actions/auth/issue-session-token" {
 					w.Header().Set("Content-Type", "application/json")
+					if scenario == "token_http500" {
+						w.WriteHeader(http.StatusInternalServerError)
+					} else if scenario == "token_http401" {
+						w.WriteHeader(http.StatusUnauthorized)
+					}
 					_, _ = w.Write([]byte(`{"data":{"token":"fixture","expiresAt":"2099-01-01T00:00:00Z"}}`))
 					return
 				}
@@ -1883,6 +1888,16 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 					_, _ = w.Write([]byte("remote response is not JSON"))
 					return
 				}
+				switch scenario {
+				case "session_http500", "session_http401", "token_http500", "token_http401", "successful_checkout":
+					if scenario == "session_http500" {
+						w.WriteHeader(http.StatusInternalServerError)
+					} else if scenario == "session_http401" {
+						w.WriteHeader(http.StatusUnauthorized)
+					}
+					_, _ = w.Write([]byte(`{"data":{"sessionId":"CS_fixture","checkoutUrl":"https://checkout.example.invalid/pancake","expiresAt":"2099-01-01T00:00:00Z"}}`))
+					return
+				}
 				// The provider received the signed create request, then its TCP
 				// response was lost. No API rejection is invented by the fixture.
 				connection, _, err := w.(http.Hijacker).Hijack()
@@ -1920,7 +1935,13 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 			request := httptest.NewRequestWithContext(ctx, http.MethodPost, "/checkout", strings.NewReader(`{"amount":100}`))
 			request.Header.Set("Content-Type", "application/json")
 			router.ServeHTTP(recorder, request)
-			assert.Contains(t, recorder.Body.String(), `"message":"error"`)
+			if scenario == "successful_checkout" {
+				assert.Contains(t, recorder.Body.String(), `"message":"success"`)
+				assert.Contains(t, recorder.Body.String(), "https://checkout.example.invalid/pancake#token=fixture")
+			} else {
+				assert.Contains(t, recorder.Body.String(), `"message":"error"`)
+				assert.NotContains(t, recorder.Body.String(), "checkout.example.invalid")
+			}
 			var order model.TopUp
 			select {
 			case order = <-observed:
@@ -1942,9 +1963,11 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 				router.ServeHTTP(recorder, request)
 				assert.Contains(t, recorder.Body.String(), `"success":true`)
 			}
-			recorder = httptest.NewRecorder()
-			router.ServeHTTP(recorder, walletWebhookRequest(t, keys, model.PaymentProviderWaffoPancake, order.TradeNo, "90", true))
-			require.Equal(t, http.StatusOK, recorder.Code)
+			for range 2 {
+				recorder = httptest.NewRecorder()
+				router.ServeHTTP(recorder, walletWebhookRequest(t, keys, model.PaymentProviderWaffoPancake, order.TradeNo, "90", true))
+				require.Equal(t, http.StatusOK, recorder.Code)
+			}
 			require.NoError(t, model.DB.First(&order, order.Id).Error)
 			assert.Equal(t, common.TopUpStatusSuccess, order.Status)
 			assert.Equal(t, 1000, *order.CreditedQuota)
@@ -1958,6 +1981,114 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 			require.Len(t, facts, 1)
 			assert.EqualValues(t, 1000, facts[0].CreditedQuota)
 			assert.EqualValues(t, 100, facts[0].RewardQuota)
+		})
+	}
+}
+
+func TestWalletPancakeSharedCheckoutPreservesSubscriptionDispatch(t *testing.T) {
+	for _, tc := range []struct {
+		name, failedPath string
+		status           int
+		localFailure     bool
+		accepted         bool
+	}{
+		{name: "session_http401", failedPath: "/v1/actions/checkout/create-session", status: http.StatusUnauthorized},
+		{name: "session_http500", failedPath: "/v1/actions/checkout/create-session", status: http.StatusInternalServerError},
+		{name: "token_http401", failedPath: "/v1/actions/auth/issue-session-token", status: http.StatusUnauthorized},
+		{name: "token_http500", failedPath: "/v1/actions/auth/issue-session-token", status: http.StatusInternalServerError},
+		{name: "local_product_rejection", localFailure: true},
+		{name: "successful_checkout", accepted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, keys := walletCheckoutFixture(t)
+			sqlDB, err := model.DB.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(2)
+			require.NoError(t, model.DB.AutoMigrate(&model.SubscriptionPlan{}, &model.UserSubscription{}))
+			plan := model.SubscriptionPlan{Id: 905, Title: "Pancake shared checkout fixture", PriceAmount: 100, Enabled: true, DurationUnit: model.SubscriptionDurationMonth, DurationValue: 1, WaffoPancakeProductId: setting.WaffoPancakeProductID}
+			if tc.localFailure {
+				plan.WaffoPancakeProductId = "invalid-product"
+			}
+			require.NoError(t, model.DB.Create(&plan).Error)
+			model.InvalidateSubscriptionPlanCache(plan.Id)
+			t.Cleanup(func() { model.InvalidateSubscriptionPlanCache(plan.Id) })
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				requests.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				if request.URL.Path == tc.failedPath {
+					w.WriteHeader(tc.status)
+				}
+				switch request.URL.Path {
+				case "/v1/actions/auth/issue-session-token":
+					_, _ = w.Write([]byte(`{"data":{"token":"fixture","expiresAt":"2099-01-01T00:00:00Z"}}`))
+				case "/v1/actions/checkout/create-session":
+					_, _ = w.Write([]byte(`{"data":{"sessionId":"CS_fixture","checkoutUrl":"https://checkout.example.invalid/subscription","expiresAt":"2099-01-01T00:00:00Z"}}`))
+				default:
+					t.Errorf("subscription must not enter wallet inquiry: %s", request.URL.Path)
+					w.WriteHeader(http.StatusBadRequest)
+				}
+			}))
+			defer server.Close()
+			target, err := url.Parse(server.URL)
+			require.NoError(t, err)
+			oldClient := http.DefaultClient
+			http.DefaultClient = &http.Client{Transport: walletCheckoutTransport(func(request *http.Request) (*http.Response, error) {
+				if request.URL.Host != "api.waffo.ai" {
+					return nil, fmt.Errorf("unexpected checkout host: %s", request.URL.Host)
+				}
+				local := request.Clone(request.Context())
+				local.URL.Scheme, local.URL.Host = target.Scheme, target.Host
+				return server.Client().Transport.RoundTrip(local)
+			})}
+			t.Cleanup(func() { http.DefaultClient = oldClient })
+			router.POST("/subscription-checkout", func(c *gin.Context) { c.Set("id", 902) }, SubscriptionRequestWaffoPancakePay)
+			request := httptest.NewRequest(http.MethodPost, "/subscription-checkout", strings.NewReader(`{"plan_id":905}`))
+			request.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			if tc.accepted {
+				assert.Contains(t, recorder.Body.String(), `"message":"success"`)
+			} else {
+				assert.Contains(t, recorder.Body.String(), `"message":"error"`)
+				assert.NotContains(t, recorder.Body.String(), "checkout.example.invalid")
+			}
+			var order model.SubscriptionOrder
+			require.NoError(t, model.DB.Where("user_id = ?", 902).First(&order).Error)
+			require.True(t, strings.HasPrefix(order.TradeNo, "WAFFO_PANCAKE_SUB-"))
+			wantStatus := common.TopUpStatusPending
+			if tc.localFailure {
+				wantStatus = common.TopUpStatusFailed
+				assert.Zero(t, requests.Load())
+			} else {
+				assert.EqualValues(t, 2, requests.Load())
+			}
+			assert.Equal(t, wantStatus, order.Status)
+			for range 2 {
+				callback := httptest.NewRecorder()
+				router.ServeHTTP(callback, walletWebhookRequest(t, keys, model.PaymentProviderWaffoPancake, order.TradeNo, "90", true))
+				if tc.localFailure {
+					assert.Equal(t, http.StatusInternalServerError, callback.Code)
+				} else {
+					assert.Equal(t, http.StatusOK, callback.Code)
+				}
+			}
+			var subscriptions, rebates int64
+			require.NoError(t, model.DB.Model(&model.UserSubscription{}).Count(&subscriptions).Error)
+			if tc.localFailure {
+				assert.Zero(t, subscriptions)
+			} else {
+				assert.EqualValues(t, 1, subscriptions)
+				require.NoError(t, model.DB.First(&order, order.Id).Error)
+				assert.Equal(t, common.TopUpStatusSuccess, order.Status)
+			}
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+			assert.Zero(t, rebates)
+			var buyer, inviter model.User
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			assert.Equal(t, -10, buyer.Quota)
+			assert.Equal(t, 7, inviter.AffQuota)
 		})
 	}
 }

@@ -62,25 +62,25 @@ func (t *waffoPancakeCheckoutTransport) RoundTrip(request *http.Request) (*http.
 	return t.transport.RoundTrip(request)
 }
 
-// The installed GraphQL SDK exposes data/errors but discards HTTP status.
+// The installed SDK can expose data/errors without rejecting HTTP failures.
 // Preserve an authentication or server failure even if its body has data.
-type waffoPancakeInquiryTransport struct {
+type waffoPancakeResponseTransport struct {
 	transport http.RoundTripper
 }
 
-func (t *waffoPancakeInquiryTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+func (t *waffoPancakeResponseTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	response, err := t.transport.RoundTrip(request)
 	if err != nil {
 		return response, err
 	}
 	if response == nil {
-		return nil, fmt.Errorf("Waffo Pancake inquiry returned no response")
+		return nil, fmt.Errorf("Waffo Pancake returned no response")
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		if response.Body != nil {
 			response.Body.Close()
 		}
-		return nil, fmt.Errorf("Waffo Pancake inquiry returned HTTP %d", response.StatusCode)
+		return nil, fmt.Errorf("Waffo Pancake returned HTTP %d", response.StatusCode)
 	}
 	return response, nil
 }
@@ -166,6 +166,7 @@ func CreateWaffoPancakeCheckoutSession(ctx context.Context, params *WaffoPancake
 	if transport.transport == nil {
 		transport.transport = http.DefaultTransport
 	}
+	transport.transport = &waffoPancakeResponseTransport{transport: transport.transport}
 	httpClient.Transport = transport
 	client, err := pancake.New(pancake.Config{
 		MerchantID: merchantID,
@@ -345,7 +346,7 @@ func ResolveWaffoPancakeTradeNo(ctx context.Context, event *WaffoPancakeWebhookE
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
-	httpClient.Transport = &waffoPancakeInquiryTransport{transport: transport}
+	httpClient.Transport = &waffoPancakeResponseTransport{transport: transport}
 	client, err := pancake.New(pancake.Config{MerchantID: merchantID, PrivateKey: privateKey, HTTPClient: &httpClient})
 	if err != nil {
 		return "", errors.Join(ErrWaffoPancakeOrderLookup, err)
