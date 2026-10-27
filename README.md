@@ -57,9 +57,9 @@
 ---
 
 > [!IMPORTANT]
-> This fork includes invitation recharge rebates and has merged upstream new-api `v1.0.0-rc.46`. Its GHCR workflow publishes custom images to `ghcr.io/cengyj/new-api` with version-aligned tags `v1.0.0-rc.46`, `v1.0.0-rc.46-amd64`, `latest`, and `latest-amd64`. All four tags currently target `linux/amd64`. The old `referral-rebate-rc45-amd64` tag is retained as a compatibility alias, not an upstream version indicator.
+> This fork includes invitation recharge rebates and has merged upstream new-api `v1.0.0-rc.47` (`e835b1bfc43b565d625537830dbfb19328925134`). This records source integration; this change does not publish or deploy a new image. After an authorized publishing run passes image verification, the existing GHCR workflow publishes custom images to `ghcr.io/cengyj/new-api` with version-aligned tags `v1.0.0-rc.47`, `v1.0.0-rc.47-amd64`, `latest`, and `latest-amd64`. These tags target `linux/amd64`. The old `referral-rebate-rc45-amd64` tag is retained as a compatibility alias, not an upstream version indicator.
 >
-> The upstream Docker examples below use `calciumion/new-api` and do not install this customization. The sample Compose file accepts `NEW_API_IMAGE=ghcr.io/cengyj/new-api:v1.0.0-rc.46`; use a new tag only after its workflow completes successfully. Production deployments should use the verified digest recorded by the GHCR workflow. Preserve your existing production Compose settings when changing the image.
+> The upstream Docker examples below use `calciumion/new-api` and do not install this customization. The sample Compose file accepts `NEW_API_IMAGE=ghcr.io/cengyj/new-api:v1.0.0-rc.47`; use this tag only after its publishing workflow completes successfully. Production deployments should use the verified digest recorded by the GHCR workflow. Preserve your existing production Compose settings when changing the image.
 >
 > `VERSION` records the merged upstream release. The GHCR workflow adds a `referral` suffix, source commit, and architecture to the application version so the customization remains identifiable. Release/latest aliases are published only after image verification, from the current head of the publishing branch. Updating these files affects future builds only; already published image digests retain their original version.
 
