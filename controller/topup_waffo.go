@@ -60,6 +60,10 @@ func getWaffoSDKForMerchant(merchantID string) (*waffo.Waffo, error) {
 		return nil, err
 	}
 	cfg.CustomTransport = service.WaffoHTTPTransport
+	if cfg.CustomTransport == nil {
+		cfg.CustomTransport = waffonet.NewDefaultHttpTransportWithTimeouts(cfg.ConnectTimeout, cfg.ReadTimeout)
+	}
+	cfg.CustomTransport = waffoResponseTransport{transport: cfg.CustomTransport}
 	return waffo.New(cfg), nil
 }
 
@@ -476,25 +480,25 @@ func WaffoWebhook(c *gin.Context) {
 }
 
 // The SDK decodes JSON even on HTTP authentication/server failures. Such a
-// reply cannot prove that the merchant-authenticated order inquiry succeeded.
-type waffoInquiryTransport struct {
+// reply cannot prove that a merchant-authenticated payment request succeeded.
+type waffoResponseTransport struct {
 	transport waffonet.HttpTransport
 }
 
-func (transport waffoInquiryTransport) Send(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+func (transport waffoResponseTransport) Send(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
 	response, err := transport.transport.Send(ctx, request)
 	if err != nil {
 		return nil, err
 	}
 	if response == nil {
-		return nil, errors.New("Waffo inquiry returned no HTTP response")
+		return nil, errors.New("Waffo returned no HTTP response")
 	}
 	if !response.IsSuccess() {
-		return nil, fmt.Errorf("Waffo inquiry returned HTTP %d", response.StatusCode)
+		return nil, fmt.Errorf("Waffo returned HTTP %d", response.StatusCode)
 	}
 	// The SDK verifies response signatures only when present; require one.
 	if response.GetHeader(core.HeaderSignature) == "" {
-		return nil, errors.New("Waffo inquiry response signature is missing")
+		return nil, errors.New("Waffo response signature is missing")
 	}
 	return response, nil
 }
@@ -524,12 +528,7 @@ func handleWaffoPayment(c *gin.Context, sdk *waffo.Waffo, wh *core.WebhookHandle
 			// A committed order only needs the existing idempotent settlement /
 			// cache recovery path. Provider availability cannot revoke that fact.
 			if topUp.Status == common.TopUpStatusPending {
-				queryConfig := *sdk.GetConfig()
-				if queryConfig.CustomTransport == nil {
-					queryConfig.CustomTransport = waffonet.NewDefaultHttpTransportWithTimeouts(queryConfig.ConnectTimeout, queryConfig.ReadTimeout)
-				}
-				queryConfig.CustomTransport = waffoInquiryTransport{transport: queryConfig.CustomTransport}
-				response, err := waffo.New(&queryConfig).Order().Inquiry(c.Request.Context(), &order.InquiryOrderParams{PaymentRequestID: topUp.TradeNo}, nil)
+				response, err := sdk.Order().Inquiry(c.Request.Context(), &order.InquiryOrderParams{PaymentRequestID: topUp.TradeNo}, nil)
 				// SDK v1.3.2 represents transport/verification failures as E0001
 				// with nil error; a non-nil response is not proof of success.
 				if err != nil || response == nil || !response.IsSuccess() || response.Data == nil {

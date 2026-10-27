@@ -847,7 +847,7 @@ func TestWalletReferralSignedCallbacksAndManualCompletion(t *testing.T) {
 
 func TestWalletReferralCallbacksPaymentProofAndRollback(t *testing.T) {
 	for _, provider := range []string{model.PaymentProviderEpay, model.PaymentProviderStripe, model.PaymentProviderCreem, model.PaymentProviderWaffo, model.PaymentProviderWaffoPancake} {
-		for _, scenario := range []string{"unpaid", "missing_amount", "invalid_amount", "zero_paid", "reward_overflow", "wrong_provider", "bad_signature", "paused", "lookup_failure", "subscription_lookup_failure", "redis_capture_failure"} {
+		for _, scenario := range []string{"unpaid", "missing_amount", "invalid_amount", "zero_paid", "reward_overflow", "wrong_provider", "bad_signature", "blank_signature", "paused", "lookup_failure", "subscription_lookup_failure", "redis_capture_failure"} {
 			t.Run(provider+"/"+scenario, func(t *testing.T) {
 				router, keys := walletWebhookFixture(t)
 				order := walletWebhookOrder(t, provider, "wallet_proof")
@@ -905,13 +905,17 @@ func TestWalletReferralCallbacksPaymentProofAndRollback(t *testing.T) {
 					require.NoError(t, err)
 					request.Body = io.NopCloser(bytes.NewReader(notificationBody))
 				}
-				if scenario == "bad_signature" {
+				if scenario == "bad_signature" || scenario == "blank_signature" {
+					signature := "invalid"
+					if scenario == "blank_signature" {
+						signature = " \t "
+					}
 					if provider == model.PaymentProviderEpay {
 						require.NoError(t, request.ParseForm())
-						request.PostForm.Set("sign", "invalid")
+						request.PostForm.Set("sign", signature)
 					} else {
 						for _, header := range []string{"Stripe-Signature", CreemSignatureHeader, "X-SIGNATURE", "X-Waffo-Signature"} {
-							request.Header.Set(header, "invalid")
+							request.Header.Set(header, signature)
 						}
 					}
 				}
@@ -4827,6 +4831,7 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 		{name: "network_failure"},
 		{name: "missing_query_signature"},
 		{name: "empty_query_signature"},
+		{name: "blank_query_signature"},
 		{name: "lowercase_query_signature", accepted: true},
 		{name: "mixed_case_query_signature", accepted: true},
 		{name: "bad_query_signature"},
@@ -4892,6 +4897,8 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 						delete(response.Headers, core.HeaderSignature)
 					case "empty_query_signature":
 						response.Headers[core.HeaderSignature] = ""
+					case "blank_query_signature":
+						response.Headers[core.HeaderSignature] = " \t "
 					case "lowercase_query_signature", "mixed_case_query_signature":
 						header := "x-signature"
 						if scenario.name == "mixed_case_query_signature" {
@@ -4965,6 +4972,147 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 				assert.Equal(t, 990, buyer.Quota)
 				assert.Equal(t, 107, inviter.AffQuota)
 				assert.EqualValues(t, 1, facts)
+			}
+		})
+	}
+}
+
+func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    int
+		signature string
+		code      string
+		accepted  bool
+		rejected  bool
+	}{
+		{name: "valid_signed", status: 200, signature: "valid", code: "0", accepted: true},
+		{name: "lowercase_signature", status: 200, signature: "lowercase", code: "0", accepted: true},
+		{name: "mixed_case_signature", status: 200, signature: "mixed_case", code: "0", accepted: true},
+		{name: "nil_response", status: 200, signature: "valid", code: "0"},
+		{name: "network_failure", status: 200, signature: "valid", code: "0"},
+		{name: "unknown_status", status: 200, signature: "valid", code: "E0001"},
+		{name: "missing_signature", status: 200, signature: "missing", code: "0"},
+		{name: "empty_signature", status: 200, signature: "empty", code: "0"},
+		{name: "blank_signature", status: 200, signature: "blank", code: "0"},
+		{name: "bad_signature", status: 200, signature: "bad", code: "0"},
+		{name: "http500_signed_success", status: 500, signature: "valid", code: "0"},
+		{name: "http401_signed_success", status: 401, signature: "valid", code: "0"},
+		{name: "unsigned_rejection", status: 200, signature: "missing", code: "A0003"},
+		{name: "signed_rejection", status: 200, signature: "valid", code: "A0003", rejected: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, keys := walletCheckoutFixture(t)
+			oldPrice, oldMin := setting.WaffoUnitPrice, setting.WaffoMinTopUp
+			oldMerchant, oldCurrency := setting.WaffoMerchantId, setting.WaffoCurrency
+			t.Cleanup(func() {
+				setting.WaffoUnitPrice, setting.WaffoMinTopUp = oldPrice, oldMin
+				setting.WaffoMerchantId, setting.WaffoCurrency = oldMerchant, oldCurrency
+			})
+			setting.WaffoUnitPrice, setting.WaffoMinTopUp = 1, 1
+			setting.WaffoMerchantId, setting.WaffoCurrency = "merchant_checkout", "USD"
+			inquiryTransport := service.WaffoHTTPTransport
+			var outgoing order.CreateOrderParams
+			service.WaffoHTTPTransport = walletWaffoSDKTransport(func(_ context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+				require.True(t, strings.HasSuffix(request.URL, "/order/create"))
+				require.True(t, waffoutils.Verify(string(request.Body), request.Headers["X-SIGNATURE"], keys.PublicKey))
+				require.NoError(t, common.Unmarshal(request.Body, &outgoing))
+				body, err := common.Marshal(map[string]any{"code": tc.code, "data": order.CreateOrderData{
+					MerchantOrderID: outgoing.MerchantOrderID, PaymentRequestID: outgoing.PaymentRequestID,
+					OrderAction: "{\"actionType\":\"REDIRECT\",\"webUrl\":\"https://checkout.example.invalid/audit-unverified\"}",
+				}})
+				require.NoError(t, err)
+				headers := map[string]string{}
+				switch tc.signature {
+				case "valid", "lowercase", "mixed_case":
+					signature, err := waffoutils.Sign(string(body), keys.PrivateKey)
+					require.NoError(t, err)
+					header := core.HeaderSignature
+					if tc.signature == "lowercase" {
+						header = "x-signature"
+					} else if tc.signature == "mixed_case" {
+						header = "X-SiGnAtUrE"
+					}
+					headers[header] = signature
+				case "empty":
+					headers[core.HeaderSignature] = ""
+				case "blank":
+					headers[core.HeaderSignature] = " \t "
+				case "bad":
+					headers[core.HeaderSignature] = "invalid"
+				}
+				if tc.name == "nil_response" {
+					return nil, nil
+				}
+				if tc.name == "network_failure" {
+					return nil, context.DeadlineExceeded
+				}
+				return waffonet.NewHttpResponse(tc.status, headers, body), nil
+			})
+			router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestWaffoPay)
+			request := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader("{\"amount\":100}"))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			require.NotEmpty(t, outgoing.PaymentRequestID)
+			var decoded struct {
+				Message    string
+				MessageKey string `json:"message_key"`
+				Data       json.RawMessage
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &decoded))
+			if tc.accepted {
+				assert.Equal(t, "success", decoded.Message)
+			} else {
+				assert.Equal(t, "error", decoded.Message)
+				assert.Equal(t, "Failed to start payment", decoded.MessageKey)
+				assert.NotContains(t, response.Body.String(), "audit-unverified")
+			}
+			stored, err := model.GetTopUpByTradeNoWithError(outgoing.PaymentRequestID)
+			require.NoError(t, err)
+			status := common.TopUpStatusPending
+			if tc.rejected {
+				status = common.TopUpStatusFailed
+			}
+			assert.Equal(t, status, stored.Status)
+			assert.Equal(t, outgoing.MerchantOrderID, stored.TradeNo)
+			assert.Equal(t, outgoing.PaymentRequestID, stored.TradeNo)
+			assert.Equal(t, 902, stored.UserId)
+			require.NotNil(t, stored.CreditedQuota)
+			assert.Equal(t, 1000, *stored.CreditedQuota)
+			var buyer, inviter model.User
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			assert.Equal(t, -10, buyer.Quota)
+			assert.Equal(t, 7, inviter.AffQuota)
+			var rebates int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+			assert.Zero(t, rebates)
+
+			// An unknown checkout outcome still belongs to the original frozen
+			// order. Verified notifications can recover it exactly once.
+			service.WaffoHTTPTransport = inquiryTransport
+			common.QuotaPerUnit = 100
+			for range 2 {
+				callback := httptest.NewRecorder()
+				router.ServeHTTP(callback, walletWebhookRequest(t, keys, model.PaymentProviderWaffo, stored.TradeNo, "90", true))
+				if tc.rejected {
+					assert.JSONEq(t, `{"message":"failed"}`, callback.Body.String())
+				} else {
+					assert.JSONEq(t, `{"message":"success"}`, callback.Body.String())
+				}
+			}
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+			if tc.rejected {
+				assert.Equal(t, -10, buyer.Quota)
+				assert.Equal(t, 7, inviter.AffQuota)
+				assert.Zero(t, rebates)
+			} else {
+				assert.Equal(t, 990, buyer.Quota)
+				assert.Equal(t, 107, inviter.AffQuota)
+				assert.EqualValues(t, 1, rebates)
 			}
 		})
 	}
