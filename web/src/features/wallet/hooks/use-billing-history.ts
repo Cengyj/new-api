@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { isAxiosError } from 'axios'
 import i18next from 'i18next'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { toast } from 'sonner'
@@ -148,7 +149,18 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
         }
       } catch (error) {
         if (signal.aborted) return false
-        handleServerError(error, i18next.t('Failed to complete order'))
+        const status = isAxiosError(error) ? error.response?.status : undefined
+        if (status !== undefined && status >= 400 && status < 500) {
+          handleServerError(error, i18next.t('Failed to complete order'))
+        } else {
+          // The database may have committed before the response was lost.
+          // Keep this order available for reconciliation and same-order retry.
+          handleServerError(error, undefined, {
+            title: i18next.t(
+              'Order completion result is unknown. Refresh Order History before retrying this order.'
+            ),
+          })
+        }
         return false
       } finally {
         pendingCompletion.current = false

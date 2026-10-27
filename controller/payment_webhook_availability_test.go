@@ -111,7 +111,11 @@ func TestWalletCheckoutRequiresPaymentComplianceBeforeCreatingOrder(t *testing.T
 			require.NoError(t, model.DB.Find(&orders).Error)
 			assert.Len(t, orders, 1, "disabled checkout must not create an order or make it manually completable")
 			callback := httptest.NewRecorder()
-			router.ServeHTTP(callback, walletWebhookRequest(t, keys, provider, existing.TradeNo, "90", true))
+			paidAmount := "90"
+			if provider == model.PaymentProviderEpay {
+				paidAmount = "100"
+			}
+			router.ServeHTTP(callback, walletWebhookRequest(t, keys, provider, existing.TradeNo, paidAmount, true))
 			if provider == model.PaymentProviderEpay {
 				assert.Equal(t, "fail", callback.Body.String())
 			} else {
@@ -485,6 +489,119 @@ func TestEpayCallbacksVerifyBeforeSettlement(t *testing.T) {
 	}
 }
 
+func TestWalletEpayCallbackRequiresQuotedOrderAmount(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		money         float64
+		callbackMoney string
+		legacy        bool
+		wantSuccess   bool
+	}{
+		{"underpaid", 100, "90.00", false, false},
+		{"overpaid", 100, "101.00", false, false},
+		{"zero", 100, "0.00", false, false},
+		{"exact", 100, "100.00", false, true},
+		{"discount_already_in_quote", 90, "90.00", false, true},
+		{"checkout_rounds_down", 12.344, "12.34", false, true},
+		{"checkout_rounds_up", 12.346, "12.35", false, true},
+		{"legacy_exact", 100, "100.00", true, true},
+		{"legacy_wrong_amount", 100, "90.00", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, keys := walletWebhookFixture(t)
+			order := walletWebhookOrder(t, model.PaymentProviderEpay, "epay-amount-binding")
+			updates := map[string]any{"money": tc.money}
+			if tc.legacy {
+				updates["credited_quota"] = nil
+			}
+			require.NoError(t, model.DB.Model(order).Updates(updates).Error)
+			// Current pricing must not replace the original order's signed price.
+			oldPrice := operation_setting.Price
+			operation_setting.Price = 2
+			t.Cleanup(func() { operation_setting.Price = oldPrice })
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, walletWebhookRequest(t, keys, model.PaymentProviderEpay, order.TradeNo, tc.callbackMoney, true))
+			var invitee model.User
+			require.NoError(t, model.DB.First(&invitee, 902).Error)
+			var facts int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
+			if tc.wantSuccess {
+				assert.Equal(t, "success", recorder.Body.String())
+				assert.Equal(t, 990, invitee.Quota)
+				assert.EqualValues(t, 1, facts)
+			} else {
+				assert.Equal(t, "fail", recorder.Body.String())
+				assert.Equal(t, -10, invitee.Quota)
+				assert.Zero(t, facts)
+				reloaded, err := model.GetTopUpByTradeNoWithError(order.TradeNo)
+				require.NoError(t, err)
+				assert.Equal(t, common.TopUpStatusPending, reloaded.Status)
+			}
+			for range 2 {
+				retry := httptest.NewRecorder()
+				router.ServeHTTP(retry, walletWebhookRequest(t, keys, model.PaymentProviderEpay, order.TradeNo, strconv.FormatFloat(tc.money, 'f', 2, 64), true))
+				assert.Equal(t, "success", retry.Body.String())
+			}
+			require.NoError(t, model.DB.First(&invitee, 902).Error)
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
+			assert.Equal(t, 990, invitee.Quota)
+			assert.EqualValues(t, 1, facts)
+		})
+	}
+}
+
+func TestWalletEpayCallbackRequiresConfiguredMerchant(t *testing.T) {
+	for _, merchant := range []string{"", " ", "another_merchant", "epay_fixture"} {
+		t.Run(fmt.Sprintf("merchant_%q", merchant), func(t *testing.T) {
+			router, keys := walletWebhookFixture(t)
+			order := walletWebhookOrder(t, model.PaymentProviderEpay, "epay-merchant-binding")
+			params := map[string]string{
+				"pid": merchant, "type": "alipay", "name": "fixture", "money": "100.00",
+				"out_trade_no": order.TradeNo, "trade_status": epay.StatusTradeSuccess,
+			}
+			signed, err := epay.GenerateParamsWithError(params, operation_setting.EpayKey)
+			require.NoError(t, err)
+			verified, err := GetEpayClient().Verify(signed)
+			require.NoError(t, err)
+			require.True(t, verified.VerifyStatus, "merchant binding must be checked after real signature verification")
+			form := url.Values{}
+			for key, value := range signed {
+				form.Set(key, value)
+			}
+			request := httptest.NewRequest(http.MethodPost, "/epay", strings.NewReader(form.Encode()))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			var invitee model.User
+			require.NoError(t, model.DB.First(&invitee, 902).Error)
+			var facts int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
+			if merchant != operation_setting.EpayId {
+				assert.Equal(t, "fail", recorder.Body.String())
+				assert.Equal(t, -10, invitee.Quota)
+				assert.Zero(t, facts)
+				require.NoError(t, model.DB.First(order, order.Id).Error)
+				assert.Equal(t, common.TopUpStatusPending, order.Status)
+			} else {
+				assert.Equal(t, "success", recorder.Body.String())
+				assert.Equal(t, 990, invitee.Quota)
+				assert.EqualValues(t, 1, facts)
+			}
+			// The original order remains recoverable by the matching merchant;
+			// a replay after success cannot credit either wallet a second time.
+			for range 2 {
+				retry := httptest.NewRecorder()
+				router.ServeHTTP(retry, walletWebhookRequest(t, keys, model.PaymentProviderEpay, order.TradeNo, "100.00", true))
+				assert.Equal(t, "success", retry.Body.String())
+			}
+			require.NoError(t, model.DB.First(&invitee, 902).Error)
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
+			assert.Equal(t, 990, invitee.Quota)
+			assert.EqualValues(t, 1, facts)
+		})
+	}
+}
+
 // walletWebhookFixture uses real controllers, the providers' real signature
 // verification, and a disposable database. These are local protocol
 // fixtures; platform sandbox and cross-process database tests are separate.
@@ -806,6 +923,10 @@ func TestWalletReferralSignedCallbacksAndManualCompletion(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/manual_first_%t", provider, manualFirst), func(t *testing.T) {
 				router, keys := walletWebhookFixture(t)
 				order := walletWebhookOrder(t, provider, "wallet_fixture")
+				paidAmount := "90"
+				if provider == model.PaymentProviderEpay {
+					paidAmount = "100"
+				}
 				common.QuotaPerUnit = 20 // Frozen new orders must not be repriced.
 				if manualFirst {
 					recorder := httptest.NewRecorder()
@@ -816,7 +937,7 @@ func TestWalletReferralSignedCallbacksAndManualCompletion(t *testing.T) {
 				}
 				for range 2 {
 					recorder := httptest.NewRecorder()
-					router.ServeHTTP(recorder, walletWebhookRequest(t, keys, provider, order.TradeNo, "90", true))
+					router.ServeHTTP(recorder, walletWebhookRequest(t, keys, provider, order.TradeNo, paidAmount, true))
 					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 					assert.NotContains(t, recorder.Body.String(), "fail")
 				}
@@ -852,6 +973,9 @@ func TestWalletReferralCallbacksPaymentProofAndRollback(t *testing.T) {
 				router, keys := walletWebhookFixture(t)
 				order := walletWebhookOrder(t, provider, "wallet_proof")
 				amount, paid := "90", true
+				if provider == model.PaymentProviderEpay {
+					amount = "100"
+				}
 				var faultRedis *redis.Client
 				var faultKey string
 				switch scenario {
@@ -951,7 +1075,7 @@ func TestWalletReferralCallbacksPaymentProofAndRollback(t *testing.T) {
 				require.NoError(t, model.DB.First(&invitee, 902).Error)
 				var facts int64
 				require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
-				if scenario == "zero_paid" {
+				if scenario == "zero_paid" && provider != model.PaymentProviderEpay {
 					assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 					assert.Equal(t, 990, invitee.Quota)
 					assert.EqualValues(t, 1, facts)
@@ -1309,6 +1433,7 @@ func TestWalletPaymentCheckoutLogsExcludeCustomerAndCheckoutSecrets(t *testing.T
 func TestWalletCreemCheckoutHTTPPreservesFrozenOrderAndRecovery(t *testing.T) {
 	for _, scenario := range []string{
 		"success", "explicit_rejection", "malformed_json", "missing_checkout_url",
+		"blank_checkout_url", "http_401_with_checkout_url", "http_500_with_checkout_url",
 		"truncated_body", "response_lost", "response_timeout", "callback_before_response",
 		"callback_before_response_loss", "caller_cancelled_after_acceptance",
 	} {
@@ -1413,6 +1538,15 @@ func TestWalletCreemCheckoutHTTPPreservesFrozenOrderAndRecovery(t *testing.T) {
 					_, _ = io.WriteString(w, `{"checkout_url":`)
 				case "missing_checkout_url":
 					_, _ = io.WriteString(w, `{"id":"ch_fixture"}`)
+				case "blank_checkout_url":
+					_, _ = io.WriteString(w, `{"id":"ch_fixture","checkout_url":"   "}`)
+				case "http_401_with_checkout_url", "http_500_with_checkout_url":
+					status := http.StatusUnauthorized
+					if scenario == "http_500_with_checkout_url" {
+						status = http.StatusInternalServerError
+					}
+					w.WriteHeader(status)
+					_, _ = io.WriteString(w, `{"id":"ch_fixture","checkout_url":"`+checkoutURL+`"}`)
 				case "truncated_body":
 					w.Header().Set("Content-Length", "1000")
 					_, _ = io.WriteString(w, `{"checkout_url":`)
@@ -1635,6 +1769,9 @@ func TestWalletReferralStripeCheckoutRejectionPreservesCompletionPolicy(t *testi
 		{"unstructured_error", http.StatusBadRequest, "unstructured gateway response", common.TopUpStatusPending},
 		{"missing_checkout_url", http.StatusOK, `{}`, common.TopUpStatusPending},
 		{"empty_checkout_url", http.StatusOK, `{"url":""}`, common.TopUpStatusPending},
+		{"blank_checkout_url", http.StatusOK, `{"url":"   "}`, common.TopUpStatusPending},
+		{"http_401_with_checkout_url", http.StatusUnauthorized, `{"id":"cs_fixture","url":"https://checkout.example.invalid/untrusted"}`, common.TopUpStatusPending},
+		{"http_500_with_checkout_url", http.StatusInternalServerError, `{"id":"cs_fixture","url":"https://checkout.example.invalid/untrusted"}`, common.TopUpStatusPending},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			router, keys := walletCheckoutFixture(t)
@@ -1815,7 +1952,7 @@ func TestWalletReferralCheckoutLocalFailurePreservesCompletionPolicy(t *testing.
 }
 
 func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.T) {
-	for _, scenario := range []string{"late_callback", "manual_then_callback", "callback_before_response_loss", "non_json_remote_error", "session_http500", "session_http401", "token_http500", "token_http401", "successful_checkout"} {
+	for _, scenario := range []string{"late_callback", "manual_then_callback", "callback_before_response_loss", "non_json_remote_error", "session_http500", "session_http401", "token_http500", "token_http401", "empty_checkout_url", "blank_checkout_url", "empty_buyer_token", "blank_buyer_token", "successful_checkout"} {
 		t.Run(scenario, func(t *testing.T) {
 			router, keys := walletCheckoutFixture(t)
 			observed := make(chan model.TopUp, 1)
@@ -1845,6 +1982,14 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 						w.WriteHeader(http.StatusInternalServerError)
 					} else if scenario == "token_http401" {
 						w.WriteHeader(http.StatusUnauthorized)
+					}
+					if scenario == "empty_buyer_token" || scenario == "blank_buyer_token" {
+						token := ""
+						if scenario == "blank_buyer_token" {
+							token = "   "
+						}
+						_, _ = fmt.Fprintf(w, `{"data":{"token":%q,"expiresAt":"2099-01-01T00:00:00Z"}}`, token)
+						return
 					}
 					_, _ = w.Write([]byte(`{"data":{"token":"fixture","expiresAt":"2099-01-01T00:00:00Z"}}`))
 					return
@@ -1889,7 +2034,14 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 					return
 				}
 				switch scenario {
-				case "session_http500", "session_http401", "token_http500", "token_http401", "successful_checkout":
+				case "empty_checkout_url", "blank_checkout_url":
+					checkoutURL := ""
+					if scenario == "blank_checkout_url" {
+						checkoutURL = "   "
+					}
+					_, _ = fmt.Fprintf(w, `{"data":{"sessionId":"CS_fixture","checkoutUrl":%q,"expiresAt":"2099-01-01T00:00:00Z"}}`, checkoutURL)
+					return
+				case "session_http500", "session_http401", "token_http500", "token_http401", "empty_buyer_token", "blank_buyer_token", "successful_checkout":
 					if scenario == "session_http500" {
 						w.WriteHeader(http.StatusInternalServerError)
 					} else if scenario == "session_http401" {
@@ -1996,6 +2148,8 @@ func TestWalletPancakeSharedCheckoutPreservesSubscriptionDispatch(t *testing.T) 
 		{name: "session_http500", failedPath: "/v1/actions/checkout/create-session", status: http.StatusInternalServerError},
 		{name: "token_http401", failedPath: "/v1/actions/auth/issue-session-token", status: http.StatusUnauthorized},
 		{name: "token_http500", failedPath: "/v1/actions/auth/issue-session-token", status: http.StatusInternalServerError},
+		{name: "empty_checkout_url"},
+		{name: "empty_buyer_token"},
 		{name: "local_product_rejection", localFailure: true},
 		{name: "successful_checkout", accepted: true},
 	} {
@@ -2021,8 +2175,16 @@ func TestWalletPancakeSharedCheckoutPreservesSubscriptionDispatch(t *testing.T) 
 				}
 				switch request.URL.Path {
 				case "/v1/actions/auth/issue-session-token":
+					if tc.name == "empty_buyer_token" {
+						_, _ = w.Write([]byte(`{"data":{"token":"","expiresAt":"2099-01-01T00:00:00Z"}}`))
+						return
+					}
 					_, _ = w.Write([]byte(`{"data":{"token":"fixture","expiresAt":"2099-01-01T00:00:00Z"}}`))
 				case "/v1/actions/checkout/create-session":
+					if tc.name == "empty_checkout_url" {
+						_, _ = w.Write([]byte(`{"data":{"sessionId":"CS_fixture","checkoutUrl":"","expiresAt":"2099-01-01T00:00:00Z"}}`))
+						return
+					}
 					_, _ = w.Write([]byte(`{"data":{"sessionId":"CS_fixture","checkoutUrl":"https://checkout.example.invalid/subscription","expiresAt":"2099-01-01T00:00:00Z"}}`))
 				default:
 					t.Errorf("subscription must not enter wallet inquiry: %s", request.URL.Path)
@@ -3339,6 +3501,10 @@ func TestWalletCallbacksRetryPostCommitCacheFailure(t *testing.T) {
 				provider = model.PaymentProviderStripe
 			}
 			order := walletWebhookOrder(t, provider, "post-commit-cache-"+entry)
+			paidAmount := "90"
+			if provider == model.PaymentProviderEpay {
+				paidAmount = "100"
+			}
 			client := redis.NewClient(&redis.Options{Addr: address, DB: 13, MaxRetries: -1})
 			require.NoError(t, client.Ping(t.Context()).Err())
 			cacheKey, fillKey := "user:902", "wallet:user:fill:902"
@@ -3359,7 +3525,7 @@ func TestWalletCallbacksRetryPostCommitCacheFailure(t *testing.T) {
 			hook.fail.Store(true)
 			client.AddHook(hook)
 			for attempt := range 3 {
-				request := walletWebhookRequest(t, keys, provider, order.TradeNo, "90", true)
+				request := walletWebhookRequest(t, keys, provider, order.TradeNo, paidAmount, true)
 				if entry == "manual" {
 					request = httptest.NewRequest(http.MethodPost, "/manual", strings.NewReader(fmt.Sprintf(`{"trade_no":%q}`, order.TradeNo)))
 					request.Header.Set("Content-Type", "application/json")
@@ -5120,6 +5286,11 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 		{name: "valid_signed", status: 200, signature: "valid", code: "0", accepted: true},
 		{name: "lowercase_signature", status: 200, signature: "lowercase", code: "0", accepted: true},
 		{name: "mixed_case_signature", status: 200, signature: "mixed_case", code: "0", accepted: true},
+		{name: "other_payment_request", status: 200, signature: "valid", code: "0"},
+		{name: "other_merchant_order", status: 200, signature: "valid", code: "0"},
+		{name: "missing_payment_request", status: 200, signature: "valid", code: "0"},
+		{name: "missing_merchant_order", status: 200, signature: "valid", code: "0"},
+		{name: "blank_checkout_url", status: 200, signature: "valid", code: "0"},
 		{name: "nil_response", status: 200, signature: "valid", code: "0"},
 		{name: "network_failure", status: 200, signature: "valid", code: "0"},
 		{name: "unknown_status", status: 200, signature: "valid", code: "E0001"},
@@ -5148,10 +5319,23 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 				require.True(t, strings.HasSuffix(request.URL, "/order/create"))
 				require.True(t, waffoutils.Verify(string(request.Body), request.Headers["X-SIGNATURE"], keys.PublicKey))
 				require.NoError(t, common.Unmarshal(request.Body, &outgoing))
-				body, err := common.Marshal(map[string]any{"code": tc.code, "data": order.CreateOrderData{
+				created := order.CreateOrderData{
 					MerchantOrderID: outgoing.MerchantOrderID, PaymentRequestID: outgoing.PaymentRequestID,
 					OrderAction: "{\"actionType\":\"REDIRECT\",\"webUrl\":\"https://checkout.example.invalid/audit-unverified\"}",
-				}})
+				}
+				switch tc.name {
+				case "other_payment_request":
+					created.PaymentRequestID = "another-payment-request"
+				case "other_merchant_order":
+					created.MerchantOrderID = "another-merchant-order"
+				case "missing_payment_request":
+					created.PaymentRequestID = ""
+				case "missing_merchant_order":
+					created.MerchantOrderID = ""
+				case "blank_checkout_url":
+					created.OrderAction = `{"actionType":"WEB","webUrl":"   "}`
+				}
+				body, err := common.Marshal(map[string]any{"code": tc.code, "data": created})
 				require.NoError(t, err)
 				headers := map[string]string{}
 				switch tc.signature {
@@ -5366,7 +5550,7 @@ func TestWalletWaffoMissingCheckoutOutcomePreservesLateSettlement(t *testing.T) 
 		{name: "unknown_status", body: "{\"code\":\"E0001\"}", sdkError: true},
 		{name: "explicit_rejection", body: "{\"code\":\"A0003\"}", wantFailed: true},
 		{name: "rejection_after_payment", body: "{\"code\":\"A0003\"}", settledBefore: true},
-		{name: "successful_checkout", body: "{\"code\":\"0\",\"data\":{\"orderAction\":\"https://checkout.example.invalid/accepted\"}}", wantURL: "https://checkout.example.invalid/accepted"},
+		{name: "successful_checkout", body: "{\"code\":\"0\",\"data\":{\"paymentRequestId\":\"waffo-missing-outcome\",\"merchantOrderId\":\"waffo-missing-outcome\",\"orderAction\":\"https://checkout.example.invalid/accepted\"}}", wantURL: "https://checkout.example.invalid/accepted"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			router, keys := walletWebhookFixture(t)

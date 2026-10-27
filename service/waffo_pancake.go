@@ -201,8 +201,15 @@ func CreateWaffoPancakeCheckoutSession(ctx context.Context, params *WaffoPancake
 		}
 		return nil, err
 	}
-	if session == nil || strings.TrimSpace(session.CheckoutURL) == "" || strings.TrimSpace(session.SessionID) == "" {
+	if session == nil || strings.TrimSpace(session.SessionID) == "" || strings.TrimSpace(session.Token) == "" {
 		return nil, fmt.Errorf("Waffo Pancake returned empty checkout session")
+	}
+	// The SDK appends #token even when either successful JSON response is
+	// incomplete. The fragment cannot turn an empty checkout URL into a valid
+	// session, and authenticated checkout must retain its buyer token.
+	checkoutURL, _, _ := strings.Cut(session.CheckoutURL, "#")
+	if strings.TrimSpace(checkoutURL) == "" {
+		return nil, fmt.Errorf("Waffo Pancake returned empty checkout URL")
 	}
 	return &WaffoPancakeCheckoutSession{
 		SessionID:      session.SessionID,

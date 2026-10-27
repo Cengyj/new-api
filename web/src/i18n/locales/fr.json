@@ -4440,6 +4440,7 @@
     "Or enter this key manually:": "Ou entrez cette clé manuellement :",
     "or pick existing": "ou choisir une existante",
     "Order completed successfully": "Commande terminée avec succès",
+    "Order completion result is unknown. Refresh Order History before retrying this order.": "Le résultat de la validation est inconnu. Actualisez l’historique avant de réessayer cette commande.",
     "Order History": "Historique des commandes",
     "Order is not pending payment and cannot be completed": "La commande n'est pas en attente de paiement et ne peut pas être finalisée",
     "Order number": "Numéro de commande",

@@ -530,7 +530,7 @@ func genStripeLink(referenceId string, customerId string, email string, amount i
 	if err != nil {
 		return "", err
 	}
-	if result == nil || result.URL == "" {
+	if result == nil || strings.TrimSpace(result.URL) == "" {
 		return "", errors.New("Stripe checkout response is missing a payment URL")
 	}
 

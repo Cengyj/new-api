@@ -4440,6 +4440,7 @@
     "Or enter this key manually:": "Or enter this key manually:",
     "or pick existing": "or pick existing",
     "Order completed successfully": "Order completed successfully",
+    "Order completion result is unknown. Refresh Order History before retrying this order.": "Order completion result is unknown. Refresh Order History before retrying this order.",
     "Order History": "Order History",
     "Order is not pending payment and cannot be completed": "Order is not pending payment and cannot be completed",
     "Order number": "Order number",

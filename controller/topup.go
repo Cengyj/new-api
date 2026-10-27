@@ -512,6 +512,13 @@ func EpayNotify(c *gin.Context) {
 		}
 		return
 	}
+	// Epay signs pid but the SDK does not bind it to this client. The v1
+	// notification contract requires the merchant ID even for legacy orders.
+	if params["pid"] != client.Config.PartnerID {
+		logger.LogWarn(c.Request.Context(), common.LogText("Epay webhook merchant mismatch trade_no=%s client_ip=%s", verifyInfo.ServiceTradeNo, c.ClientIP()))
+		_, _ = c.Writer.Write([]byte("fail"))
+		return
+	}
 	logger.LogInfo(c.Request.Context(), common.LogText("Epay webhook signature verified trade_no=%s callback_type=%s trade_status=%s client_ip=%s", verifyInfo.ServiceTradeNo, verifyInfo.Type, verifyInfo.TradeStatus, c.ClientIP()))
 
 	if verifyInfo.TradeStatus == epay.StatusTradeSuccess {
@@ -524,6 +531,21 @@ func EpayNotify(c *gin.Context) {
 		// 数据库行锁 + 事务内状态校验保证（多实例部署下同样安全）。
 		LockOrder(verifyInfo.ServiceTradeNo)
 		defer UnlockOrder(verifyInfo.ServiceTradeNo)
+		// In Epay v1, money is the submitted product amount, not a separate
+		// post-discount paid amount. Local discounts are already included in
+		// Money. Match the same two-decimal value Purchase signed, including
+		// legacy orders whose stored float predates the quota snapshot.
+		topUp, lookupErr := model.GetTopUpByTradeNoWithError(verifyInfo.ServiceTradeNo)
+		if lookupErr != nil || math.IsNaN(topUp.Money) || math.IsInf(topUp.Money, 0) {
+			_, _ = c.Writer.Write([]byte("fail"))
+			return
+		}
+		quoted, quoteErr := decimal.NewFromString(strconv.FormatFloat(topUp.Money, 'f', 2, 64))
+		if quoteErr != nil || !paid.Equal(quoted) {
+			logger.LogWarn(c.Request.Context(), common.LogText("Epay webhook amount mismatch trade_no=%s client_ip=%s", verifyInfo.ServiceTradeNo, c.ClientIP()))
+			_, _ = c.Writer.Write([]byte("fail"))
+			return
+		}
 		alreadyDone, err := model.RechargeEpay(verifyInfo.ServiceTradeNo, verifyInfo.Type, c.ClientIP())
 		if err != nil {
 			switch {

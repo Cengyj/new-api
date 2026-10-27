@@ -4440,6 +4440,7 @@
     "Or enter this key manually:": "Hoặc nhập khóa này thủ công:",
     "or pick existing": "hoặc chọn cặp hiện có",
     "Order completed successfully": "Đơn hàng đã hoàn thành thành công",
+    "Order completion result is unknown. Refresh Order History before retrying this order.": "Chưa xác định được kết quả hoàn tất đơn hàng. Hãy làm mới lịch sử đơn hàng trước khi thử lại đơn này.",
     "Order History": "Lịch sử đơn hàng",
     "Order is not pending payment and cannot be completed": "Đơn hàng không ở trạng thái chờ thanh toán nên không thể hoàn tất",
     "Order number": "Mã đơn hàng",

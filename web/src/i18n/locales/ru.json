@@ -4440,6 +4440,7 @@
     "Or enter this key manually:": "Или введите этот ключ вручную:",
     "or pick existing": "или выбрать существующую",
     "Order completed successfully": "Заказ успешно завершен",
+    "Order completion result is unknown. Refresh Order History before retrying this order.": "Результат завершения заказа неизвестен. Обновите историю заказов перед повторной попыткой для этого заказа.",
     "Order History": "История заказов",
     "Order is not pending payment and cannot be completed": "Заказ не ожидает оплаты, его нельзя завершить",
     "Order number": "Номер заказа",

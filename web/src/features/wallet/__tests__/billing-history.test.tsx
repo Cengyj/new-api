@@ -457,6 +457,79 @@ test('an order completion rejected with 401 is not automatically refreshed and r
   }
 })
 
+test.each(['response lost', 'timeout', 'HTTP 503'])(
+  'order completion with %s stays unknown until the original order is refreshed without another credit request',
+  async (failure) => {
+    const previousAdapter = api.defaults.adapter
+    const requests: InternalAxiosRequestConfig[] = []
+    let submitted = false
+    api.defaults.adapter = async (config) => {
+      requests.push(config)
+      if (config.method === 'post') {
+        submitted = true
+        const response =
+          failure === 'HTTP 503'
+            ? {
+                config,
+                status: 503,
+                statusText: 'Service Unavailable',
+                headers: {},
+                data: { message: 'Service unavailable' },
+              }
+            : undefined
+        throw new AxiosError(
+          failure,
+          failure === 'timeout' ? 'ECONNABORTED' : 'ERR_NETWORK',
+          config,
+          undefined,
+          response
+        )
+      }
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: {
+          success: true,
+          data: {
+            items: [{ ...record, status: submitted ? 'success' : 'pending' }],
+            total: 1,
+          },
+        },
+      }
+    }
+    const notify = vi.spyOn(toast, 'error')
+    const successNotify = vi.spyOn(toast, 'success')
+    try {
+      const { result } = renderHook(() => useBillingHistory())
+      await waitFor(() => expect(result.current.records).toHaveLength(1))
+      await act(async () => {
+        expect(await result.current.handleCompleteOrder(record.trade_no)).toBe(
+          false
+        )
+      })
+      expect(notify).toHaveBeenCalledWith(
+        'Order completion result is unknown. Refresh Order History before retrying this order.'
+      )
+      expect(successNotify).not.toHaveBeenCalled()
+      expect(result.current.records[0].status).toBe('pending')
+      await act(async () => {
+        await result.current.refresh()
+      })
+      expect(result.current.records[0].status).toBe('success')
+      const writes = requests.filter((request) => request.method === 'post')
+      expect(writes).toHaveLength(1)
+      expect(writes[0].url).toBe('/api/user/topup/complete')
+      expect(JSON.parse(writes[0].data as string)).toEqual({
+        trade_no: record.trade_no,
+      })
+    } finally {
+      api.defaults.adapter = previousAdapter
+    }
+  }
+)
+
 test('leaving the wallet while completion is pending prevents a late success from refreshing or notifying another page', async () => {
   const get = vi.spyOn(api, 'get').mockResolvedValue(history)
   let finish!: (value: { data: { success: boolean } }) => void

@@ -455,7 +455,7 @@ func genCreemLink(ctx context.Context, referenceId string, product *CreemProduct
 		return "", fmt.Errorf("failed to parse response: %v", err)
 	}
 
-	if checkoutResp.CheckoutUrl == "" {
+	if strings.TrimSpace(checkoutResp.CheckoutUrl) == "" {
 		return "", fmt.Errorf("Creem API resp no checkout url ")
 	}
 

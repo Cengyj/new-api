@@ -4440,6 +4440,7 @@
     "Or enter this key manually:": "或手动输入此密钥：",
     "or pick existing": "或选择已有项",
     "Order completed successfully": "订单已成功完成",
+    "Order completion result is unknown. Refresh Order History before retrying this order.": "补单结果未知。请刷新订单记录后再重试此订单。",
     "Order History": "订单历史",
     "Order is not pending payment and cannot be completed": "订单状态不是待支付，无法补单",
     "Order number": "订单号",

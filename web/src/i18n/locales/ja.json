@@ -4440,6 +4440,7 @@
     "Or enter this key manually:": "または、このキーを手動で入力してください:",
     "or pick existing": "または既存のものを選択",
     "Order completed successfully": "注文が正常に完了しました",
+    "Order completion result is unknown. Refresh Order History before retrying this order.": "注文の手動完了結果は不明です。この注文を再試行する前に注文履歴を更新してください。",
     "Order History": "注文履歴",
     "Order is not pending payment and cannot be completed": "注文が支払い待ちではないため、完了できません",
     "Order number": "注文番号",

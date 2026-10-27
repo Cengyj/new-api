@@ -388,14 +388,17 @@ func resolveWaffoCheckoutResponse(topUp *model.TopUp, resp *core.ApiResponse[ord
 	}
 
 	orderData := resp.GetData()
-	paymentURL := ""
-	if orderData != nil {
-		paymentURL = orderData.FetchRedirectURL()
-		if paymentURL == "" {
-			paymentURL = orderData.OrderAction
-		}
+	// The signature authenticates the response, not its association with this
+	// checkout. Both required provider identifiers must match the frozen order
+	// before exposing a payment link. A mismatch leaves its outcome unknown.
+	if orderData == nil || orderData.PaymentRequestID != topUp.TradeNo || orderData.MerchantOrderID != topUp.TradeNo {
+		return "", common.NewMessage("Failed to start payment")
 	}
+	paymentURL := orderData.FetchRedirectURL()
 	if paymentURL == "" {
+		paymentURL = orderData.OrderAction
+	}
+	if strings.TrimSpace(paymentURL) == "" {
 		// An incomplete response does not prove the provider rejected the order.
 		return "", common.NewMessage("Failed to start payment")
 	}
