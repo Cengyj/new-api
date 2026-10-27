@@ -219,10 +219,18 @@ func getMinTopup(displayType string, quotaPerUnit float64) int64 {
 }
 
 func getTopUpQuota(amount int64, displayType string, quotaPerUnit float64) (int, error) {
+	if quotaPerUnit <= 0 {
+		return 0, common.NewMessage("Invalid top-up amount")
+	}
 	quota := decimal.NewFromInt(amount)
 	if displayType == operation_setting.QuotaDisplayTypeTokens {
 		dQuotaPerUnit := decimal.NewFromFloat(quotaPerUnit)
-		quota = decimal.NewFromInt(quota.Div(dQuotaPerUnit).IntPart()).Mul(dQuotaPerUnit)
+		normalizedAmount := quota.Div(dQuotaPerUnit).Truncate(0)
+		// Checkout stores this normalized amount as int64. Check before that
+		// conversion can wrap, but freeze the full requested token quantity.
+		if normalizedAmount.GreaterThan(decimal.NewFromInt(math.MaxInt64)) {
+			return 0, common.NewMessage("Invalid top-up amount")
+		}
 	} else {
 		quota = quota.Mul(decimal.NewFromFloat(quotaPerUnit))
 	}
@@ -234,15 +242,15 @@ func getMaxTopUpAmount(displayType string, quotaPerUnit float64) int64 {
 		return 0
 	}
 	dQuotaPerUnit := decimal.NewFromFloat(quotaPerUnit)
-	maxStoredAmount := decimal.NewFromInt(common.MaxWalletQuota).
+	maxStoredAmount := decimal.Min(decimal.NewFromInt(common.MaxWalletQuota).
 		Div(dQuotaPerUnit).
-		Floor()
+		Floor(), decimal.NewFromInt(math.MaxInt64))
 	if displayType == operation_setting.QuotaDisplayTypeTokens {
-		return maxStoredAmount.Add(decimal.NewFromInt(1)).
+		maxAmount := maxStoredAmount.Add(decimal.NewFromInt(1)).
 			Mul(dQuotaPerUnit).
 			Ceil().
-			Sub(decimal.NewFromInt(1)).
-			IntPart()
+			Sub(decimal.NewFromInt(1))
+		return decimal.Min(maxAmount, decimal.NewFromInt(common.MaxWalletQuota)).IntPart()
 	}
 	return maxStoredAmount.IntPart()
 }

@@ -264,8 +264,10 @@ export interface TopupRecord {
   id: number
   /** User ID */
   user_id: number
-  /** Topup amount (quota) */
+  /** Legacy topup amount; units depend on the payment provider. */
   amount: number
+  /** Frozen wallet quota; absent or null for legacy orders. */
+  credited_quota?: number | null
   /** Payment amount (actual money paid) */
   money: number
   /** Trade/order number */

@@ -194,7 +194,12 @@ func CreateWaffoPancakeCheckoutSession(ctx context.Context, params *WaffoPancake
 		}
 	}
 
-	session, err := client.Checkout.Authenticated.Create(ctx, sdkParams)
+	// The SDK waits for both requests and its default HTTP client has no
+	// timeout. Bound the whole checkout, including reading either response;
+	// expiration after transport starts still leaves the original order pending.
+	checkoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	session, err := client.Checkout.Authenticated.Create(checkoutCtx, sdkParams)
 	if err != nil {
 		if !transport.started.Load() {
 			return nil, fmt.Errorf("%w: %w", ErrWaffoPancakeCheckoutNotStarted, err)

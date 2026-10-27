@@ -32,9 +32,18 @@ import {
   type AxiosRequestConfig,
   type InternalAxiosRequestConfig,
 } from 'axios'
+import { createInstance } from 'i18next'
+import { I18nextProvider, initReactI18next } from 'react-i18next'
 import { toast } from 'sonner'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
+import en from '@/i18n/locales/en.json'
+import fr from '@/i18n/locales/fr.json'
+import ja from '@/i18n/locales/ja.json'
+import ru from '@/i18n/locales/ru.json'
+import viLocale from '@/i18n/locales/vi.json'
+import zhTW from '@/i18n/locales/zh-TW.json'
+import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
 import { applyAuthBundle, clearAuthentication } from '@/lib/auth-session'
 import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
@@ -296,14 +305,44 @@ describe('billing history authentication recovery', () => {
 })
 
 test.each([
-  { provider: 'creem', method: 'creem', amount: 500000, expected: '$1' },
-  { provider: 'epay', method: 'creem', amount: 10, expected: '$10' },
-  { provider: '', method: 'creem', amount: 10, expected: '$10' },
-  { provider: 'unknown', method: 'creem', amount: 10, expected: '$10' },
-  { provider: 'stripe', method: 'stripe', amount: 10, expected: '$10' },
+  {
+    provider: 'creem',
+    method: 'creem',
+    amount: 500000,
+    expected: '$1',
+    quota: null,
+  },
+  {
+    provider: 'epay',
+    method: 'creem',
+    amount: 10,
+    expected: '$10',
+    quota: null,
+  },
+  {
+    provider: '',
+    method: 'creem',
+    amount: 10,
+    expected: '$10',
+    quota: undefined,
+  },
+  {
+    provider: 'unknown',
+    method: 'creem',
+    amount: 10,
+    expected: '$10',
+    quota: undefined,
+  },
+  {
+    provider: 'stripe',
+    method: 'stripe',
+    amount: 10,
+    expected: '$10',
+    quota: undefined,
+  },
 ])(
   'billing history respects the stored amount units for provider "$provider" without guessing from method "$method"',
-  async ({ provider, method, amount, expected }) => {
+  async ({ provider, method, amount, expected, quota }) => {
     vi.spyOn(api, 'get').mockResolvedValue({
       data: {
         success: true,
@@ -312,6 +351,7 @@ test.each([
             {
               ...record,
               amount,
+              credited_quota: quota,
               money: 90,
               payment_provider: provider,
               payment_method: method,
@@ -327,6 +367,132 @@ test.each([
     expect(screen.getByText('90')).toBeVisible()
   }
 )
+
+describe('billing history frozen quota display', () => {
+  const originalAdapter = api.defaults.adapter
+  let responseRecord = {
+    ...record,
+    amount: 1,
+    money: 1.5,
+    credited_quota: 749999,
+    payment_provider: 'epay',
+  }
+  let requests: string[]
+
+  beforeEach(() => {
+    responseRecord = {
+      ...record,
+      amount: 1,
+      money: 1.5,
+      credited_quota: 749999,
+      payment_provider: 'epay',
+    }
+    requests = []
+    api.defaults.adapter = async (config) => {
+      requests.push(config.url ?? '')
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: { success: true, data: { items: [responseRecord], total: 1 } },
+      }
+    }
+  })
+
+  afterEach(() => {
+    api.defaults.adapter = originalAdapter
+  })
+
+  test.each([
+    { role: 1, provider: 'epay', amount: 1, endpoint: '/api/user/topup/self' },
+    {
+      role: 100,
+      provider: 'waffo',
+      amount: 1,
+      endpoint: '/api/user/topup',
+    },
+  ])(
+    'role $role history uses frozen quota across display-unit and conversion-rate changes',
+    async ({ role, provider, amount, endpoint }) => {
+      applyAuthBundle({ ...original, user: { ...original.user, role } }, false)
+      responseRecord.amount = amount
+      responseRecord.payment_provider = provider
+      render(<BillingHistoryDialog open onOpenChange={vi.fn()} />)
+      expect(await screen.findByText(record.trade_no)).toBeVisible()
+      expect(screen.getByText('$1.5')).toBeVisible()
+      for (const [quotaDisplayType, quotaPerUnit, expected] of [
+        ['TOKENS', 500000, '749,999'],
+        ['TOKENS', 1000000, '749,999'],
+        ['USD', 1000000, '$0.75'],
+        ['CNY', 1000000, '¥5.25'],
+      ] as const) {
+        act(() => {
+          useSystemConfigStore.getState().setConfig({
+            currency: {
+              ...DEFAULT_CURRENCY_CONFIG,
+              quotaDisplayType,
+              quotaPerUnit,
+              usdExchangeRate: 7,
+            },
+          })
+        })
+        expect(screen.getByText(expected)).toBeVisible()
+        expect(screen.getByText('1.5')).toBeVisible()
+      }
+      expect(requests).toEqual([`${endpoint}?p=1&page_size=10`])
+    }
+  )
+
+  test('frozen token quota remains exact at the safe integer limit when switching all interface languages', async () => {
+    responseRecord.credited_quota = 9007199254740991
+    useSystemConfigStore.getState().setConfig({
+      currency: {
+        ...DEFAULT_CURRENCY_CONFIG,
+        quotaDisplayType: 'TOKENS',
+        quotaPerUnit: 3,
+      },
+    })
+    const i18n = createInstance()
+    await i18n.use(initReactI18next).init({
+      lng: 'en',
+      fallbackLng: false,
+      resources: {
+        en,
+        zhCN: zh,
+        zhTW,
+        fr,
+        ja,
+        ru,
+        vi: viLocale,
+        invalid_locale: en,
+      },
+      interpolation: { escapeValue: false },
+    })
+    render(
+      <I18nextProvider i18n={i18n}>
+        <BillingHistoryDialog open onOpenChange={vi.fn()} />
+      </I18nextProvider>
+    )
+    expect(await screen.findByText(record.trade_no)).toBeVisible()
+    for (const [language, expected] of [
+      ['en', '9,007,199,254,740,991'],
+      ['zhCN', '9,007,199,254,740,991'],
+      ['zhTW', '9,007,199,254,740,991'],
+      ['fr', '9\u202f007\u202f199\u202f254\u202f740\u202f991'],
+      ['ru', '9\u00a0007\u00a0199\u00a0254\u00a0740\u00a0991'],
+      ['ja', '9,007,199,254,740,991'],
+      ['vi', '9.007.199.254.740.991'],
+      ['invalid_locale', '9,007,199,254,740,991'],
+    ]) {
+      await act(() => i18n.changeLanguage(language))
+      expect(
+        screen.getByText(expected, { normalizer: (value) => value })
+      ).toBeVisible()
+    }
+    expect(requests).toHaveLength(1)
+  })
+})
 
 test('a failed payment is shown as failed and never offers administrator completion', async () => {
   vi.spyOn(api, 'get').mockResolvedValue({

@@ -1952,7 +1952,7 @@ func TestWalletReferralCheckoutLocalFailurePreservesCompletionPolicy(t *testing.
 }
 
 func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.T) {
-	for _, scenario := range []string{"late_callback", "manual_then_callback", "callback_before_response_loss", "non_json_remote_error", "session_http500", "session_http401", "token_http500", "token_http401", "empty_checkout_url", "blank_checkout_url", "empty_buyer_token", "blank_buyer_token", "successful_checkout"} {
+	for _, scenario := range []string{"late_callback", "manual_then_callback", "callback_before_response_loss", "non_json_remote_error", "session_http500", "session_http401", "token_http500", "token_http401", "session_timeout", "token_timeout", "empty_checkout_url", "blank_checkout_url", "empty_buyer_token", "blank_buyer_token", "successful_checkout"} {
 		t.Run(scenario, func(t *testing.T) {
 			router, keys := walletCheckoutFixture(t)
 			observed := make(chan model.TopUp, 1)
@@ -2041,7 +2041,7 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 					}
 					_, _ = fmt.Fprintf(w, `{"data":{"sessionId":"CS_fixture","checkoutUrl":%q,"expiresAt":"2099-01-01T00:00:00Z"}}`, checkoutURL)
 					return
-				case "session_http500", "session_http401", "token_http500", "token_http401", "empty_buyer_token", "blank_buyer_token", "successful_checkout":
+				case "session_http500", "session_http401", "token_http500", "token_http401", "empty_buyer_token", "blank_buyer_token", "session_timeout", "token_timeout", "successful_checkout":
 					if scenario == "session_http500" {
 						w.WriteHeader(http.StatusInternalServerError)
 					} else if scenario == "session_http401" {
@@ -2065,6 +2065,10 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 				if request.URL.Host != "api.waffo.ai" {
 					return nil, fmt.Errorf("unexpected checkout host: %s", request.URL.Host)
 				}
+				if request.URL.Path != "/v1/graphql" {
+					_, bounded := request.Context().Deadline()
+					assert.True(t, bounded, "both remote checkout requests must have a server-side deadline")
+				}
 				local := request.Clone(request.Context())
 				local.URL.Scheme, local.URL.Host = target.Scheme, target.Host
 				response, err := server.Client().Transport.RoundTrip(local)
@@ -2077,14 +2081,23 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 						return nil, request.Context().Err()
 					}
 				}
+				if (scenario == "session_timeout" && request.URL.Path == "/v1/actions/checkout/create-session") ||
+					(scenario == "token_timeout" && request.URL.Path == "/v1/actions/auth/issue-session-token") {
+					// The remote request completed, but its response was lost to a
+					// deadline. The other concurrent request may also have succeeded.
+					if response != nil && response.Body != nil {
+						response.Body.Close()
+					}
+					return nil, context.DeadlineExceeded
+				}
 				return response, err
 			})}
 			t.Cleanup(func() { http.DefaultClient = oldClient })
 			router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestWaffoPancakePay)
 			recorder := httptest.NewRecorder()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			request := httptest.NewRequestWithContext(ctx, http.MethodPost, "/checkout", strings.NewReader(`{"amount":100}`))
+			// Incoming HTTP requests normally have no deadline. The payment
+			// boundary must bound both SDK requests without relying on the caller.
+			request := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(`{"amount":100}`))
 			request.Header.Set("Content-Type", "application/json")
 			router.ServeHTTP(recorder, request)
 			if scenario == "successful_checkout" {
@@ -2199,6 +2212,8 @@ func TestWalletPancakeSharedCheckoutPreservesSubscriptionDispatch(t *testing.T) 
 				if request.URL.Host != "api.waffo.ai" {
 					return nil, fmt.Errorf("unexpected checkout host: %s", request.URL.Host)
 				}
+				_, bounded := request.Context().Deadline()
+				assert.True(t, bounded, "shared subscription checkout must also bound remote requests")
 				local := request.Clone(request.Context())
 				local.URL.Scheme, local.URL.Host = target.Scheme, target.Host
 				return server.Client().Transport.RoundTrip(local)

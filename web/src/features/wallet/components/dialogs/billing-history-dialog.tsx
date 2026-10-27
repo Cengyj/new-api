@@ -37,9 +37,11 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
+import { toIntlLocale } from '@/i18n/languages'
 import { formatCurrencyFromUSD, formatQuotaWithCurrency } from '@/lib/currency'
 import { formatNumber } from '@/lib/format'
 import { useAuthStore } from '@/stores/auth-store'
+import { useSystemConfigStore } from '@/stores/system-config-store'
 
 import {
   billingHistoryIdentity,
@@ -65,7 +67,9 @@ function BillingHistoryContent({
   open,
   onOpenChange,
 }: BillingHistoryDialogProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const currency = useSystemConfigStore((state) => state.config.currency)
   const {
     records,
     total,
@@ -200,12 +204,25 @@ function BillingHistoryContent({
               <div className='space-y-3'>
                 {records.map((record) => {
                   const statusConfig = getStatusConfig(record.status)
-                  // Creem stores Amount in smallest quota units, unlike other
-                  // channels. Do not infer units from an unknown provider.
+                  // Frozen quota is authoritative. Only legacy orders need
+                  // the provider's historical Amount units (Creem uses quota).
+                  const creditedQuota = record.credited_quota
                   const formatAmount =
-                    record.payment_provider === 'creem'
+                    creditedQuota != null || record.payment_provider === 'creem'
                       ? formatQuotaWithCurrency
                       : formatCurrencyFromUSD
+                  // Token display must not lose integer quota units in a
+                  // quota -> USD -> quota floating-point round trip.
+                  const displayAmount =
+                    creditedQuota != null &&
+                    currency.quotaDisplayType === 'TOKENS'
+                      ? formatNumber(creditedQuota, locale)
+                      : formatAmount(creditedQuota ?? record.amount, {
+                          digitsLarge: 2,
+                          digitsSmall: 2,
+                          abbreviate: false,
+                          locale,
+                        })
                   return (
                     <div
                       key={record.id}
@@ -267,11 +284,7 @@ function BillingHistoryContent({
                             {t('Amount')}
                           </Label>
                           <div className='text-sm font-semibold'>
-                            {formatAmount(record.amount, {
-                              digitsLarge: 2,
-                              digitsSmall: 2,
-                              abbreviate: false,
-                            })}
+                            {displayAmount}
                           </div>
                         </div>
                         <div className='space-y-1'>
@@ -279,7 +292,7 @@ function BillingHistoryContent({
                             {t('Payment')}
                           </Label>
                           <div className='text-sm font-semibold text-red-600'>
-                            {formatNumber(record.money)}
+                            {formatNumber(record.money, locale)}
                           </div>
                         </div>
                       </div>
