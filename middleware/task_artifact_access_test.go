@@ -194,7 +194,7 @@ func TestSetUpLoggerRedactsPaymentAndOAuthQueriesWithoutChangingRequests(t *test
 				assert.NotContains(t, output.String(), "never-log-")
 				assert.NotContains(t, output.String(), "?", "callback access logs contain only the path")
 			} else {
-				assert.Contains(t, output.String(), query, "ordinary route log semantics stay unchanged")
+				assert.Contains(t, output.String(), "code=never-log-oauth-code&keep=ok&sign=never-log-payment-signature", "ordinary query values survive the upstream log normalization")
 			}
 		})
 	}

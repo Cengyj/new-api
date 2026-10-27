@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/gin-gonic/gin"
 )
 
@@ -41,6 +42,9 @@ func SetUpLogger(server *gin.Engine) {
 		if paymentCallback || strings.HasPrefix(requestPath, "/api/waffo-pancake/webhook/") ||
 			strings.HasPrefix(requestPath, "/api/oauth/") || strings.HasPrefix(requestPath, "/oauth/") {
 			path = requestPath
+		} else if param.Request.URL.RawQuery != "" {
+			query := param.Request.URL.Query().Encode()
+			path = param.Request.URL.EscapedPath() + relaycommon.SanitizeURLForLog("?"+query)
 		}
 		return fmt.Sprintf("[GIN] %s | %s | %s | %3d | %13v | %15s | %7s %s\n",
 			param.TimeStamp.Format("2006/01/02 - 15:04:05"),
