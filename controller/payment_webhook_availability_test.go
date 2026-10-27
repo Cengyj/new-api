@@ -4825,6 +4825,10 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 		{name: "unknown_query", raw: `{"code":"E0001"}`},
 		{name: "query_not_found", raw: `{"code":"E0002"}`},
 		{name: "network_failure"},
+		{name: "missing_query_signature"},
+		{name: "empty_query_signature"},
+		{name: "lowercase_query_signature", accepted: true},
+		{name: "mixed_case_query_signature", accepted: true},
 		{name: "bad_query_signature"},
 		{name: "nil_http_response"},
 		{name: "http_unauthorized_with_valid_body"},
@@ -4868,7 +4872,7 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 				body = []byte(scenario.raw)
 			}
 			transport.responses.Store(topUp.TradeNo, body)
-			if scenario.name == "network_failure" || scenario.name == "bad_query_signature" || scenario.name == "nil_http_response" || strings.HasSuffix(scenario.name, "_with_valid_body") {
+			if scenario.name == "network_failure" || strings.HasSuffix(scenario.name, "_query_signature") || scenario.name == "nil_http_response" || strings.HasSuffix(scenario.name, "_with_valid_body") {
 				service.WaffoHTTPTransport = walletWaffoSDKTransport(func(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
 					response, err := transport.Send(ctx, request)
 					switch scenario.name {
@@ -4884,12 +4888,26 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 						if err == nil {
 							response.Headers["X-SIGNATURE"] = "invalid"
 						}
+					case "missing_query_signature":
+						delete(response.Headers, core.HeaderSignature)
+					case "empty_query_signature":
+						response.Headers[core.HeaderSignature] = ""
+					case "lowercase_query_signature", "mixed_case_query_signature":
+						header := "x-signature"
+						if scenario.name == "mixed_case_query_signature" {
+							header = "X-SiGnAtUrE"
+						}
+						signature := response.GetHeader(core.HeaderSignature)
+						delete(response.Headers, core.HeaderSignature)
+						response.Headers[header] = signature
 					}
 					return response, err
 				})
 			}
 			recorder := httptest.NewRecorder()
 			router.ServeHTTP(recorder, request)
+			assert.Equal(t, http.StatusOK, recorder.Code)
+			assert.True(t, waffoutils.Verify(recorder.Body.String(), recorder.Header().Get(core.HeaderSignature), keys.PublicKey), "provider acknowledgment must retain its real response signature")
 			expectedStatus, expectedQuota, expectedAffQuota, expectedFacts := common.TopUpStatusPending, -10, 7, int64(0)
 			if scenario.accepted {
 				assert.JSONEq(t, `{"message":"success"}`, recorder.Body.String())
@@ -4920,6 +4938,8 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 			retry.Body = io.NopCloser(bytes.NewReader(callbackBody))
 			retryResponse := httptest.NewRecorder()
 			router.ServeHTTP(retryResponse, retry)
+			assert.Equal(t, http.StatusOK, retryResponse.Code)
+			assert.True(t, waffoutils.Verify(retryResponse.Body.String(), retryResponse.Header().Get(core.HeaderSignature), keys.PublicKey))
 			assert.JSONEq(t, `{"message":"success"}`, retryResponse.Body.String())
 			// After commit, even an inquiry outage cannot prevent idempotent
 			// cache recovery or cause a second credit.
@@ -4931,6 +4951,8 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 			retry.Body = io.NopCloser(bytes.NewReader(callbackBody))
 			retryResponse = httptest.NewRecorder()
 			router.ServeHTTP(retryResponse, retry)
+			assert.Equal(t, http.StatusOK, retryResponse.Code)
+			assert.True(t, waffoutils.Verify(retryResponse.Body.String(), retryResponse.Header().Get(core.HeaderSignature), keys.PublicKey))
 			assert.JSONEq(t, `{"message":"success"}`, retryResponse.Body.String())
 			require.NoError(t, model.DB.First(&buyer, 902).Error)
 			require.NoError(t, model.DB.First(&inviter, 901).Error)

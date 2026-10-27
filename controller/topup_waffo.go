@@ -492,6 +492,10 @@ func (transport waffoInquiryTransport) Send(ctx context.Context, request *waffon
 	if !response.IsSuccess() {
 		return nil, fmt.Errorf("Waffo inquiry returned HTTP %d", response.StatusCode)
 	}
+	// The SDK verifies response signatures only when present; require one.
+	if response.GetHeader(core.HeaderSignature) == "" {
+		return nil, errors.New("Waffo inquiry response signature is missing")
+	}
 	return response, nil
 }
 
