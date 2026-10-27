@@ -3,7 +3,9 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -542,7 +544,15 @@ func walletWebhookFixture(t *testing.T) (*gin.Engine, *waffoutils.KeyPair) {
 	setting.CreemApiKey, setting.CreemProducts, setting.CreemWebhookSecret, setting.CreemTestMode = "fixture", `[{"productId":"fixture"}]`, "creem_fixture", false
 	setting.WaffoEnabled, setting.WaffoSandbox = true, false
 	setting.WaffoApiKey, setting.WaffoPrivateKey, setting.WaffoPublicCert = "fixture", keys.PrivateKey, keys.PublicKey
-	setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey, setting.WaffoPancakeProductID, setting.WaffoPancakeStoreID = "fixture", keys.PrivateKey, "product_fixture", "store_fixture"
+	oldWaffoTransport := service.WaffoHTTPTransport
+	service.WaffoHTTPTransport = &walletWaffoInquiryTransport{t: t, keys: keys}
+	t.Cleanup(func() { service.WaffoHTTPTransport = oldWaffoTransport })
+	setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey, setting.WaffoPancakeProductID, setting.WaffoPancakeStoreID = "MER_AbCdEfGhIjKlMnOpQrStUv", keys.PrivateKey, "product_fixture", "store_fixture"
+	oldPancakeClient := http.DefaultClient
+	pancakeClient := *oldPancakeClient
+	pancakeClient.Transport = &walletPancakeInquiryTransport{t: t, next: oldPancakeClient.Transport}
+	http.DefaultClient = &pancakeClient
+	t.Cleanup(func() { http.DefaultClient = oldPancakeClient })
 	t.Setenv("WAFFO_WEBHOOK_TEST_PUBLIC_KEY", keys.PublicKey)
 	operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey = "https://pay.example.invalid", "epay_fixture", "epay_fixture_key"
 	operation_setting.PayMethods = []map[string]string{{"type": "alipay"}}
@@ -658,10 +668,16 @@ func signedWalletWebhookRequest(t *testing.T, keys *waffoutils.KeyPair, provider
 	case model.PaymentProviderCreem:
 		request.Header.Set(CreemSignatureHeader, generateCreemSignature(string(body), setting.CreemWebhookSecret))
 	case model.PaymentProviderWaffo:
+		if transport, ok := service.WaffoHTTPTransport.(*walletWaffoInquiryTransport); ok {
+			transport.setResult(payload["result"].(map[string]any))
+		}
 		signature, err := waffoutils.Sign(string(body), keys.PrivateKey)
 		require.NoError(t, err)
 		request.Header.Set("X-SIGNATURE", signature)
 	case model.PaymentProviderWaffoPancake:
+		if transport, ok := http.DefaultClient.Transport.(*walletPancakeInquiryTransport); ok {
+			transport.setResult(payload)
+		}
 		timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
 		signature, err := waffoutils.Sign(timestamp+"."+string(body), keys.PrivateKey)
 		require.NoError(t, err)
@@ -1802,7 +1818,23 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 			providerDone := make(chan struct{})
 			var observeCheckout, completeProvider sync.Once
 			var firstOrder model.TopUp
+			var remoteOrder atomic.Pointer[model.TopUp]
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if request.URL.Path == "/v1/graphql" {
+					stored := remoteOrder.Load()
+					if !assert.NotNil(t, stored) {
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					body, err := common.Marshal(map[string]any{"data": map[string]any{"onetimeOrder": map[string]any{
+						"id": "ORD_fixture", "orderMerchantExternalId": stored.TradeNo, "status": "completed", "testMode": true, "currency": "USD",
+						"store": map[string]string{"id": "store_fixture"}, "priceSnapshot": map[string]string{"currency": "USD", "subtotal": formatWaffoPancakeAmount(stored.Money)},
+					}}})
+					if assert.NoError(t, err) {
+						_, _ = w.Write(body)
+					}
+					return
+				}
 				if request.URL.Path == "/v1/actions/auth/issue-session-token" {
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = w.Write([]byte(`{"data":{"token":"fixture","expiresAt":"2099-01-01T00:00:00Z"}}`))
@@ -1825,6 +1857,7 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 					w.WriteHeader(http.StatusBadRequest)
 					return
 				}
+				remoteOrder.Store(&order)
 				// The SDK's idempotency header allows net/http to retry after a
 				// reused connection loses its response. Observe the original
 				// checkout once, but verify every attempt keeps its local order.
@@ -2183,10 +2216,207 @@ func TestWalletReferralStripeZeroPaymentRequiresExplicitCompletedAmount(t *testi
 	}
 }
 
+// walletPancakeInquiryTransport supplies normal provider order snapshots for
+// existing callback/transaction fixtures. The dedicated inquiry regression
+// below overrides this boundary with independent mismatches and failures.
+type walletPancakeInquiryTransport struct {
+	t         *testing.T
+	next      http.RoundTripper
+	mu        sync.Mutex
+	responses map[string][]byte
+}
+
+func (transport *walletPancakeInquiryTransport) setResult(payload map[string]any) {
+	transport.t.Helper()
+	data := payload["data"].(map[string]any)
+	tradeNo, _ := data["orderMerchantExternalId"].(string)
+	orderID, _ := data["orderId"].(string)
+	price := "100.00"
+	if topUp, err := model.GetTopUpByTradeNoWithError(tradeNo); err == nil {
+		price = formatWaffoPancakeAmount(topUp.Money)
+	}
+	body, err := common.Marshal(map[string]any{"data": map[string]any{"onetimeOrder": map[string]any{
+		"id": orderID, "orderMerchantExternalId": tradeNo, "status": "completed",
+		"testMode": payload["mode"] == "test", "currency": "USD", "store": map[string]any{"id": payload["storeId"]},
+		"priceSnapshot": map[string]string{"currency": "USD", "subtotal": price},
+	}}})
+	require.NoError(transport.t, err)
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	if transport.responses == nil {
+		transport.responses = make(map[string][]byte)
+	}
+	transport.responses[orderID] = body
+}
+
+func (transport *walletPancakeInquiryTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.Host != "api.waffo.ai" || request.URL.Path != "/v1/graphql" {
+		next := transport.next
+		if next == nil {
+			next = http.DefaultTransport
+		}
+		return next.RoundTrip(request)
+	}
+	var query struct {
+		Variables map[string]string `json:"variables"`
+	}
+	if err := common.DecodeJson(request.Body, &query); err != nil {
+		return nil, err
+	}
+	transport.mu.Lock()
+	body := transport.responses[query.Variables["id"]]
+	transport.mu.Unlock()
+	if body == nil {
+		return nil, fmt.Errorf("missing Pancake inquiry fixture for %s", query.Variables["id"])
+	}
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(body)), Header: make(http.Header)}, nil
+}
+
+func TestWalletPancakeQueriesMerchantOrderBeforeSettlement(t *testing.T) {
+	for _, scenario := range []string{
+		"discount and tax", "zero charged", "other environment", "missing environment",
+		"other order", "other external order", "other store", "other currency", "not completed", "missing order",
+		"query errors", "empty response", "null response", "nil response", "malformed response", "credential rejected", "rejected with data", "server error with data", "lost response",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			router, platformKeys := walletWebhookFixture(t)
+			merchantKeys, err := waffoutils.GenerateKeyPair()
+			require.NoError(t, err)
+			setting.WaffoPancakeMerchantID = "MER_AbCdEfGhIjKlMnOpQrStUv"
+			setting.WaffoPancakePrivateKey = merchantKeys.PrivateKey
+			order := walletWebhookOrder(t, model.PaymentProviderWaffoPancake, "pancake-inquiry-original-order")
+			charged := "90.00"
+			if scenario == "zero charged" {
+				charged = "0"
+			}
+			price := map[string]any{"currency": "USD", "subtotal": "100.00", "taxAmount": "10.00", "total": "110.00"}
+			remoteOrder := map[string]any{"id": "ORD_fixture", "orderMerchantExternalId": order.TradeNo, "status": "completed", "testMode": true, "currency": "USD", "priceSnapshot": price, "store": map[string]string{"id": "store_fixture"}}
+			response := map[string]any{"data": map[string]any{"onetimeOrder": remoteOrder}}
+			switch scenario {
+			case "other environment":
+				remoteOrder["testMode"] = false
+			case "missing environment":
+				delete(remoteOrder, "testMode")
+			case "other order":
+				remoteOrder["id"] = "ORD_other"
+			case "other external order":
+				remoteOrder["orderMerchantExternalId"] = "another-local-order"
+			case "other store":
+				remoteOrder["store"] = map[string]string{"id": "another-store"}
+			case "other currency":
+				remoteOrder["currency"] = "EUR"
+			case "not completed":
+				remoteOrder["status"] = "pending"
+			case "missing order":
+				response["data"] = map[string]any{"onetimeOrder": nil}
+			case "query errors":
+				response["errors"] = []map[string]string{{"message": "not authorized"}}
+			}
+			body, err := common.Marshal(response)
+			require.NoError(t, err)
+			switch scenario {
+			case "empty response":
+				body = nil
+			case "null response":
+				body = []byte("null")
+			case "malformed response":
+				body = []byte("{")
+			}
+			request := walletWebhookRequest(t, platformKeys, model.PaymentProviderWaffoPancake, order.TradeNo, charged, true)
+			oldClient := http.DefaultClient
+			t.Cleanup(func() { http.DefaultClient = oldClient })
+			queries := 0
+			recovered := false
+			http.DefaultClient = &http.Client{Transport: walletCheckoutTransport(func(req *http.Request) (*http.Response, error) {
+				queries++
+				assert.Equal(t, "https://api.waffo.ai/v1/graphql", req.URL.String())
+				assert.Equal(t, http.MethodPost, req.Method)
+				assert.Equal(t, setting.WaffoPancakeMerchantID, req.Header.Get("X-Merchant-Id"))
+				assert.Empty(t, req.Header.Get("X-Idempotency-Key"), "read queries must not reuse the checkout action cache")
+				raw, err := io.ReadAll(req.Body)
+				if !assert.NoError(t, err) {
+					return nil, err
+				}
+				hash := sha256.Sum256(raw)
+				canonical := "POST\n/v1/graphql\n" + req.Header.Get("X-Timestamp") + "\n" + base64.StdEncoding.EncodeToString(hash[:])
+				assert.True(t, waffoutils.Verify(canonical, req.Header.Get("X-Signature"), merchantKeys.PublicKey), "the installed SDK must sign the actual query body")
+				var query struct {
+					Query     string            `json:"query"`
+					Variables map[string]string `json:"variables"`
+				}
+				assert.NoError(t, common.Unmarshal(raw, &query))
+				assert.Contains(t, query.Query, "onetimeOrder")
+				assert.Contains(t, query.Query, "orderMerchantExternalId")
+				assert.Contains(t, query.Query, "testMode")
+				assert.Equal(t, "ORD_fixture", query.Variables["id"])
+				if recovered {
+					body = []byte(`{"data":{"onetimeOrder":{"id":"ORD_fixture","orderMerchantExternalId":"pancake-inquiry-original-order","status":"completed","testMode":true,"currency":"USD","store":{"id":"store_fixture"},"priceSnapshot":{"currency":"USD","subtotal":"100.00","taxAmount":"10.00","total":"110.00"}}}}`)
+				} else if scenario == "lost response" {
+					return nil, io.ErrUnexpectedEOF
+				} else if scenario == "nil response" {
+					return nil, nil
+				} else if scenario == "rejected with data" {
+					return &http.Response{StatusCode: http.StatusUnauthorized, Body: io.NopCloser(bytes.NewReader(body)), Header: make(http.Header)}, nil
+				} else if scenario == "server error with data" {
+					return &http.Response{StatusCode: http.StatusInternalServerError, Body: io.NopCloser(bytes.NewReader(body)), Header: make(http.Header)}, nil
+				} else if scenario == "credential rejected" {
+					return &http.Response{StatusCode: http.StatusUnauthorized, Body: io.NopCloser(strings.NewReader(`{"errors":[{"message":"credential rejected"}]}`)), Header: make(http.Header)}, nil
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(body)), Header: make(http.Header)}, nil
+			})}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			valid := scenario == "discount and tax" || scenario == "zero charged"
+			wantStatus := http.StatusInternalServerError
+			if valid {
+				wantStatus = http.StatusOK
+			}
+			assert.Equal(t, wantStatus, recorder.Code, recorder.Body.String())
+			assert.Equal(t, 1, queries)
+			var buyer, inviter model.User
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			var facts int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
+			if !valid {
+				assert.Equal(t, -10, buyer.Quota)
+				assert.Equal(t, 7, inviter.AffQuota)
+				assert.Zero(t, facts)
+				stored, err := model.GetTopUpByTradeNoWithError(order.TradeNo)
+				require.NoError(t, err)
+				assert.Equal(t, common.TopUpStatusPending, stored.Status)
+				assert.Zero(t, stored.CompleteTime)
+			}
+			// Corrected provider data or restored credentials retry the original
+			// order. A known SQL success remains recoverable without the API.
+			recovered = true
+			for range 2 {
+				retry := httptest.NewRecorder()
+				router.ServeHTTP(retry, walletWebhookRequest(t, platformKeys, model.PaymentProviderWaffoPancake, order.TradeNo, charged, true))
+				assert.Equal(t, http.StatusOK, retry.Code, retry.Body.String())
+			}
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
+			assert.Equal(t, 990, buyer.Quota)
+			assert.Equal(t, 107, inviter.AffQuota)
+			assert.EqualValues(t, 1, facts)
+			wantQueries := 2
+			if valid {
+				wantQueries = 1
+			}
+			assert.Equal(t, wantQueries, queries)
+		})
+	}
+}
+
 func TestWalletReferralPancakePreservesStoreEnvironmentAndBuyerBinding(t *testing.T) {
-	for _, scenario := range []string{"other store", "other buyer", "missing buyer", "missing local order", "other environment"} {
+	for _, scenario := range []string{"other store", "other buyer", "missing buyer", "missing local order", "other environment", "test signature for production", "production signature for test", "valid production", "missing environment"} {
 		t.Run(scenario, func(t *testing.T) {
 			router, keys := walletWebhookFixture(t)
+			productionKeys, err := waffoutils.GenerateKeyPair()
+			require.NoError(t, err)
+			t.Setenv("WAFFO_WEBHOOK_PROD_PUBLIC_KEY", productionKeys.PublicKey)
 			order := walletWebhookOrder(t, model.PaymentProviderWaffoPancake, "pancake-bound-order")
 			data := map[string]any{"orderId": "ORD_fixture", "orderMerchantExternalId": order.TradeNo, "merchantProvidedBuyerIdentity": "new-api-user-902", "amount": "90.00", "currency": "USD"}
 			payload := map[string]any{"id": "evt_bound_order", "eventType": "order.completed", "mode": "test", "storeId": "store_fixture", "data": data}
@@ -2201,9 +2431,21 @@ func TestWalletReferralPancakePreservesStoreEnvironmentAndBuyerBinding(t *testin
 				delete(data, "merchantProvidedBuyerIdentity")
 			case "missing local order":
 				data["orderMerchantExternalId"] = "unknown_order"
+			case "test signature for production":
+				payload["mode"] = "prod"
+				wantHTTP = http.StatusUnauthorized
+			case "production signature for test":
+				keys = productionKeys
+				wantHTTP = http.StatusUnauthorized
+			case "valid production":
+				payload["mode"] = "prod"
+				keys = productionKeys
+			case "missing environment":
+				delete(payload, "mode")
+				wantHTTP = http.StatusUnauthorized
 			}
 			request := signedWalletWebhookRequest(t, keys, model.PaymentProviderWaffoPancake, payload)
-			if scenario == "other environment" {
+			if scenario == "other environment" || payload["mode"] == "prod" {
 				request.URL.Path = "/waffo_pancake/prod"
 			}
 			recorder := httptest.NewRecorder()
@@ -2211,14 +2453,21 @@ func TestWalletReferralPancakePreservesStoreEnvironmentAndBuyerBinding(t *testin
 			assert.Equal(t, wantHTTP, recorder.Code)
 			var invitee model.User
 			require.NoError(t, model.DB.First(&invitee, 902).Error)
-			assert.Equal(t, -10, invitee.Quota)
 			stored, err := model.GetTopUpByTradeNoWithError(order.TradeNo)
 			require.NoError(t, err)
-			assert.Equal(t, common.TopUpStatusPending, stored.Status)
-			assert.Zero(t, stored.CompleteTime)
 			var facts int64
 			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
-			assert.Zero(t, facts)
+			if scenario == "valid production" {
+				assert.Equal(t, 990, invitee.Quota)
+				assert.Equal(t, common.TopUpStatusSuccess, stored.Status)
+				assert.NotZero(t, stored.CompleteTime)
+				assert.EqualValues(t, 1, facts)
+			} else {
+				assert.Equal(t, -10, invitee.Quota)
+				assert.Equal(t, common.TopUpStatusPending, stored.Status)
+				assert.Zero(t, stored.CompleteTime)
+				assert.Zero(t, facts)
+			}
 		})
 	}
 }
@@ -2272,8 +2521,21 @@ func TestWalletCheckoutDisplaySnapshotPreservesPricingAndCapacity(t *testing.T) 
 					setting.WaffoUnitPrice, setting.WaffoMinTopUp = 1, 1
 					var externalRequests atomic.Int32
 					var checkoutAmount atomic.Value
+					var checkoutExternalID atomic.Value
 					http.DefaultClient = &http.Client{Transport: walletCheckoutTransport(func(request *http.Request) (*http.Response, error) {
 						externalRequests.Add(1)
+						if request.URL.Path == "/v1/graphql" {
+							// Preserve the provider's original checkout snapshot even
+							// after local display/rate settings change during the request.
+							response, err := common.Marshal(map[string]any{"data": map[string]any{"onetimeOrder": map[string]any{
+								"id": "ORD_fixture", "orderMerchantExternalId": checkoutExternalID.Load(), "status": "completed", "testMode": true, "currency": "USD",
+								"store": map[string]string{"id": "store_fixture"}, "priceSnapshot": map[string]any{"currency": "USD", "subtotal": checkoutAmount.Load()},
+							}}})
+							if err != nil {
+								return nil, err
+							}
+							return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(response))}, nil
+						}
 						body := "{\"data\":{\"token\":\"fixture\",\"expiresAt\":\"2099-01-01T00:00:00Z\"}}"
 						if request.URL.Path == "/v1/actions/checkout/create-session" {
 							var payload map[string]any
@@ -2285,6 +2547,10 @@ func TestWalletCheckoutDisplaySnapshotPreservesPricingAndCapacity(t *testing.T) 
 								return nil, errors.New("missing checkout price snapshot")
 							}
 							checkoutAmount.Store(price["amount"])
+							checkoutExternalID.Store(payload["orderMerchantExternalId"])
+							assert.Equal(t, "USD", payload["currency"])
+							assert.Equal(t, setting.WaffoPancakeProductID, payload["productId"])
+							assert.NotEqual(t, "client-chosen-order", payload["orderMerchantExternalId"])
 							body = "{\"data\":{\"sessionId\":\"ses_fixture\",\"checkoutUrl\":\"https://checkout.example.invalid/fixture\",\"expiresAt\":\"2099-01-01T00:00:00Z\"}}"
 						}
 						return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
@@ -2296,7 +2562,10 @@ func TestWalletCheckoutDisplaySnapshotPreservesPricingAndCapacity(t *testing.T) 
 						// permanent test offline after the frozen order has been created.
 						setting.WaffoPrivateKey = "invalid-local-fixture-key"
 					} else if provider == model.PaymentProviderWaffoPancake {
-						handler, body = RequestWaffoPancakePay, fmt.Sprintf("{\"amount\":%d}", display.amount)
+						handler = RequestWaffoPancakePay
+						// Client-supplied checkout identities, currency and prices cannot
+						// replace the original server-generated order and quote.
+						body = fmt.Sprintf(`{"amount":%d,"orderMerchantExternalId":"client-chosen-order","productId":"PROD_client","currency":"EUR","priceSnapshot":{"amount":"0"}}`, display.amount)
 					}
 					router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, handler)
 					request := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(body))
@@ -2331,6 +2600,7 @@ func TestWalletCheckoutDisplaySnapshotPreservesPricingAndCapacity(t *testing.T) 
 						assert.Equal(t, fmt.Sprintf("%.2f", display.money), response.Data["money"])
 					} else {
 						assert.Equal(t, fmt.Sprintf("%.2f", display.money), checkoutAmount.Load())
+						assert.Equal(t, order.TradeNo, checkoutExternalID.Load())
 						assert.EqualValues(t, 2, externalRequests.Load())
 					}
 					for range 2 {
@@ -4468,11 +4738,314 @@ func TestWalletPricingReadersSynchronizeWithSaveAndReload(t *testing.T) {
 // and decoding while keeping regression tests off the real payment network.
 type walletWaffoSDKTransport func(context.Context, *waffonet.HttpRequest) (*waffonet.HttpResponse, error)
 
+// walletWaffoInquiryTransport simulates the provider at the SDK's HTTP boundary.
+// Requests and replies retain real RSA signatures and SDK decoding.
+type walletWaffoInquiryTransport struct {
+	t         *testing.T
+	keys      *waffoutils.KeyPair
+	responses sync.Map
+	requests  atomic.Int32
+}
+
+func (transport *walletWaffoInquiryTransport) setResult(result map[string]any) {
+	transport.t.Helper()
+	body, err := common.Marshal(result)
+	require.NoError(transport.t, err)
+	var data map[string]any
+	require.NoError(transport.t, common.Unmarshal(body, &data))
+	tradeNo, _ := data["merchantOrderId"].(string)
+	data["paymentRequestId"] = tradeNo
+	data["acquiringOrderId"] = "acquiring_" + tradeNo
+	if data["orderCurrency"] == nil || data["orderCurrency"] == "" {
+		data["orderCurrency"] = "USD"
+	}
+	body, err = common.Marshal(map[string]any{"code": "0", "data": data})
+	require.NoError(transport.t, err)
+	transport.responses.Store(tradeNo, body)
+}
+
+func (transport *walletWaffoInquiryTransport) Send(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	transport.requests.Add(1)
+	if request.Method != http.MethodPost || !strings.HasSuffix(request.URL, "/order/inquiry") ||
+		request.Headers["X-API-KEY"] != "fixture" || !waffoutils.Verify(string(request.Body), request.Headers["X-SIGNATURE"], transport.keys.PublicKey) {
+		return nil, errors.New("invalid simulated merchant inquiry request")
+	}
+	var query order.InquiryOrderParams
+	if err := common.Unmarshal(request.Body, &query); err != nil {
+		return nil, err
+	}
+	body := []byte(`{"code":"E0002","msg":"order not found"}`)
+	if fixture, ok := transport.responses.Load(query.PaymentRequestID); ok {
+		body = fixture.([]byte)
+	}
+	signature, err := waffoutils.Sign(string(body), transport.keys.PrivateKey)
+	if err != nil {
+		return nil, err
+	}
+	return waffonet.NewHttpResponse(http.StatusOK, map[string]string{"X-SIGNATURE": signature}, body), nil
+}
+
 func (transport walletWaffoSDKTransport) Send(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
 	return transport(ctx, request)
 }
 
+func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
+	for _, scenario := range []struct {
+		name, field string
+		value       any
+		raw         string
+		closed      bool
+		accepted    bool
+	}{
+		{name: "discounted_amount", accepted: true},
+		{name: "zero_paid", field: "orderAmount", value: "0.00", accepted: true},
+		{name: "merchant_order_mismatch", field: "merchantOrderId", value: "other_order"},
+		{name: "payment_request_mismatch", field: "paymentRequestId", value: "other_request"},
+		{name: "missing_payment_request", field: "paymentRequestId", value: nil},
+		{name: "missing_acquiring_order", field: "acquiringOrderId", value: nil},
+		{name: "pending_query", field: "orderStatus", value: "PAY_IN_PROGRESS"},
+		{name: "paid_query_cannot_close", field: "orderStatus", value: "PAY_SUCCESS", closed: true},
+		{name: "closed_query_cannot_pay", field: "orderStatus", value: "ORDER_CLOSE"},
+		{name: "amount_mismatch", field: "orderAmount", value: "1.00"},
+		{name: "negative_amount", field: "orderAmount", value: "-1"},
+		{name: "invalid_amount", field: "orderAmount", value: "invalid"},
+		{name: "currency_mismatch", field: "orderCurrency", value: "EUR"},
+		{name: "missing_currency", field: "orderCurrency", value: nil},
+		{name: "merchant_mismatch", field: "merchantInfo", value: map[string]any{"merchantId": "other_merchant"}},
+		{name: "buyer_mismatch", field: "userInfo", value: map[string]any{"userId": "903"}},
+		{name: "subscription_order", field: "subscriptionInfo", value: map[string]any{"subscriptionId": "subscription_other"}},
+		{name: "empty_optional_subscription_info", field: "subscriptionInfo", value: map[string]any{}, accepted: true},
+		{name: "missing_data", raw: `{"code":"0"}`},
+		{name: "null_data", raw: `{"code":"0","data":null}`},
+		{name: "missing_code", raw: `{}`},
+		{name: "json_null", raw: `null`},
+		{name: "unknown_query", raw: `{"code":"E0001"}`},
+		{name: "query_not_found", raw: `{"code":"E0002"}`},
+		{name: "network_failure"},
+		{name: "bad_query_signature"},
+		{name: "nil_http_response"},
+		{name: "http_unauthorized_with_valid_body"},
+		{name: "http_server_error_with_valid_body"},
+		{name: "valid_closed", closed: true, accepted: true},
+		{name: "closed_without_payment_fields", closed: true, accepted: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			router, keys := walletWebhookFixture(t)
+			topUp := walletWebhookOrder(t, model.PaymentProviderWaffo, "waffo-inquiry-binding")
+			require.NoError(t, model.DB.Model(topUp).Update("waffo_merchant_id", "merchant_checkout").Error)
+			status, amount := "PAY_SUCCESS", "90.00"
+			if scenario.closed {
+				status = "ORDER_CLOSE"
+			}
+			if scenario.name == "zero_paid" {
+				amount = "0.00"
+			}
+			result := map[string]any{"merchantOrderId": topUp.TradeNo, "paymentRequestId": topUp.TradeNo, "orderStatus": status, "orderAmount": amount, "orderCurrency": "USD"}
+			if scenario.name == "closed_without_payment_fields" {
+				delete(result, "orderAmount")
+				delete(result, "orderCurrency")
+			}
+			request := signedWalletWebhookRequest(t, keys, model.PaymentProviderWaffo, map[string]any{"eventType": "PAYMENT_NOTIFICATION", "result": result})
+			callbackBody, err := io.ReadAll(request.Body)
+			require.NoError(t, err)
+			request.Body = io.NopCloser(bytes.NewReader(callbackBody))
+			transport := service.WaffoHTTPTransport.(*walletWaffoInquiryTransport)
+			query := map[string]any{"merchantOrderId": topUp.TradeNo, "paymentRequestId": topUp.TradeNo, "acquiringOrderId": "acquiring_" + topUp.TradeNo, "orderStatus": status, "orderAmount": amount, "orderCurrency": "USD", "merchantInfo": map[string]any{"merchantId": "merchant_checkout"}, "userInfo": map[string]any{"userId": "902"}}
+			if scenario.field != "" {
+				query[scenario.field] = scenario.value
+			}
+			if scenario.name == "closed_without_payment_fields" {
+				delete(query, "orderAmount")
+				delete(query, "orderCurrency")
+				delete(query, "acquiringOrderId")
+			}
+			body, err := common.Marshal(map[string]any{"code": "0", "data": query})
+			require.NoError(t, err)
+			if scenario.raw != "" {
+				body = []byte(scenario.raw)
+			}
+			transport.responses.Store(topUp.TradeNo, body)
+			if scenario.name == "network_failure" || scenario.name == "bad_query_signature" || scenario.name == "nil_http_response" || strings.HasSuffix(scenario.name, "_with_valid_body") {
+				service.WaffoHTTPTransport = walletWaffoSDKTransport(func(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+					response, err := transport.Send(ctx, request)
+					switch scenario.name {
+					case "network_failure":
+						return nil, errors.New("simulated inquiry response loss")
+					case "nil_http_response":
+						return nil, nil
+					case "http_unauthorized_with_valid_body":
+						response.StatusCode = http.StatusUnauthorized
+					case "http_server_error_with_valid_body":
+						response.StatusCode = http.StatusInternalServerError
+					case "bad_query_signature":
+						if err == nil {
+							response.Headers["X-SIGNATURE"] = "invalid"
+						}
+					}
+					return response, err
+				})
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			expectedStatus, expectedQuota, expectedAffQuota, expectedFacts := common.TopUpStatusPending, -10, 7, int64(0)
+			if scenario.accepted {
+				assert.JSONEq(t, `{"message":"success"}`, recorder.Body.String())
+				if scenario.closed {
+					expectedStatus = common.TopUpStatusFailed
+				} else {
+					expectedStatus, expectedQuota, expectedAffQuota, expectedFacts = common.TopUpStatusSuccess, 990, 107, 1
+				}
+			} else {
+				assert.JSONEq(t, `{"message":"failed"}`, recorder.Body.String())
+			}
+			require.NoError(t, model.DB.First(topUp, topUp.Id).Error)
+			assert.Equal(t, expectedStatus, topUp.Status)
+			var buyer, inviter model.User
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			assert.Equal(t, expectedQuota, buyer.Quota)
+			assert.Equal(t, expectedAffQuota, inviter.AffQuota)
+			var facts int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
+			assert.Equal(t, expectedFacts, facts)
+			assert.EqualValues(t, 1, transport.requests.Load(), "terminal notification must query the merchant-authenticated original order")
+			// Restore the provider's original fact and replay the exact signed
+			// notification. A retry does not need a replacement local order.
+			transport.setResult(result)
+			service.WaffoHTTPTransport = transport
+			retry := request.Clone(t.Context())
+			retry.Body = io.NopCloser(bytes.NewReader(callbackBody))
+			retryResponse := httptest.NewRecorder()
+			router.ServeHTTP(retryResponse, retry)
+			assert.JSONEq(t, `{"message":"success"}`, retryResponse.Body.String())
+			// After commit, even an inquiry outage cannot prevent idempotent
+			// cache recovery or cause a second credit.
+			service.WaffoHTTPTransport = walletWaffoSDKTransport(func(context.Context, *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+				t.Error("committed order unexpectedly depends on provider inquiry")
+				return nil, errors.New("provider unavailable after commit")
+			})
+			retry = request.Clone(t.Context())
+			retry.Body = io.NopCloser(bytes.NewReader(callbackBody))
+			retryResponse = httptest.NewRecorder()
+			router.ServeHTTP(retryResponse, retry)
+			assert.JSONEq(t, `{"message":"success"}`, retryResponse.Body.String())
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
+			if scenario.closed {
+				assert.Equal(t, -10, buyer.Quota)
+				assert.Equal(t, 7, inviter.AffQuota)
+				assert.Zero(t, facts)
+			} else {
+				assert.Equal(t, 990, buyer.Quota)
+				assert.Equal(t, 107, inviter.AffQuota)
+				assert.EqualValues(t, 1, facts)
+			}
+		})
+	}
+}
+
 func TestWalletWaffoMissingCheckoutOutcomePreservesLateSettlement(t *testing.T) {
+	t.Run("handler freezes authenticated SDK checkout", func(t *testing.T) {
+		router, keys := walletCheckoutFixture(t)
+		oldPrice, oldMin := setting.WaffoUnitPrice, setting.WaffoMinTopUp
+		oldMerchant, oldCurrency := setting.WaffoMerchantId, setting.WaffoCurrency
+		t.Cleanup(func() {
+			setting.WaffoUnitPrice, setting.WaffoMinTopUp = oldPrice, oldMin
+			setting.WaffoMerchantId, setting.WaffoCurrency = oldMerchant, oldCurrency
+		})
+		setting.WaffoUnitPrice, setting.WaffoMinTopUp = 1, 1
+		setting.WaffoMerchantId, setting.WaffoCurrency = "merchant_checkout", "USD"
+		inquiryTransport := service.WaffoHTTPTransport
+		var outgoing order.CreateOrderParams
+		service.WaffoHTTPTransport = walletWaffoSDKTransport(func(_ context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+			require.True(t, strings.HasSuffix(request.URL, "/order/create"))
+			require.Equal(t, "fixture", request.Headers["X-API-KEY"])
+			require.True(t, waffoutils.Verify(string(request.Body), request.Headers["X-SIGNATURE"], keys.PublicKey))
+			require.NoError(t, common.Unmarshal(request.Body, &outgoing))
+			// The local identity and credit must exist before the SDK sends.
+			stored, err := model.GetTopUpByTradeNoWithError(outgoing.PaymentRequestID)
+			require.NoError(t, err)
+			require.NotNil(t, stored.CreditedQuota)
+			assert.Equal(t, 1000, *stored.CreditedQuota)
+			assert.Equal(t, 902, stored.UserId)
+			body, err := common.Marshal(map[string]any{"code": "0", "data": order.CreateOrderData{MerchantOrderID: outgoing.MerchantOrderID, PaymentRequestID: outgoing.PaymentRequestID, OrderAction: `{"actionType":"REDIRECT","webUrl":"https://checkout.example.invalid/waffo"}`}})
+			require.NoError(t, err)
+			signature, err := waffoutils.Sign(string(body), keys.PrivateKey)
+			require.NoError(t, err)
+			return waffonet.NewHttpResponse(http.StatusOK, map[string]string{"X-SIGNATURE": signature}, body), nil
+		})
+		router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestWaffoPay)
+		request := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(`{"amount":100,"user_id":901,"orderAmount":"0","orderCurrency":"EUR","merchantOrderId":"client-selected"}`))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		var checkoutResponse struct {
+			Message string            `json:"message"`
+			Data    map[string]string `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &checkoutResponse))
+		require.Equal(t, "success", checkoutResponse.Message)
+		require.Equal(t, "https://checkout.example.invalid/waffo", checkoutResponse.Data["payment_url"])
+		assert.Equal(t, outgoing.PaymentRequestID, outgoing.MerchantOrderID)
+		assert.NotEqual(t, "client-selected", outgoing.MerchantOrderID)
+		assert.LessOrEqual(t, len(outgoing.PaymentRequestID), 32)
+		assert.Equal(t, "100.00", outgoing.OrderAmount)
+		assert.Equal(t, "USD", outgoing.OrderCurrency)
+		require.NotNil(t, outgoing.MerchantInfo)
+		assert.Equal(t, "merchant_checkout", outgoing.MerchantInfo.MerchantID)
+		require.NotNil(t, outgoing.UserInfo)
+		assert.Equal(t, "902", outgoing.UserInfo.UserID)
+		assert.Equal(t, "902@examples.com", outgoing.UserInfo.UserEmail)
+		require.NotNil(t, outgoing.PaymentInfo)
+		assert.Equal(t, "ONE_TIME_PAYMENT", outgoing.PaymentInfo.ProductName)
+		service.WaffoHTTPTransport = inquiryTransport
+		common.QuotaPerUnit, setting.WaffoUnitPrice = 100, 9
+		for range 2 {
+			callback := httptest.NewRecorder()
+			router.ServeHTTP(callback, walletWebhookRequest(t, keys, model.PaymentProviderWaffo, outgoing.PaymentRequestID, "90.00", true))
+			assert.JSONEq(t, `{"message":"success"}`, callback.Body.String())
+		}
+		var buyer, inviter model.User
+		require.NoError(t, model.DB.First(&buyer, 902).Error)
+		require.NoError(t, model.DB.First(&inviter, 901).Error)
+		assert.Equal(t, 990, buyer.Quota)
+		assert.Equal(t, 107, inviter.AffQuota)
+		var facts int64
+		require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
+		assert.EqualValues(t, 1, facts)
+	})
+	t.Run("generated id fits provider contract", func(t *testing.T) {
+		router, keys := walletCheckoutFixture(t)
+		oldPrice, oldMin := setting.WaffoUnitPrice, setting.WaffoMinTopUp
+		t.Cleanup(func() { setting.WaffoUnitPrice, setting.WaffoMinTopUp = oldPrice, oldMin })
+		setting.WaffoUnitPrice, setting.WaffoMinTopUp = 1, 1
+		user := model.User{Id: 100000, Username: "waffo-large-user-id", AffCode: "waffo-large-user", Status: common.UserStatusEnabled, Group: "default", Quota: -10}
+		require.NoError(t, model.DB.Create(&user).Error)
+		router.POST("/checkout", func(c *gin.Context) { c.Set("id", user.Id) }, RequestWaffoPay)
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel() // The real SDK cannot contact the payment platform.
+		request := httptest.NewRequestWithContext(ctx, http.MethodPost, "/checkout", strings.NewReader(`{"amount":100}`))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		var stored model.TopUp
+		require.NoError(t, model.DB.Where("user_id = ?", user.Id).First(&stored).Error)
+		// Waffo's paymentRequestId is also our persisted merchantOrderId.
+		// The published Create Order schema limits paymentRequestId to 32.
+		assert.LessOrEqual(t, len(stored.TradeNo), 32)
+		assert.Equal(t, common.TopUpStatusPending, stored.Status)
+		for range 2 {
+			callback := httptest.NewRecorder()
+			router.ServeHTTP(callback, walletWebhookRequest(t, keys, model.PaymentProviderWaffo, stored.TradeNo, "100.00", true))
+			assert.JSONEq(t, `{"message":"success"}`, callback.Body.String())
+		}
+		require.NoError(t, model.DB.First(&user, user.Id).Error)
+		assert.Equal(t, 990, user.Quota)
+	})
 	for _, tc := range []struct {
 		name, body    string
 		nilResponse   bool

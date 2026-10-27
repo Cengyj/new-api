@@ -2,9 +2,13 @@ package router
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -15,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +37,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stripe/stripe-go/v81/webhook"
+	waffonet "github.com/waffo-com/waffo-go/net"
+	"github.com/waffo-com/waffo-go/types/order"
 	waffoutils "github.com/waffo-com/waffo-go/utils"
 	"gorm.io/gorm"
 )
@@ -273,11 +280,20 @@ func TestReferralRoutesEnforceIdentityRolesAndTokenScopes(t *testing.T) {
 		{name: "root needs read scope", method: "GET", path: "/api/option/referral_rebate", scope: "wallet:read", user: 2, status: http.StatusForbidden},
 		{name: "root reads rule", method: "GET", path: "/api/option/referral_rebate", scope: "option:read", user: 2, status: http.StatusOK},
 		{name: "read scope cannot save", method: "PUT", path: "/api/option/referral_rebate", scope: "option:read", user: 2, status: http.StatusForbidden},
+		{name: "root saves default disabled rule", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":false,"percentage":"5","valid_days":"7"}`},
+		{name: "root cannot erase configured default rule", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":false,"percentage":"","valid_days":""}`, failure: true},
 		{name: "root saves complete unconfigured rule", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":false,"percentage":"","valid_days":""}`},
 		{name: "root cannot save only one rule field", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":true}`, failure: true},
 		{name: "general option endpoint cannot bypass rule validation", method: "PUT", path: "/api/option/", scope: "option:write", user: 2, status: http.StatusOK, body: `{"key":"ReferralRebateRule","value":"{}"}`, failure: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "root saves complete unconfigured rule" {
+				// Historical installations may have an explicitly empty rule. New
+				// installations now have configured, disabled defaults instead.
+				value, err := common.Marshal(model.ReferralRebateRule{})
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&model.Option{}).Where(&model.Option{Key: model.ReferralRebateOptionKey}).Update("value", string(value)).Error)
+			}
 			if tc.name == "wallet write transfers only own rewards" || tc.name == "transfer replay remains successful while paused" {
 				previousPayment, previousUnit := *operation_setting.GetPaymentSetting(), common.QuotaPerUnit
 				operation_setting.GetPaymentSetting().ComplianceConfirmed = tc.name == "wallet write transfers only own rewards"
@@ -311,6 +327,11 @@ func TestReferralRoutesEnforceIdentityRolesAndTokenScopes(t *testing.T) {
 				if tc.quota != "" {
 					assert.Equal(t, tc.quota, result.Data.AffQuota)
 				}
+			}
+			if tc.name == "root reads rule" || tc.name == "root saves default disabled rule" || tc.name == "root cannot erase configured default rule" {
+				rule, err := model.GetReferralRebateRule()
+				require.NoError(t, err)
+				assert.Equal(t, model.ReferralRebateRule{RateBPS: 500, ValidDays: 7}, rule)
 			}
 		})
 	}
@@ -438,6 +459,8 @@ func TestWalletPaymentRoutesVerifySignaturesAndSettleOnce(t *testing.T) {
 	require.NoError(t, err)
 	merchantKeys, err := waffoutils.GenerateKeyPair()
 	require.NoError(t, err)
+	productionKeys, err := waffoutils.GenerateKeyPair()
+	require.NoError(t, err)
 	stringsToRestore := []*string{
 		&setting.StripeApiSecret, &setting.StripeWebhookSecret, &setting.StripePriceId,
 		&setting.CreemApiKey, &setting.CreemProducts, &setting.CreemWebhookSecret,
@@ -461,11 +484,36 @@ func TestWalletPaymentRoutesVerifySignaturesAndSettleOnce(t *testing.T) {
 	setting.CreemTestMode = false
 	setting.WaffoEnabled, setting.WaffoSandbox = true, false
 	setting.WaffoApiKey, setting.WaffoPrivateKey, setting.WaffoPublicCert, setting.WaffoMerchantId = "waffo_route_key", merchantKeys.PrivateKey, keys.PublicKey, "merchant_route_fixture"
-	setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey, setting.WaffoPancakeProductID, setting.WaffoPancakeStoreID = "merchant_route_fixture", keys.PrivateKey, "product_route_fixture", "store_route_fixture"
+	oldWaffoTransport := service.WaffoHTTPTransport
+	t.Cleanup(func() { service.WaffoHTTPTransport = oldWaffoTransport })
+	waffoFacts := make(map[string]map[string]any)
+	waffoInquiryFailure := false
+	service.WaffoHTTPTransport = paymentRouteWaffoTransport(func(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		require.Equal(t, http.MethodPost, request.Method)
+		require.True(t, strings.HasSuffix(request.URL, "/order/inquiry"))
+		require.Equal(t, "waffo_route_key", request.Headers["X-API-KEY"])
+		require.True(t, waffoutils.Verify(string(request.Body), request.Headers["X-SIGNATURE"], merchantKeys.PublicKey))
+		var query order.InquiryOrderParams
+		require.NoError(t, common.Unmarshal(request.Body, &query))
+		if waffoInquiryFailure {
+			return nil, errors.New("isolated merchant inquiry unavailable")
+		}
+		data, exists := waffoFacts[query.PaymentRequestID]
+		require.True(t, exists, "inquiry must use the original merchant order")
+		body, err := common.Marshal(map[string]any{"code": "0", "data": data})
+		require.NoError(t, err)
+		signature, err := waffoutils.Sign(string(body), keys.PrivateKey)
+		require.NoError(t, err)
+		return waffonet.NewHttpResponse(http.StatusOK, map[string]string{"X-SIGNATURE": signature}, body), nil
+	})
+	setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey, setting.WaffoPancakeProductID, setting.WaffoPancakeStoreID = "MER_AbCdEfGhIjKlMnOpQrStUv", keys.PrivateKey, "product_route_fixture", "store_route_fixture"
 	// This is the SDK's existing public-key injection contract, not a mock of
 	// signature verification and not an application-level verification bypass.
 	t.Setenv("WAFFO_WEBHOOK_TEST_PUBLIC_KEY", keys.PublicKey)
-	t.Setenv("WAFFO_WEBHOOK_PROD_PUBLIC_KEY", "")
+	t.Setenv("WAFFO_WEBHOOK_PROD_PUBLIC_KEY", productionKeys.PublicKey)
 	t.Setenv("WAFFO_WEBHOOK_PUBLIC_KEY", "")
 	operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey = "https://pay.example.invalid", "epay_route_id", "epay_route_secret"
 	operation_setting.PayMethods = []map[string]string{{"type": "alipay"}}
@@ -476,13 +524,14 @@ func TestWalletPaymentRoutesVerifySignaturesAndSettleOnce(t *testing.T) {
 	adminToken := model.UserAccessToken{Name: "payment-route-admin", TokenHash: model.AccessTokenFingerprint(adminRaw), TokenHint: model.AccessTokenHint(adminRaw)}
 	require.NoError(t, adminToken.SetScopes([]string{"billing:read", "billing:write"}))
 	require.NoError(t, model.CreateUserAccessToken(admin.Id, &adminToken, service.AccessTokenMaxPerUser))
-	for i, tc := range []struct{ provider, method string }{
-		{model.PaymentProviderEpay, http.MethodGet}, {model.PaymentProviderEpay, http.MethodPost},
-		{model.PaymentProviderStripe, http.MethodPost}, {model.PaymentProviderCreem, http.MethodPost},
-		{model.PaymentProviderWaffo, http.MethodPost}, {model.PaymentProviderWaffoPancake, http.MethodPost},
+	for i, tc := range []struct{ provider, method, environment string }{
+		{model.PaymentProviderEpay, http.MethodGet, ""}, {model.PaymentProviderEpay, http.MethodPost, ""},
+		{model.PaymentProviderStripe, http.MethodPost, ""}, {model.PaymentProviderCreem, http.MethodPost, ""},
+		{model.PaymentProviderWaffo, http.MethodPost, ""},
+		{model.PaymentProviderWaffoPancake, http.MethodPost, "test"}, {model.PaymentProviderWaffoPancake, http.MethodPost, "prod"},
 	} {
-		t.Run(tc.provider+"/"+tc.method, func(t *testing.T) {
-			name := "route-" + tc.provider + "-" + tc.method
+		t.Run(tc.provider+"/"+tc.method+"/"+tc.environment, func(t *testing.T) {
+			name := "route-" + tc.provider + "-" + tc.method + tc.environment
 			now := time.Now().Unix()
 			inviter := model.User{Username: "route-inviter-" + strconv.Itoa(i), AffCode: "route-aff-" + strconv.Itoa(i), Status: common.UserStatusEnabled, Role: common.RoleCommonUser, AffQuota: 7, AffHistoryQuota: 11, Group: "default"}
 			require.NoError(t, db.Create(&inviter).Error)
@@ -503,6 +552,7 @@ func TestWalletPaymentRoutesVerifySignaturesAndSettleOnce(t *testing.T) {
 			}
 			if tc.provider == model.PaymentProviderWaffo {
 				order.WaffoMerchantID = &merchant
+				waffoFacts[name] = map[string]any{"merchantOrderId": name, "paymentRequestId": name, "acquiringOrderId": "acquiring_" + name, "orderStatus": "PAY_SUCCESS", "orderAmount": "90.00", "orderCurrency": "USD", "merchantInfo": map[string]any{"merchantId": merchant}, "userInfo": map[string]any{"userId": strconv.Itoa(buyer.Id)}}
 			}
 			require.NoError(t, db.Create(&order).Error)
 			foreignProvider := model.PaymentProviderEpay
@@ -511,21 +561,90 @@ func TestWalletPaymentRoutesVerifySignaturesAndSettleOnce(t *testing.T) {
 			}
 			foreign := model.TopUp{UserId: buyer.Id, TradeNo: name + "-foreign", Amount: 100, Money: money, PaymentProvider: foreignProvider, Status: common.TopUpStatusPending, CreditedQuota: &credit}
 			require.NoError(t, db.Create(&foreign).Error)
+			var pancakeInquiryMode atomic.Value
+			pancakeInquiryMode.Store("")
+			var pancakeQueries atomic.Int32
+			if tc.provider == model.PaymentProviderWaffoPancake {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+					pancakeQueries.Add(1)
+					assert.Equal(t, "/v1/graphql", request.URL.Path)
+					assert.Equal(t, setting.WaffoPancakeMerchantID, request.Header.Get("X-Merchant-Id"))
+					raw, err := io.ReadAll(request.Body)
+					if !assert.NoError(t, err) {
+						return
+					}
+					hash := sha256.Sum256(raw)
+					canonical := "POST\n/v1/graphql\n" + request.Header.Get("X-Timestamp") + "\n" + base64.StdEncoding.EncodeToString(hash[:])
+					assert.True(t, waffoutils.Verify(canonical, request.Header.Get("X-Signature"), keys.PublicKey))
+					var query struct {
+						Variables map[string]string `json:"variables"`
+					}
+					assert.NoError(t, common.Unmarshal(raw, &query))
+					assert.Equal(t, "ORD_route_fixture", query.Variables["id"])
+					mode := pancakeInquiryMode.Load().(string)
+					if mode == "inquiry-unavailable" {
+						_, _ = w.Write([]byte(`{"data":{"onetimeOrder":null}}`))
+						return
+					}
+					testMode := tc.environment == "test"
+					if mode == "inquiry-other-environment" {
+						testMode = !testMode
+					}
+					body, err := common.Marshal(map[string]any{"data": map[string]any{"onetimeOrder": map[string]any{
+						"id": "ORD_route_fixture", "orderMerchantExternalId": name, "status": "completed", "testMode": testMode, "currency": "USD",
+						"store": map[string]string{"id": "store_route_fixture"}, "priceSnapshot": map[string]string{"currency": "USD", "subtotal": strconv.FormatFloat(money, 'f', 2, 64)},
+					}}})
+					if assert.NoError(t, err) {
+						_, _ = w.Write(body)
+					}
+				}))
+				target, err := url.Parse(server.URL)
+				require.NoError(t, err)
+				oldClient := http.DefaultClient
+				http.DefaultClient = &http.Client{Transport: paymentRoutePancakeTransport(func(request *http.Request) (*http.Response, error) {
+					if request.URL.Host != "api.waffo.ai" || request.URL.Path != "/v1/graphql" {
+						return nil, fmt.Errorf("unexpected Pancake inquiry URL: %s", request.URL)
+					}
+					local := request.Clone(request.Context())
+					local.URL.Scheme, local.URL.Host = target.Scheme, target.Host
+					return server.Client().Transport.RoundTrip(local)
+				})}
+				t.Cleanup(func() { http.DefaultClient = oldClient; server.Close() })
+			}
 			variants := []string{"wrong-key", "tampered", "missing-signature", "malformed-signature", "unrelated-event", "wrong-binding", "cross-channel"}
+			if tc.provider == model.PaymentProviderWaffo {
+				variants = append(variants, "inquiry-unavailable", "inquiry-amount-mismatch")
+			}
 			if tc.method == http.MethodPost {
 				variants = append(variants, "oversized-body")
 			}
 			if tc.provider == model.PaymentProviderStripe || tc.provider == model.PaymentProviderWaffoPancake {
 				variants = append(variants, "expired-signature")
 			}
+			if tc.provider == model.PaymentProviderWaffoPancake {
+				variants = append(variants, "other-environment-key", "inquiry-other-environment", "inquiry-unavailable")
+			}
 			variants = append(variants, "valid", "duplicate", "manual-replay")
 			for _, variant := range variants {
 				t.Run(variant, func(t *testing.T) {
+					pancakeInquiryMode.Store(variant)
+					if variant == "duplicate" {
+						pancakeInquiryMode.Store("inquiry-unavailable")
+					}
+					previousPancakeQueries := pancakeQueries.Load()
 					signingKeys := keys
+					if tc.provider == model.PaymentProviderWaffoPancake && tc.environment == "prod" {
+						signingKeys = productionKeys
+					}
 					if variant == "wrong-key" {
 						signingKeys = wrongKeys
+					} else if variant == "other-environment-key" {
+						signingKeys = productionKeys
+						if tc.environment == "prod" {
+							signingKeys = keys
+						}
 					}
-					request := signedPaymentRouteRequest(t, signingKeys, tc.provider, name, buyer.Id, variant)
+					request := signedPaymentRouteRequest(t, signingKeys, tc.provider, name, buyer.Id, variant, tc.environment)
 					if tc.method == http.MethodGet {
 						body, err := io.ReadAll(request.Body)
 						require.NoError(t, err)
@@ -540,11 +659,29 @@ func TestWalletPaymentRoutesVerifySignaturesAndSettleOnce(t *testing.T) {
 					}
 					request.RemoteAddr = "198.51.100." + strconv.Itoa(40+i) + ":10000"
 					response := httptest.NewRecorder()
+					if tc.provider == model.PaymentProviderWaffo {
+						waffoInquiryFailure = variant == "inquiry-unavailable"
+						waffoFacts[name]["orderAmount"] = "90.00"
+						if variant == "inquiry-amount-mismatch" {
+							waffoFacts[name]["orderAmount"] = "1.00"
+						}
+					}
 					engine.ServeHTTP(response, request)
+					if tc.provider == model.PaymentProviderWaffoPancake {
+						wantQueries := previousPancakeQueries
+						if variant == "valid" || strings.HasPrefix(variant, "inquiry-") {
+							wantQueries++
+						}
+						assert.Equal(t, wantQueries, pancakeQueries.Load())
+					}
 					settled := variant == "valid" || variant == "duplicate" || variant == "manual-replay"
 					wantStatus := http.StatusOK
 					switch variant {
-					case "wrong-key", "tampered", "missing-signature", "malformed-signature", "expired-signature":
+					case "inquiry-other-environment", "inquiry-unavailable":
+						if tc.provider == model.PaymentProviderWaffoPancake {
+							wantStatus = http.StatusInternalServerError
+						}
+					case "wrong-key", "tampered", "missing-signature", "malformed-signature", "expired-signature", "other-environment-key":
 						switch tc.provider {
 						case model.PaymentProviderStripe, model.PaymentProviderWaffo:
 							wantStatus = http.StatusBadRequest
@@ -659,7 +796,19 @@ func TestWalletPaymentRoutesVerifySignaturesAndSettleOnce(t *testing.T) {
 
 // Generate protocol signatures with the installed SDK algorithms and local
 // credentials, then let SetApiRouter read the original bytes and authenticate.
-func signedPaymentRouteRequest(t *testing.T, keys *waffoutils.KeyPair, provider, tradeNo string, buyerID int, variant string) *http.Request {
+type paymentRouteWaffoTransport func(context.Context, *waffonet.HttpRequest) (*waffonet.HttpResponse, error)
+
+func (transport paymentRouteWaffoTransport) Send(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+	return transport(ctx, request)
+}
+
+type paymentRoutePancakeTransport func(*http.Request) (*http.Response, error)
+
+func (transport paymentRoutePancakeTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
+func signedPaymentRouteRequest(t *testing.T, keys *waffoutils.KeyPair, provider, tradeNo string, buyerID int, variant, environment string) *http.Request {
 	t.Helper()
 	if variant == "cross-channel" {
 		tradeNo += "-foreign"
@@ -736,15 +885,18 @@ func signedPaymentRouteRequest(t *testing.T, keys *waffoutils.KeyPair, provider,
 		}
 		payload = map[string]any{"eventType": eventType, "result": map[string]any{"merchantOrderId": tradeNo, "paymentRequestId": tradeNo, "orderStatus": "PAY_SUCCESS", "orderAmount": "90.00", "orderCurrency": "USD", "merchantInfo": map[string]any{"merchantId": merchant}}}
 	case model.PaymentProviderWaffoPancake:
-		path = "/api/waffo-pancake/webhook/test"
+		path = "/api/waffo-pancake/webhook/" + environment
 		eventType := "order.completed"
 		if variant == "unrelated-event" {
 			eventType = "order.pending"
 		}
 		if variant == "wrong-binding" {
 			path = "/api/waffo-pancake/webhook/prod"
+			if environment == "prod" {
+				path = "/api/waffo-pancake/webhook/test"
+			}
 		}
-		payload = map[string]any{"id": "evt_route_fixture", "eventType": eventType, "mode": "test", "storeId": setting.WaffoPancakeStoreID, "data": map[string]any{"orderId": "ORD_route_fixture", "orderMerchantExternalId": tradeNo, "merchantProvidedBuyerIdentity": service.WaffoPancakeBuyerIdentityFromUserID(buyerID), "amount": "90.00", "currency": "USD"}}
+		payload = map[string]any{"id": "evt_route_fixture", "eventType": eventType, "mode": environment, "storeId": setting.WaffoPancakeStoreID, "data": map[string]any{"orderId": "ORD_route_fixture", "orderMerchantExternalId": tradeNo, "merchantProvidedBuyerIdentity": service.WaffoPancakeBuyerIdentityFromUserID(buyerID), "amount": "90.00", "currency": "USD"}}
 	default:
 		t.Fatalf("unsupported payment fixture provider %s", provider)
 	}

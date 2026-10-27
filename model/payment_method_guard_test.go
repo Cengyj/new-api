@@ -587,6 +587,8 @@ func TestReferralCrossProcessWorker(t *testing.T) {
 	table := "top_ups"
 	if mode == "transfer" {
 		table = "users"
+	} else if mode == "initialize_rule" {
+		table = "options"
 	}
 	barrier := func(tx *gorm.DB) {
 		if tx.Statement.Table != table {
@@ -603,7 +605,9 @@ func TestReferralCrossProcessWorker(t *testing.T) {
 			}
 		})
 	}
-	if dialect == "sqlite" && mode == "transfer" {
+	if mode == "initialize_rule" {
+		require.NoError(t, db.Callback().Create().Before("gorm:create").Register("referral_process_barrier", barrier))
+	} else if dialect == "sqlite" && mode == "transfer" {
 		// SQLite's first account lock is its write reservation; waiting
 		// after that write would prevent the other process reaching the gate.
 		require.NoError(t, db.Callback().Update().Before("gorm:update").Register("referral_process_barrier", barrier))
@@ -612,6 +616,8 @@ func TestReferralCrossProcessWorker(t *testing.T) {
 	}
 	tradeNo := os.Getenv("REFERRAL_PROCESS_TRADE")
 	switch mode {
+	case "initialize_rule":
+		err = InitializeReferralRebateRule(db)
 	case "callback":
 		_, err = RechargeEpay(tradeNo, "alipay", "127.0.0.1")
 	case "manual":

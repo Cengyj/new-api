@@ -62,6 +62,29 @@ func (t *waffoPancakeCheckoutTransport) RoundTrip(request *http.Request) (*http.
 	return t.transport.RoundTrip(request)
 }
 
+// The installed GraphQL SDK exposes data/errors but discards HTTP status.
+// Preserve an authentication or server failure even if its body has data.
+type waffoPancakeInquiryTransport struct {
+	transport http.RoundTripper
+}
+
+func (t *waffoPancakeInquiryTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := t.transport.RoundTrip(request)
+	if err != nil {
+		return response, err
+	}
+	if response == nil {
+		return nil, fmt.Errorf("Waffo Pancake inquiry returned no response")
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		if response.Body != nil {
+			response.Body.Close()
+		}
+		return nil, fmt.Errorf("Waffo Pancake inquiry returned HTTP %d", response.StatusCode)
+	}
+	return response, nil
+}
+
 // WaffoPancakeWebhookEvent mirrors the SDK's WebhookEvent shape using plain
 // strings so controllers don't have to import the SDK package.
 type WaffoPancakeWebhookEvent struct {
@@ -75,7 +98,7 @@ type WaffoPancakeWebhookEvent struct {
 }
 
 type WaffoPancakeWebhookData struct {
-	// OrderID = Pancake ORD_* (logs); OrderMerchantExternalID = our trade_no (lookup).
+	// OrderID = Pancake ORD_* (authenticated inquiry); external ID = our trade_no.
 	OrderID                       string
 	OrderMerchantExternalID       string
 	BuyerEmail                    string
@@ -204,14 +227,26 @@ func WaffoPancakeBuyerIdentityFromUserID(userID int) string {
 	return fmt.Sprintf("new-api-user-%d", userID)
 }
 
-// VerifyConfiguredWaffoPancakeWebhook verifies the signature header. The SDK
-// picks the matching test / prod public key from the payload's `mode` field.
+// VerifyConfiguredWaffoPancakeWebhook verifies the signature with the key for
+// the payload's environment. The SDK's default auto-detection accepts either
+// key regardless of mode, so select the key explicitly before trusting data.
 func VerifyConfiguredWaffoPancakeWebhook(payload string, signatureHeader string) (*WaffoPancakeWebhookEvent, error) {
+	var envelope struct {
+		Mode string `json:"mode"`
+	}
+	if err := common.UnmarshalJsonStr(payload, &envelope); err != nil {
+		return nil, fmt.Errorf("invalid Waffo Pancake webhook envelope: %w", err)
+	}
+	environment := pancake.Environment(strings.ToLower(strings.TrimSpace(envelope.Mode)))
+	if environment != pancake.EnvironmentTest && environment != pancake.EnvironmentProd {
+		return nil, fmt.Errorf("invalid Waffo Pancake webhook environment")
+	}
 	// Retries reuse the first signature timestamp and can arrive over 31
 	// minutes later. Match Waffo's documented 45-minute/1-minute window while
 	// keeping the installed SDK's signature verification and finite age check.
 	// https://github.com/waffo-com/waffo-pancake-sdk-go/releases/tag/v0.9.0
 	evt, err := pancake.VerifyWebhookTyped[pancake.WebhookEventData](payload, signatureHeader, &pancake.VerifyWebhookOptions{
+		Environment: environment,
 		ToleranceMS: (45 * time.Minute).Milliseconds(),
 	})
 	if err != nil {
@@ -269,7 +304,7 @@ var ErrWaffoPancakeOrderLookup = errors.New("waffo pancake order lookup failed")
 
 // ResolveWaffoPancakeTradeNo maps a verified webhook event to a local TopUp
 // trade_no via OrderMerchantExternalID, and rejects buyer-identity mismatches.
-func ResolveWaffoPancakeTradeNo(event *WaffoPancakeWebhookEvent) (string, error) {
+func ResolveWaffoPancakeTradeNo(ctx context.Context, event *WaffoPancakeWebhookEvent) (string, error) {
 	if event == nil {
 		return "", fmt.Errorf("missing webhook event")
 	}
@@ -293,6 +328,76 @@ func ResolveWaffoPancakeTradeNo(event *WaffoPancakeWebhookEvent) (string, error)
 			expectedIdentity,
 			actualIdentity,
 		)
+	}
+	// A committed success already has a verified payment fact. Its original
+	// retry must still reach wallet-cache recovery during a provider outage.
+	if topUp.Status == common.TopUpStatusSuccess {
+		return tradeNo, nil
+	}
+	if strings.TrimSpace(event.Data.OrderID) == "" {
+		return "", fmt.Errorf("%w: missing provider order id", ErrWaffoPancakeOrderLookup)
+	}
+	common.OptionMapRWMutex.RLock()
+	merchantID, privateKey := setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey
+	common.OptionMapRWMutex.RUnlock()
+	httpClient := *http.DefaultClient
+	transport := httpClient.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	httpClient.Transport = &waffoPancakeInquiryTransport{transport: transport}
+	client, err := pancake.New(pancake.Config{MerchantID: merchantID, PrivateKey: privateKey, HTTPClient: &httpClient})
+	if err != nil {
+		return "", errors.Join(ErrWaffoPancakeOrderLookup, err)
+	}
+	// API-key requests are scoped to that merchant and key's environment.
+	// Query the signed provider order ID, never an external reference alone;
+	// a rotated key that cannot see the old order must leave it retryable.
+	// The installed SDK documents these fields in docs/graphql-guide.md.
+	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	response, err := client.GraphQL.Query(queryCtx, pancake.GraphQLParams{
+		Query: `query ($id: ID!) {
+			onetimeOrder(id: $id) {
+				id orderMerchantExternalId status testMode currency
+				store { id }
+			}
+		}`,
+		Variables: map[string]any{"id": event.Data.OrderID},
+	})
+	if err != nil {
+		return "", errors.Join(ErrWaffoPancakeOrderLookup, err)
+	}
+	if response == nil || len(response.Errors) != 0 {
+		return "", fmt.Errorf("%w: provider query did not succeed", ErrWaffoPancakeOrderLookup)
+	}
+	var result struct {
+		Order *struct {
+			ID                      string `json:"id"`
+			OrderMerchantExternalID string `json:"orderMerchantExternalId"`
+			Status                  string `json:"status"`
+			TestMode                *bool  `json:"testMode"`
+			Currency                string `json:"currency"`
+			Store                   struct {
+				ID string `json:"id"`
+			} `json:"store"`
+		} `json:"onetimeOrder"`
+	}
+	if err := common.Unmarshal(response.Data, &result); err != nil {
+		return "", errors.Join(ErrWaffoPancakeOrderLookup, err)
+	}
+	remote := result.Order
+	if remote == nil || remote.ID != event.Data.OrderID || remote.OrderMerchantExternalID != tradeNo || remote.Store.ID != event.StoreID {
+		return "", fmt.Errorf("%w: provider order binding mismatch", ErrWaffoPancakeOrderLookup)
+	}
+	if remote.TestMode == nil || *remote.TestMode != strings.EqualFold(strings.TrimSpace(event.Mode), "test") || remote.Status != string(pancake.OnetimeOrderStatusCompleted) {
+		return "", fmt.Errorf("%w: provider order environment or status mismatch", ErrWaffoPancakeOrderLookup)
+	}
+	// Checkout fixes USD and the price override on the server. Bind the paid
+	// provider order to that checkout; taxes or promotions can make the
+	// collected amount differ, so preserve the existing completion contract.
+	if !strings.EqualFold(remote.Currency, "USD") || !strings.EqualFold(event.Data.Currency, remote.Currency) {
+		return "", fmt.Errorf("%w: provider order currency mismatch", ErrWaffoPancakeOrderLookup)
 	}
 	return tradeNo, nil
 }

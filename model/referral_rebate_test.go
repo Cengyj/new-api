@@ -36,7 +36,13 @@ func referralFixture(t *testing.T, rate int) (User, User) {
 func TestReferralRuleInitializationDefaultsAndPreservesExistingAcrossDatabases(t *testing.T) {
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(dialect, func(t *testing.T) {
-			db, _ := newReferralIntegrationDatabase(t, dialect)
+			db, dsn := newReferralIntegrationDatabase(t, dialect)
+			require.NoError(t, db.AutoMigrate(&Option{}))
+			for _, outcome := range runReferralProcessRace(t, dialect, dsn,
+				referralProcessOperation{Mode: "initialize_rule"},
+				referralProcessOperation{Mode: "initialize_rule"}) {
+				require.Empty(t, outcome.Error, "independent startup processes must initialize one missing rule")
+			}
 			for range 2 {
 				require.NoError(t, db.AutoMigrate(&Option{}))
 				require.NoError(t, InitializeReferralRebateRule(db))
@@ -62,11 +68,117 @@ func TestReferralRuleInitializationDefaultsAndPreservesExistingAcrossDatabases(t
 						require.NoError(t, err)
 						assert.Equal(t, tc.rule, rule, "startup must preserve the existing rule")
 					}
+					for _, outcome := range runReferralProcessRace(t, dialect, dsn,
+						referralProcessOperation{Mode: "initialize_rule"},
+						referralProcessOperation{Mode: "initialize_rule"}) {
+						require.Empty(t, outcome.Error)
+					}
+					rule, err := readReferralRebateRule(db, false)
+					require.NoError(t, err)
+					assert.Equal(t, tc.rule, rule, "concurrent startup must preserve the saved rule")
 				})
+			}
+			for _, damaged := range []string{"", "null", "{}", "invalid-json"} {
+				require.NoError(t, db.Model(&Option{}).Where(&Option{Key: ReferralRebateOptionKey}).Update("value", damaged).Error)
+				require.NoError(t, InitializeReferralRebateRule(db))
+				var stored Option
+				require.NoError(t, db.Where(&Option{Key: ReferralRebateOptionKey}).First(&stored).Error)
+				assert.Equal(t, damaged, stored.Value, "startup must not silently replace damaged persisted configuration")
+				_, err := readReferralRebateRule(db, false)
+				assert.ErrorIs(t, err, ErrInvalidReferralRule)
 			}
 			var count int64
 			require.NoError(t, db.Model(&Option{}).Where(&Option{Key: ReferralRebateOptionKey}).Count(&count).Error)
 			assert.EqualValues(t, 1, count)
+		})
+	}
+}
+
+func TestReferralDefaultRuleRegistrationAndActivationAcrossDatabases(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			db, _ := newReferralIntegrationDatabase(t, dialect)
+			previousDB, previousLogDB, previousRedis := DB, LOG_DB, common.RedisEnabled
+			previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+			previousPayment := *operation_setting.GetPaymentSetting()
+			previousNew, previousInvitee, previousInviter := common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter
+			DB, LOG_DB, common.RedisEnabled = db, db, false
+			kind := map[string]common.DatabaseType{"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL}[dialect]
+			common.SetDatabaseTypes(kind, kind)
+			common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter = 0, 0, 0
+			payment := operation_setting.GetPaymentSetting()
+			payment.ComplianceConfirmed = true
+			payment.ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+			t.Cleanup(func() {
+				DB, LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+				common.SetDatabaseTypes(previousMain, previousLog)
+				*payment = previousPayment
+				common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter = previousNew, previousInvitee, previousInviter
+			})
+			require.NoError(t, db.AutoMigrate(&User{}, &Option{}, &TopUp{}, &ReferralRebate{}, &SubscriptionOrder{}, &Log{}))
+			require.NoError(t, InitializeReferralRebateRule(db))
+			inviter := User{Username: "default-owner", AffCode: "default-owner", Status: common.UserStatusEnabled}
+			require.NoError(t, db.Create(&inviter).Error)
+			legacy := User{Username: "default-legacy", AffCode: "default-legacy", InviterId: inviter.Id, Status: common.UserStatusEnabled}
+			require.NoError(t, db.Create(&legacy).Error)
+			closed := User{Username: "default-closed", RegistrationAffCode: inviter.AffCode, Status: common.UserStatusEnabled}
+			require.NoError(t, closed.Insert(0))
+			assert.Equal(t, inviter.Id, closed.InviterId)
+			assert.Positive(t, closed.CreatedAt)
+			assert.Zero(t, closed.ReferralRateBPS)
+			assert.Zero(t, closed.ReferralExpiresAt)
+			rule, err := GetReferralRebateRule()
+			require.NoError(t, err)
+			rule.Enabled = true
+			payment.ComplianceConfirmed = false
+			require.Error(t, SaveReferralRebateRule(rule), "default values cannot bypass the compliance switch")
+			saved, err := GetReferralRebateRule()
+			require.NoError(t, err)
+			assert.False(t, saved.Enabled)
+			payment.ComplianceConfirmed = true
+			require.NoError(t, SaveReferralRebateRule(rule))
+			active := User{Username: "default-active", RegistrationAffCode: inviter.AffCode, Status: common.UserStatusEnabled}
+			require.NoError(t, active.Insert(0))
+			assert.Equal(t, 500, active.ReferralRateBPS)
+			assert.Equal(t, active.CreatedAt+7*86400, active.ReferralExpiresAt)
+			require.NoError(t, SaveReferralRebateRule(ReferralRebateRule{Enabled: true, RateBPS: 1250, ValidDays: 30}))
+			for range 2 {
+				require.NoError(t, InitializeReferralRebateRule(db))
+			}
+			credit := 100
+			for _, user := range []User{legacy, closed, active} {
+				var stored User
+				require.NoError(t, db.First(&stored, user.Id).Error)
+				assert.Equal(t, user.CreatedAt, stored.CreatedAt)
+				assert.Equal(t, user.ReferralRateBPS, stored.ReferralRateBPS)
+				assert.Equal(t, user.ReferralExpiresAt, stored.ReferralExpiresAt)
+				order := TopUp{UserId: user.Id, TradeNo: user.Username, CreditedQuota: &credit, PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending}
+				require.NoError(t, order.Insert())
+				_, err := RechargeEpay(order.TradeNo, "", "")
+				require.NoError(t, err)
+				require.NoError(t, db.First(&stored, user.Id).Error)
+				assert.Equal(t, credit, stored.Quota)
+			}
+			for _, enabled := range []bool{false, true} {
+				require.NoError(t, SaveReferralRebateRule(ReferralRebateRule{Enabled: enabled, RateBPS: 1250, ValidDays: 30}))
+				order := TopUp{UserId: active.Id, TradeNo: "default-resume-" + strconv.FormatBool(enabled), CreditedQuota: &credit, PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending}
+				require.NoError(t, order.Insert())
+				_, err := RechargeEpay(order.TradeNo, "", "")
+				require.NoError(t, err)
+			}
+			var facts []ReferralRebate
+			require.NoError(t, db.Order("id").Find(&facts).Error)
+			require.Len(t, facts, 2, "old/closed users and paused payments never acquire retroactive rewards")
+			for _, fact := range facts {
+				assert.Equal(t, active.Id, fact.InviteeID)
+				assert.Equal(t, 500, fact.RateBPS)
+				assert.EqualValues(t, 5, fact.RewardQuota)
+			}
+			require.NoError(t, db.First(&inviter, inviter.Id).Error)
+			assert.Equal(t, 10, inviter.AffQuota)
+			assert.Equal(t, 10, inviter.AffHistoryQuota)
+			require.NoError(t, db.First(&active, active.Id).Error)
+			assert.Equal(t, 300, active.Quota)
 		})
 	}
 }

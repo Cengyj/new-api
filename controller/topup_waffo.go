@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 	waffo "github.com/waffo-com/waffo-go"
 	"github.com/waffo-com/waffo-go/config"
 	"github.com/waffo-com/waffo-go/core"
+	waffonet "github.com/waffo-com/waffo-go/net"
 	"github.com/waffo-com/waffo-go/types/order"
 	"gorm.io/gorm"
 )
@@ -57,6 +59,7 @@ func getWaffoSDKForMerchant(merchantID string) (*waffo.Waffo, error) {
 	if err != nil {
 		return nil, err
 	}
+	cfg.CustomTransport = service.WaffoHTTPTransport
 	return waffo.New(cfg), nil
 }
 
@@ -258,8 +261,9 @@ func RequestWaffoPay(c *gin.Context) {
 		return
 	}
 
-	// 生成唯一订单号，paymentRequestId 与 merchantOrderId 保持一致，简化追踪
-	merchantOrderId := fmt.Sprintf("WAFFO-%d-%d-%s", id, time.Now().UnixMilli(), randstr.String(6))
+	// Both IDs share Waffo's 32-character paymentRequestId limit. The user
+	// binding is persisted below; it must not make this identifier grow.
+	merchantOrderId := "WAFFO-" + randstr.String(26)
 	paymentRequestId := merchantOrderId
 
 	// Token 模式下归一化 Amount（存等价美元/CNY 数量，避免 RechargeWaffo 双重放大）
@@ -464,32 +468,92 @@ func WaffoWebhook(c *gin.Context) {
 			return
 		}
 		logger.LogInfo(c.Request.Context(), common.LogText("Waffo webhook verified and parsed event_type=%s merchant_order_id=%s order_status=%s client_ip=%s", event.EventType, payload.Result.MerchantOrderID, payload.Result.OrderStatus, c.ClientIP()))
-		handleWaffoPayment(c, wh, &payload.Result.PaymentNotificationResult)
+		handleWaffoPayment(c, sdk, wh, &payload.Result.PaymentNotificationResult)
 	default:
 		logger.LogInfo(c.Request.Context(), common.LogText("Waffo webhook ignored event event_type=%s client_ip=%s", event.EventType, c.ClientIP()))
 		sendWaffoWebhookResponse(c, wh, true, "")
 	}
 }
 
+// The SDK decodes JSON even on HTTP authentication/server failures. Such a
+// reply cannot prove that the merchant-authenticated order inquiry succeeded.
+type waffoInquiryTransport struct {
+	transport waffonet.HttpTransport
+}
+
+func (transport waffoInquiryTransport) Send(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+	response, err := transport.transport.Send(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	if response == nil {
+		return nil, errors.New("Waffo inquiry returned no HTTP response")
+	}
+	if !response.IsSuccess() {
+		return nil, fmt.Errorf("Waffo inquiry returned HTTP %d", response.StatusCode)
+	}
+	return response, nil
+}
+
 // handleWaffoPayment 处理支付完成通知
-func handleWaffoPayment(c *gin.Context, wh *core.WebhookHandler, result *core.PaymentNotificationResult) {
+func handleWaffoPayment(c *gin.Context, sdk *waffo.Waffo, wh *core.WebhookHandler, result *core.PaymentNotificationResult) {
 	if result.OrderStatus == core.OrderStatusPaySuccess || result.OrderStatus == core.OrderStatusOrderClose {
-		// The signature authenticates Waffo, not the local order's merchant.
-		// Compare an explicit identity with the checkout-time snapshot. Legacy
-		// orders and notifications without a merchant keep their prior contract.
+		topUp, err := model.GetTopUpByTradeNoWithError(result.MerchantOrderID)
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			logger.LogError(c.Request.Context(), common.LogText("Waffo webhook order lookup failed trade_no=%s error=%q", result.MerchantOrderID, err.Error()))
+			sendWaffoWebhookResponse(c, wh, false, "order lookup failed")
+			return
+		}
+		// A platform signature alone does not bind an optional merchant field
+		// to this checkout. Query the original paymentRequestId using the same
+		// merchant credentials/environment that verified this notification.
+		// Both old and new checkouts use tradeNo as paymentRequestId.
 		merchantID, _ := result.MerchantInfo["merchantId"].(string)
-		if merchantID != "" {
-			topUp, err := model.GetTopUpByTradeNoWithError(result.MerchantOrderID)
-			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-				logger.LogError(c.Request.Context(), common.LogText("Waffo webhook order merchant lookup failed trade_no=%s client_ip=%s error=%q", result.MerchantOrderID, c.ClientIP(), err.Error()))
-				sendWaffoWebhookResponse(c, wh, false, "order lookup failed")
+		buyerID, _ := result.UserInfo["userId"].(string)
+		if topUp != nil && topUp.PaymentProvider == model.PaymentProviderWaffo {
+			if (merchantID != "" && topUp.WaffoMerchantID != nil && *topUp.WaffoMerchantID != "" && *topUp.WaffoMerchantID != merchantID) ||
+				(result.PaymentRequestID != "" && result.PaymentRequestID != topUp.TradeNo) ||
+				(buyerID != "" && buyerID != strconv.Itoa(topUp.UserId)) {
+				sendWaffoWebhookResponse(c, wh, false, "payment identity mismatch")
 				return
 			}
-			if topUp != nil && topUp.PaymentProvider == model.PaymentProviderWaffo &&
-				topUp.WaffoMerchantID != nil && *topUp.WaffoMerchantID != "" && *topUp.WaffoMerchantID != merchantID {
-				logger.LogWarn(c.Request.Context(), common.LogText("Waffo webhook order merchant mismatch trade_no=%s client_ip=%s", result.MerchantOrderID, c.ClientIP()))
-				sendWaffoWebhookResponse(c, wh, false, "payment merchant mismatch")
-				return
+			// A committed order only needs the existing idempotent settlement /
+			// cache recovery path. Provider availability cannot revoke that fact.
+			if topUp.Status == common.TopUpStatusPending {
+				queryConfig := *sdk.GetConfig()
+				if queryConfig.CustomTransport == nil {
+					queryConfig.CustomTransport = waffonet.NewDefaultHttpTransportWithTimeouts(queryConfig.ConnectTimeout, queryConfig.ReadTimeout)
+				}
+				queryConfig.CustomTransport = waffoInquiryTransport{transport: queryConfig.CustomTransport}
+				response, err := waffo.New(&queryConfig).Order().Inquiry(c.Request.Context(), &order.InquiryOrderParams{PaymentRequestID: topUp.TradeNo}, nil)
+				// SDK v1.3.2 represents transport/verification failures as E0001
+				// with nil error; a non-nil response is not proof of success.
+				if err != nil || response == nil || !response.IsSuccess() || response.Data == nil {
+					sendWaffoWebhookResponse(c, wh, false, "order inquiry unavailable")
+					return
+				}
+				verified := response.Data
+				if verified.PaymentRequestID != topUp.TradeNo || verified.MerchantOrderID != topUp.TradeNo ||
+					verified.OrderStatus != result.OrderStatus ||
+					(verified.SubscriptionInfo != nil && (verified.SubscriptionInfo.SubscriptionID != "" || verified.SubscriptionInfo.SubscriptionRequest != "" || verified.SubscriptionInfo.MerchantRequest != "")) ||
+					(result.OrderStatus == core.OrderStatusPaySuccess && (verified.AcquiringOrderID == "" || verified.OrderCurrency == "")) ||
+					(result.AcquiringOrderID != "" && result.AcquiringOrderID != verified.AcquiringOrderID) ||
+					(result.OrderCurrency != "" && !strings.EqualFold(result.OrderCurrency, verified.OrderCurrency)) ||
+					(verified.MerchantInfo != nil && topUp.WaffoMerchantID != nil && *topUp.WaffoMerchantID != "" && verified.MerchantInfo.MerchantID != *topUp.WaffoMerchantID) ||
+					(verified.UserInfo != nil && verified.UserInfo.UserID != "" && verified.UserInfo.UserID != strconv.Itoa(topUp.UserId)) {
+					sendWaffoWebhookResponse(c, wh, false, "order inquiry mismatch")
+					return
+				}
+				if result.OrderStatus == core.OrderStatusPaySuccess {
+					paid, paymentErr := decimal.NewFromString(result.OrderAmount)
+					verifiedPaid, verifiedErr := decimal.NewFromString(verified.OrderAmount)
+					// Compare final provider amounts, not the undiscounted checkout
+					// quote: Waffo coupons legitimately permit a zero final amount.
+					if paymentErr != nil || verifiedErr != nil || paid.IsNegative() || !paid.Equal(verifiedPaid) {
+						sendWaffoWebhookResponse(c, wh, false, "payment amount mismatch")
+						return
+					}
+				}
 			}
 		}
 	}

@@ -512,7 +512,7 @@ func WaffoPancakeWebhook(c *gin.Context) {
 	}
 
 	// Dispatch by trade_no prefix. OrderMerchantExternalID = our trade_no;
-	// OrderID is Pancake's internal ORD_* (logs only).
+	// OrderID is Pancake's internal ORD_* used for authenticated wallet inquiry.
 	rawTradeNo := strings.TrimSpace(event.Data.OrderMerchantExternalID)
 	isSubscription := strings.HasPrefix(rawTradeNo, "WAFFO_PANCAKE_SUB-")
 
@@ -544,9 +544,10 @@ func WaffoPancakeWebhook(c *gin.Context) {
 		return
 	}
 
-	tradeNo, err := service.ResolveWaffoPancakeTradeNo(event)
+	tradeNo, err := service.ResolveWaffoPancakeTradeNo(c.Request.Context(), event)
 	if err != nil {
 		if errors.Is(err, service.ErrWaffoPancakeOrderLookup) {
+			logger.LogError(c.Request.Context(), common.LogText("Waffo Pancake top-up verification unavailable trade_no=%s order_id=%s error=%q", rawTradeNo, event.Data.OrderID, err.Error()))
 			c.String(http.StatusInternalServerError, "retry")
 			return
 		}

@@ -32,6 +32,7 @@ import {
 } from '@/stores/system-config-store'
 
 import { parseAffiliateTransferQuota } from '../../lib/affiliate'
+import { ReferralQuota } from '../referral-quota'
 
 interface TransferDialogProps {
   open: boolean
@@ -75,6 +76,13 @@ export function TransferDialog({
   const maximumAmount = quotaUnitsToDollars(availableQuota)
   const [amount, setAmount] = useState(String(minimumAmount))
   const transferQuota = pending?.quota ?? parseAffiliateTransferQuota(amount)
+  const pendingAmount = pending ? quotaUnitsToDollars(pending.quota) : 0
+  // Recovery must show the original amount even when a safe integer loses a
+  // quota unit during currency conversion. Never round-trip that display into
+  // a replacement operation.
+  const needsExactPendingAmount =
+    pending &&
+    parseAffiliateTransferQuota(String(pendingAmount)) !== pending.quota
   const canTransfer =
     complianceConfirmed &&
     !storageError &&
@@ -204,17 +212,23 @@ export function TransferDialog({
           >
             {t('Transfer Amount')}
           </Label>
-          <Input
-            id='transfer-amount'
-            type='number'
-            value={pending ? quotaUnitsToDollars(pending.quota) : amount}
-            disabled={!!pending || transferring}
-            onChange={(e) => setAmount(e.target.value)}
-            min={minimumAmount}
-            max={maximumAmount}
-            step={minimumAmount}
-            className='font-mono text-lg'
-          />
+          {needsExactPendingAmount ? (
+            <output id='transfer-amount' className='block text-lg'>
+              <ReferralQuota value={String(pending.quota)} />
+            </output>
+          ) : (
+            <Input
+              id='transfer-amount'
+              type='number'
+              value={pending ? pendingAmount : amount}
+              disabled={!!pending || transferring}
+              onChange={(e) => setAmount(e.target.value)}
+              min={minimumAmount}
+              max={maximumAmount}
+              step={minimumAmount}
+              className='font-mono text-lg'
+            />
+          )}
         </div>
       </div>
     </Dialog>

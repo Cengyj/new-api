@@ -176,6 +176,61 @@ test('transfer conversion accepts the exact safe limit and rejects out-of-range 
   }
 })
 
+test.each(['USD', 'CNY', 'CUSTOM'] as const)(
+  'restoring a large original transfer in %s shows its exact quota when currency conversion loses a unit',
+  async (quotaDisplayType) => {
+    useSystemConfigStore.getState().setConfig({
+      currency: {
+        ...DEFAULT_CURRENCY_CONFIG,
+        quotaDisplayType,
+        usdExchangeRate: 7,
+        customCurrencyExchangeRate: 0.9,
+      },
+    })
+    const operation = {
+      request_id: 'large-original-transfer',
+      quota: Number.MAX_SAFE_INTEGER,
+    }
+    localStorage.setItem(
+      'new-api:affiliate-transfer:1:large-original-transfer',
+      JSON.stringify(operation)
+    )
+    const posts: unknown[] = []
+    vi.spyOn(api, 'request').mockImplementation(async (config) => {
+      if (config.method === 'post') {
+        posts.push(config.data)
+        return success({})
+      }
+      if (config.url?.includes('/aff_transfer/')) {
+        return success({ found: false, transfer: null })
+      }
+      if (config.url === '/api/user/aff') return success('invite-first')
+      return success({ ...summary, aff_quota: String(operation.quota) })
+    })
+    mountCard()
+    await screen.findByRole('textbox', { name: 'Invitation link' })
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Check transfer result' })
+    )
+    const dialog = await screen.findByRole('dialog', {
+      name: 'Transfer Rewards',
+    })
+    expect(within(dialog).getByLabelText('Transfer Amount')).toHaveTextContent(
+      '9,007,199,254,740,991 quota units'
+    )
+    expect(
+      within(dialog).queryByRole('spinbutton', { name: 'Transfer Amount' })
+    ).not.toBeInTheDocument()
+    await userEvent.click(
+      within(dialog).getByRole('button', { name: 'Check transfer result' })
+    )
+    await userEvent.click(
+      within(dialog).getByRole('button', { name: 'Retry original transfer' })
+    )
+    expect(posts).toEqual([operation])
+  }
+)
+
 test.each(['network loss', 'timeout'])(
   '%s requires lookup and preserves the original ID and amount on retry',
   async (failure) => {
