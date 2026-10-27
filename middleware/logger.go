@@ -10,6 +10,7 @@ import (
 )
 
 const RouteTagKey = "route_tag"
+const accessLogPathKey = "access_log_path"
 
 func RouteTag(tag string) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -20,17 +21,12 @@ func RouteTag(tag string) gin.HandlerFunc {
 
 func SetUpLogger(server *gin.Engine) {
 	server.Use(redactTaskArtifactAccessQuery())
-	server.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
-		var requestID string
-		if param.Keys != nil {
-			requestID, _ = param.Keys[common.RequestIdKey].(string)
-		}
-		tag, _ := param.Keys[RouteTagKey].(string)
-		if tag == "" {
-			tag = "web"
-		}
-		path := param.Path
-		requestPath, _, _ := strings.Cut(path, "?")
+	server.Use(func(c *gin.Context) {
+		// Freeze the safe log value before handlers can rewrite the request.
+		// Decode only for callback classification; keep all displayed paths escaped.
+		requestURL := c.Request.URL
+		requestPath := requestURL.Path
+		path := requestURL.EscapedPath()
 		paymentCallback := false
 		switch requestPath {
 		case "/api/user/epay/notify", "/api/subscription/epay/notify", "/api/subscription/epay/return",
@@ -39,13 +35,22 @@ func SetUpLogger(server *gin.Engine) {
 		}
 		// Payment and OAuth callbacks can carry usable signatures, one-time
 		// codes and state. Only redact the log; verification needs the full query.
-		if paymentCallback || strings.HasPrefix(requestPath, "/api/waffo-pancake/webhook/") ||
-			strings.HasPrefix(requestPath, "/api/oauth/") || strings.HasPrefix(requestPath, "/oauth/") {
-			path = requestPath
-		} else if param.Request.URL.RawQuery != "" {
-			query := param.Request.URL.Query().Encode()
-			path = param.Request.URL.EscapedPath() + relaycommon.SanitizeURLForLog("?"+query)
+		sensitiveCallback := paymentCallback || strings.HasPrefix(requestPath, "/api/waffo-pancake/webhook/") ||
+			strings.HasPrefix(requestPath, "/api/oauth/") || strings.HasPrefix(requestPath, "/oauth/")
+		if !sensitiveCallback && requestURL.RawQuery != "" {
+			query := requestURL.Query().Encode()
+			path += relaycommon.SanitizeURLForLog("?" + query)
 		}
+		c.Set(accessLogPathKey, path)
+		c.Next()
+	})
+	server.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
+		requestID, _ := param.Keys[common.RequestIdKey].(string)
+		tag, _ := param.Keys[RouteTagKey].(string)
+		if tag == "" {
+			tag = "web"
+		}
+		path, _ := param.Keys[accessLogPathKey].(string)
 		return fmt.Sprintf("[GIN] %s | %s | %s | %3d | %13v | %15s | %7s %s\n",
 			param.TimeStamp.Format("2006/01/02 - 15:04:05"),
 			tag,
