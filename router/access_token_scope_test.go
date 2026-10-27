@@ -104,10 +104,13 @@ var accessTokenHelperRoutes = map[string]authz.Permission{
 	"GET /api/audit":               authz.AuditRead,
 }
 
-func newAccessTokenScopeTestEngine(t *testing.T) *gin.Engine {
+func newAccessTokenScopeTestEngine(t *testing.T, setup ...func(*gin.Engine)) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
+	for _, configure := range setup {
+		configure(engine)
+	}
 	// A permission route that is also in the static table panics here.
 	require.NotPanics(t, func() {
 		SetApiRouter(engine)
@@ -517,7 +520,11 @@ func TestWalletPaymentRoutesVerifySignaturesAndSettleOnce(t *testing.T) {
 	t.Setenv("WAFFO_WEBHOOK_PUBLIC_KEY", "")
 	operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey = "https://pay.example.invalid", "epay_route_id", "epay_route_secret"
 	operation_setting.PayMethods = []map[string]string{{"type": "alipay"}}
-	engine := newAccessTokenScopeTestEngine(t)
+	var accessLog bytes.Buffer
+	previousWriter := gin.DefaultWriter
+	gin.DefaultWriter = &accessLog
+	t.Cleanup(func() { gin.DefaultWriter = previousWriter })
+	engine := newAccessTokenScopeTestEngine(t, middleware.SetUpLogger)
 	admin := model.User{Username: "payment-route-admin", AffCode: "route-admin", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default"}
 	require.NoError(t, db.Create(&admin).Error)
 	adminRaw := model.AccessTokenPrefix + strings.Repeat("a", 32)
@@ -649,6 +656,13 @@ func TestWalletPaymentRoutesVerifySignaturesAndSettleOnce(t *testing.T) {
 						body, err := io.ReadAll(request.Body)
 						require.NoError(t, err)
 						request = httptest.NewRequest(http.MethodGet, request.URL.Path+"?"+string(body), nil)
+						if variant == "duplicate" {
+							// Repeated, encoded names must reach the real verifier unchanged.
+							signature := request.URL.Query().Get("sign")
+							query := strings.ReplaceAll(request.URL.RawQuery, "sign=", "%73ign=")
+							query += "&sign=" + url.QueryEscape(signature)
+							request = httptest.NewRequest(http.MethodGet, request.URL.Path+"?"+query, nil)
+						}
 					}
 					if variant == "manual-replay" {
 						body, err := common.Marshal(map[string]string{"trade_no": name})
@@ -656,6 +670,10 @@ func TestWalletPaymentRoutesVerifySignaturesAndSettleOnce(t *testing.T) {
 						request = httptest.NewRequest(http.MethodPost, "/api/user/topup/complete", bytes.NewReader(body))
 						request.Header.Set("Content-Type", "application/json")
 						request.Header.Set("Authorization", "Bearer "+adminRaw)
+					}
+					if tc.provider != model.PaymentProviderEpay && (variant == "valid" || variant == "duplicate") {
+						request.URL.RawQuery = "%73ign=route-private-signature&key=route-private-key&code=route-private-code&code=route-private-code-2"
+						request.RequestURI = request.URL.RequestURI()
 					}
 					request.RemoteAddr = "198.51.100." + strconv.Itoa(40+i) + ":10000"
 					response := httptest.NewRecorder()
@@ -666,7 +684,17 @@ func TestWalletPaymentRoutesVerifySignaturesAndSettleOnce(t *testing.T) {
 							waffoFacts[name]["orderAmount"] = "1.00"
 						}
 					}
+					originalURL, originalQuery, originalURI := request.URL.String(), request.URL.RawQuery, request.RequestURI
+					accessLog.Reset()
 					engine.ServeHTTP(response, request)
+					assert.Equal(t, originalURL, request.URL.String())
+					assert.Equal(t, originalQuery, request.URL.RawQuery)
+					assert.Equal(t, originalURI, request.RequestURI)
+					assert.Contains(t, accessLog.String(), request.URL.Path)
+					if signature := request.URL.Query().Get("sign"); signature != "" {
+						assert.NotContains(t, accessLog.String(), signature)
+						assert.NotContains(t, accessLog.String(), "?")
+					}
 					if tc.provider == model.PaymentProviderWaffoPancake {
 						wantQueries := previousPancakeQueries
 						if variant == "valid" || strings.HasPrefix(variant, "inquiry-") {

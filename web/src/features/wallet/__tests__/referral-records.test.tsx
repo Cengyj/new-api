@@ -37,6 +37,11 @@ import { I18nextProvider, initReactI18next } from 'react-i18next'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import en from '@/i18n/locales/en.json'
+import fr from '@/i18n/locales/fr.json'
+import ja from '@/i18n/locales/ja.json'
+import ru from '@/i18n/locales/ru.json'
+import viLocale from '@/i18n/locales/vi.json'
+import zhTW from '@/i18n/locales/zh-TW.json'
 import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
 import { applyAuthBundle, clearAuthentication } from '@/lib/auth-session'
@@ -1033,12 +1038,12 @@ test('safe wallet amounts keep six-decimal display precision without an extra ra
   expect(screen.queryByText(/quota units/)).not.toBeInTheDocument()
 })
 
-test('exact quota strings remain exact after switching interface languages', async () => {
+test('exact quota strings and interpolation remain intact when switching through all seven interface languages', async () => {
   const i18n = createInstance()
   await i18n.use(initReactI18next).init({
     lng: 'en',
     fallbackLng: 'en',
-    resources: { en, zh },
+    resources: { en, zhCN: zh, zhTW, fr, ja, ru, vi: viLocale },
     interpolation: { escapeValue: false },
   })
   render(
@@ -1047,8 +1052,20 @@ test('exact quota strings remain exact after switching interface languages', asy
     </I18nextProvider>
   )
   expect(screen.getByText('9,007,199,254,740,993 quota units')).toBeVisible()
-  await act(() => i18n.changeLanguage('zh'))
-  expect(screen.getByText('9,007,199,254,740,993 额度单位')).toBeVisible()
+  for (const [language, expected] of [
+    ['zhCN', '9,007,199,254,740,993 额度单位'],
+    ['zhTW', '9,007,199,254,740,993 額度單位'],
+    ['fr', '9\u202f007\u202f199\u202f254\u202f740\u202f993 unités de quota'],
+    ['ja', '9,007,199,254,740,993 クォータ単位'],
+    ['ru', '9\u00a0007\u00a0199\u00a0254\u00a0740\u00a0993 единиц квоты'],
+    ['vi', '9.007.199.254.740.993 đơn vị hạn mức'],
+    ['en', '9,007,199,254,740,993 quota units'],
+  ]) {
+    await act(() => i18n.changeLanguage(language))
+    expect(
+      screen.getByText(expected, { normalizer: (value) => value })
+    ).toBeVisible()
+  }
 })
 
 test.each([
