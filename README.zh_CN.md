@@ -57,11 +57,13 @@
 ---
 
 > [!IMPORTANT]
-> 此定制仓库包含邀请充值返利，已合并上游 new-api `v1.0.0-rc.47`（`e835b1bfc43b565d625537830dbfb19328925134`）。这仅记录源码整合，本次修改不发布或部署新镜像。经授权的发布运行通过镜像验证后，既有 GHCR 工作流会将定制镜像发布到 `ghcr.io/cengyj/new-api`，版本标签与上游对应：`v1.0.0-rc.47`、`v1.0.0-rc.47-amd64`、`latest` 和 `latest-amd64`。这些标签仅提供 `linux/amd64`。旧标签 `referral-rebate-rc45-amd64` 保留为兼容别名，不代表上游版本。
+> 此定制仓库包含邀请充值返利，已合并上游 new-api `v1.0.0-rc.49`（`48a6c87f9e7757fdc58e5be9bcb4f8281ad0dfd0`）。这仅记录源码整合，本次修改不发布或部署新镜像。经授权的发布运行通过镜像验证后，既有 GHCR 工作流会将定制镜像发布到 `ghcr.io/cengyj/new-api`，版本标签与上游对应：`v1.0.0-rc.49`、`v1.0.0-rc.49-amd64`、`latest` 和 `latest-amd64`。这些标签仅提供 `linux/amd64`。旧标签 `referral-rebate-rc45-amd64` 保留为兼容别名，不代表上游版本。
 >
-> 下方保留的上游 Docker 示例使用 `calciumion/new-api`，不会安装本仓库的定制功能。示例 Compose 支持设置 `NEW_API_IMAGE=ghcr.io/cengyj/new-api:v1.0.0-rc.47`，该标签须等待对应发布工作流成功后使用。生产部署应使用 GHCR 工作流记录并验证的固定 digest。已有生产服务器更换镜像时应保留自己的 Compose 配置。
+> 下方保留的上游 Docker 示例使用 `calciumion/new-api`，不会安装本仓库的定制功能。示例 Compose 支持设置 `NEW_API_IMAGE=ghcr.io/cengyj/new-api:v1.0.0-rc.49`，该标签须等待对应发布工作流成功后使用。生产部署应使用 GHCR 工作流记录并验证的固定 digest。已有生产服务器更换镜像时应保留自己的 Compose 配置。
 >
 > `VERSION` 记录已经合并的上游版本。GHCR 工作流为应用版本附加 `referral`、源码提交和架构，保留定制产物的可追溯性；版本和 latest 别名仅在发布分支当前提交的镜像验证通过后更新。修改这些文件只影响后续构建，已经发布的镜像 digest 仍保留原版本标识。
+
+> 共享 Redis 的节点须统一升级，并保持相同的有效 `CRYPTO_SECRET`（未设置时继承 `SESSION_SECRET`）；回退时也须保持这些密钥。新旧版本不能可靠同步缓存失效通知，因此混跑的滚动升级未经验证。SQLite 应使用在线备份 API，或停写并 checkpoint 后进行一致性复制；依次复制正在写入的数据库与 WAL 文件不是原子备份。回退必须保全并对账升级后已确认的支付、返利和转入事实，单独切换源码或镜像版本不能恢复数据库与缓存状态。
 
 ## 📝 项目说明
 

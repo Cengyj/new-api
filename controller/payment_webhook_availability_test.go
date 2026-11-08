@@ -1952,7 +1952,7 @@ func TestWalletReferralCheckoutLocalFailurePreservesCompletionPolicy(t *testing.
 }
 
 func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.T) {
-	for _, scenario := range []string{"late_callback", "manual_then_callback", "callback_before_response_loss", "non_json_remote_error", "session_http500", "session_http401", "token_http500", "token_http401", "session_timeout", "token_timeout", "empty_checkout_url", "blank_checkout_url", "empty_buyer_token", "blank_buyer_token", "successful_checkout"} {
+	for _, scenario := range []string{"late_callback", "manual_then_callback", "callback_before_response_loss", "non_json_remote_error", "session_http500", "session_http401", "token_http500", "token_http401", "session_timeout", "token_timeout", "missing_session_id", "blank_session_id", "empty_checkout_url", "blank_checkout_url", "empty_buyer_token", "blank_buyer_token", "successful_checkout"} {
 		t.Run(scenario, func(t *testing.T) {
 			router, keys := walletCheckoutFixture(t)
 			observed := make(chan model.TopUp, 1)
@@ -2034,6 +2034,12 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 					return
 				}
 				switch scenario {
+				case "missing_session_id":
+					_, _ = w.Write([]byte(`{"data":{"checkoutUrl":"https://checkout.example.invalid/pancake","expiresAt":"2099-01-01T00:00:00Z"}}`))
+					return
+				case "blank_session_id":
+					_, _ = w.Write([]byte(`{"data":{"sessionId":"   ","checkoutUrl":"https://checkout.example.invalid/pancake","expiresAt":"2099-01-01T00:00:00Z"}}`))
+					return
 				case "empty_checkout_url", "blank_checkout_url":
 					checkoutURL := ""
 					if scenario == "blank_checkout_url" {
@@ -3522,7 +3528,7 @@ func TestWalletCallbacksRetryPostCommitCacheFailure(t *testing.T) {
 			}
 			client := redis.NewClient(&redis.Options{Addr: address, DB: 13, MaxRetries: -1})
 			require.NoError(t, client.Ping(t.Context()).Err())
-			cacheKey, fillKey := "user:902", "wallet:user:fill:902"
+			cacheKey, fillKey := "user:902", "wallet:user:fill:{user:902}"
 			count, err := client.Exists(t.Context(), cacheKey, fillKey).Result()
 			require.NoError(t, err)
 			require.Zero(t, count, "never overwrite another Redis fixture")

@@ -179,6 +179,42 @@ func TestReferralDefaultRuleRegistrationAndActivationAcrossDatabases(t *testing.
 			assert.Equal(t, 10, inviter.AffHistoryQuota)
 			require.NoError(t, db.First(&active, active.Id).Error)
 			assert.Equal(t, 300, active.Quota)
+
+			t.Run("self_invitation_cannot_create_eligibility_or_rewards", func(t *testing.T) {
+				common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter = 20, 30, 40
+				self := User{Id: GetMaxUserId() + 1, Username: "self-invitation", Status: common.UserStatusEnabled, ReferralRateBPS: 10000, ReferralExpiresAt: time.Now().Unix() + 86400}
+				require.NoError(t, self.Insert(self.Id))
+				require.NoError(t, db.First(&self, self.Id).Error)
+				assert.Zero(t, self.InviterId)
+				assert.Zero(t, self.ReferralRateBPS)
+				assert.Zero(t, self.ReferralExpiresAt)
+				assert.Equal(t, 20, self.Quota, "only the ordinary registration gift is credited")
+				assert.Zero(t, self.AffQuota)
+				assert.Zero(t, self.AffHistoryQuota)
+				assert.Zero(t, self.AffCount)
+
+				// A damaged historical self-reference must fail settlement atomically,
+				// even when it claims otherwise valid, unexpired eligibility.
+				require.NoError(t, db.Model(&self).Updates(map[string]any{
+					"inviter_id": self.Id, "referral_rate_bps": 1000, "referral_expires_at": self.CreatedAt + 86400,
+				}).Error)
+				order := TopUp{UserId: self.Id, TradeNo: "self-invitation-payment", CreditedQuota: &credit, PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending}
+				require.NoError(t, order.Insert())
+				for range 2 {
+					_, err := RechargeEpay(order.TradeNo, "", "")
+					require.ErrorIs(t, err, ErrInvalidReferralSnapshot)
+				}
+				require.NoError(t, db.First(&self, self.Id).Error)
+				require.NoError(t, db.First(&order, order.Id).Error)
+				assert.Equal(t, 20, self.Quota)
+				assert.Zero(t, self.AffQuota)
+				assert.Zero(t, self.AffHistoryQuota)
+				assert.Equal(t, common.TopUpStatusPending, order.Status)
+				assert.Zero(t, order.CompleteTime)
+				var selfRewards int64
+				require.NoError(t, db.Model(&ReferralRebate{}).Where("top_up_id = ?", order.Id).Count(&selfRewards).Error)
+				assert.Zero(t, selfRewards)
+			})
 		})
 	}
 }

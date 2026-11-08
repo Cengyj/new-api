@@ -59,16 +59,28 @@ func walletCacheValidationError(err error) error {
 }
 
 type UserBase struct {
-	Id          int    `json:"id" redis:"Id"`
-	Group       string `json:"group" redis:"Group"`
-	Email       string `json:"email" redis:"Email"`
-	Quota       int    `json:"quota" redis:"Quota"`
-	Status      int    `json:"status" redis:"Status"`
-	Role        int    `json:"role" redis:"Role"`
-	Username    string `json:"username" redis:"Username"`
-	Setting     string `json:"setting" redis:"Setting"`
-	AuthVersion int64  `json:"-" redis:"AuthVersion"`
-	CacheSchema int    `json:"-" redis:"CacheSchema"`
+	Id             int    `json:"id" redis:"Id"`
+	Group          string `json:"group" redis:"Group"`
+	Email          string `json:"email" redis:"Email"`
+	Quota          int    `json:"quota" redis:"Quota"`
+	Status         int    `json:"status" redis:"Status"`
+	Role           int    `json:"role" redis:"Role"`
+	Username       string `json:"username" redis:"Username"`
+	Setting        string `json:"setting" redis:"Setting"`
+	AuthVersion    int64  `json:"-" redis:"AuthVersion"`
+	CacheSchema    int    `json:"-" redis:"CacheSchema"`
+	CacheExpiresAt int64  `json:"-" redis:"CacheExpiresAt"`
+	CacheMAC       string `json:"-" redis:"CacheMAC"`
+}
+
+func (user UserBase) cacheMAC() (string, error) {
+	user.Quota = 0
+	return authCacheMAC(getUserCacheKey(user.Id), struct {
+		User           UserBase
+		AuthVersion    int64
+		CacheSchema    int
+		CacheExpiresAt int64
+	}{user, user.AuthVersion, user.CacheSchema, user.CacheExpiresAt})
 }
 
 func (user *UserBase) WriteContext(c *gin.Context) {
@@ -208,6 +220,18 @@ func GetUserCache(userId int) (*UserBase, error) {
 	if err != nil {
 		return nil, err
 	}
+	if fillErr == nil {
+		// Metadata repair preserves live quota deltas. Return that same balance
+		// to callers, including the billing trust check, rather than the older
+		// SQL balance used only to initialize a genuinely missing counter.
+		refreshed, cacheErr := cacheGetUserBase(userId)
+		if cacheErr == nil {
+			return refreshed, nil
+		}
+		if errors.Is(cacheErr, ErrUserAuthCachePending) || errors.Is(cacheErr, ErrWalletCacheRecoveryRequired) || errors.Is(cacheErr, ErrWalletCacheValidationUnavailable) {
+			return nil, cacheErr
+		}
+	}
 	return user.ToBaseUser(), nil
 }
 
@@ -225,11 +249,18 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 	if len(command.Val()) == 0 {
 		return nil, fmt.Errorf("user cache is missing")
 	}
+	if _, ok := command.Val()["Quota"]; !ok {
+		return nil, fmt.Errorf("user cache quota is missing")
+	}
 	if err := command.Scan(&userCache); err != nil {
 		return nil, err
 	}
 	if userCache.Id != userId || userCache.CacheSchema != userCacheSchemaVersion || userCache.AuthVersion <= 0 {
 		return nil, fmt.Errorf("user cache schema is stale")
+	}
+	mac, err := userCache.cacheMAC()
+	if err != nil || !validAuthCacheMAC(mac, userCache.CacheMAC, userCache.CacheExpiresAt) {
+		return nil, fmt.Errorf("user cache integrity check failed")
 	}
 	floor, err := getUserAuthVersionFloor(context.Background(), common.RDB, userId)
 	if err != nil {
@@ -269,7 +300,7 @@ func syncCreditUserQuotaCache(userId int, quota int, operation string) {
 }
 
 func getWalletCacheFillKey(userID int) string {
-	return fmt.Sprintf("wallet:user:fill:%d", userID)
+	return fmt.Sprintf("wallet:user:fill:{%s}", getUserCacheKey(userID))
 }
 
 // Bind each acknowledged reservation to the Redis run observed before the SQL
@@ -394,6 +425,9 @@ if not marker then
   return 0
 end
 if marker ~= 'done' then
+  if redis.call('HEXISTS', KEYS[1], 'Quota') == 0 then
+    return redis.error_reply('WALLET_CACHE_RECOVERY_REQUIRED')
+  end
   -- HINCRBY validates signed int64 arithmetic; HGET avoids Lua number rounding.
   redis.call('HSET', KEYS[1], 'WalletCreditNextQuota', redis.call('HGET', KEYS[1], 'Quota') or '0')
   redis.call('HINCRBY', KEYS[1], 'WalletCreditNextQuota', ARGV[2])
@@ -442,74 +476,9 @@ func getUserSettingCache(userId int) (dto.UserSetting, error) {
 	return cache.GetSetting(), nil
 }
 
-// RefreshUserGroupCache writes the database-authoritative group into an
-// existing user hash without changing the user's authentication version.
+// RefreshUserGroupCache publishes current user metadata after a group change.
 func RefreshUserGroupCache(userId int) error {
-	if !common.RedisEnabled {
-		return nil
-	}
-	if userId <= 0 {
-		return fmt.Errorf("invalid user id")
-	}
-	var authoritative User
-	if err := DB.Select("id", "auth_version", commonGroupCol).Where("id = ?", userId).First(&authoritative).Error; err != nil {
-		return err
-	}
-	// Group transitions intentionally keep the same authentication version. A
-	// refresh that read the previous group can therefore arrive after a newer
-	// refresh and still pass the auth-version fence. Re-read after every write
-	// and repair the cache when the authoritative group changed in between.
-	for range 3 {
-		if err := updateUserCacheFieldAtVersion(userId, "Group", authoritative.Group, authoritative.AuthVersion); err != nil {
-			return err
-		}
-
-		var verified User
-		if err := DB.Select("id", "auth_version", commonGroupCol).Where("id = ?", userId).First(&verified).Error; err != nil {
-			return err
-		}
-		if verified.AuthVersion == authoritative.AuthVersion && verified.Group == authoritative.Group {
-			return nil
-		}
-		authoritative = verified
-	}
-
-	// Preserve the freshest snapshot observed even when the row was too busy to
-	// stabilize within the bounded retries. Returning an error lets best-effort
-	// callers emit an operation-specific warning.
-	if err := updateUserCacheFieldAtVersion(userId, "Group", authoritative.Group, authoritative.AuthVersion); err != nil {
-		return err
-	}
-	return fmt.Errorf("user group changed repeatedly during cache refresh")
-}
-
-func updateUserEmailCache(userId int, email string) error {
-	return updateUserCacheField(userId, "Email", email)
-}
-
-func updateUserNameCache(userId int, username string) error {
-	return updateUserCacheField(userId, "Username", username)
-}
-
-func updateUserSettingCache(userId int, setting string) error {
-	return updateUserCacheField(userId, "Setting", setting)
-}
-
-// updateUserCacheField prevents individual cache refreshes from bypassing the
-// auth-version fence. It intentionally does nothing when the complete hash is
-// absent; the next GetUserCache call will repopulate it from the database.
-func updateUserCacheField(userId int, field string, value any) error {
-	if !common.RedisEnabled {
-		return nil
-	}
-	var user User
-	if err := DB.Select("id", "auth_version").Where("id = ?", userId).First(&user).Error; err != nil {
-		return err
-	}
-	if user.AuthVersion <= 0 {
-		return fmt.Errorf("invalid user auth version")
-	}
-	return updateUserCacheFieldAtVersion(userId, field, value, user.AuthVersion)
+	return PublishUserAuthCache(userId)
 }
 
 // GetUserLanguage returns the user's language preference from cache

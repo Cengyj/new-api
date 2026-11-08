@@ -6,8 +6,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -102,6 +104,28 @@ func (conn *lostWalletCreditReplyConn) Read(response []byte) (int, error) {
 	return conn.Conn.Read(response)
 }
 
+// Sharded Redis hashes only the text inside the first brace pair, so fence
+// and version keys tagged with the untagged cache key share its slot.
+// Miniredis does not enforce slots, so check the tags explicitly.
+func TestAuthCacheKeysShareClusterHashTag(t *testing.T) {
+	for _, tc := range []struct {
+		cacheKey string
+		related  []string
+	}{
+		{getUserCacheKey(5), []string{getUserAuthFenceKey(5), getUserAuthVersionKey(5), getWalletCacheFillKey(5)}},
+		{getTokenCacheKey("test-token"), []string{getTokenCacheFenceKey("test-token")}},
+	} {
+		assert.NotContains(t, tc.cacheKey, "{")
+		for _, key := range tc.related {
+			_, suffix, ok := strings.Cut(key, "{")
+			require.True(t, ok)
+			tag, _, ok := strings.Cut(suffix, "}")
+			require.True(t, ok)
+			assert.Equal(t, tc.cacheKey, tag)
+		}
+	}
+}
+
 func useUserCacheMiniRedis(t *testing.T) *miniredis.Miniredis {
 	t.Helper()
 	server := miniredis.RunT(t)
@@ -183,14 +207,14 @@ func TestPendingUserAuthFenceRejectsStaleCacheWrite(t *testing.T) {
 	assert.False(t, server.Exists(getUserCacheKey(userID)))
 }
 
-func TestUserAuthFieldUpdateRejectsVersionMismatch(t *testing.T) {
+func TestUserAuthCacheUpdateRejectsVersionMismatch(t *testing.T) {
 	useUserCacheMiniRedis(t)
 	const userID = 4202
 	require.NoError(t, writeUserCache(&UserBase{
 		Id: userID, Group: "current", Username: "cached", AuthVersion: 3,
 	}, true))
 
-	err := updateUserCacheFieldAtVersion(userID, "Group", "stale", 2)
+	err := writeUserCache(&UserBase{Id: userID, Group: "stale", AuthVersion: 2}, false)
 
 	assert.ErrorIs(t, err, ErrUserAuthCachePending)
 	group, err := common.RDB.HGet(t.Context(), getUserCacheKey(userID), "Group").Result()
@@ -1624,4 +1648,224 @@ func TestReferralWalletCacheFinalizationPreservesSignedIntegerQuota(t *testing.T
 			}
 		})
 	}
+}
+
+func TestSignedUserCacheDoesNotRebaseUnfinishedWalletCredit(t *testing.T) {
+	address := os.Getenv("NEW_API_REFERRAL_REDIS_ADDR")
+	if address == "" {
+		t.Skip("set NEW_API_REFERRAL_REDIS_ADDR to a disposable isolated Redis instance")
+	}
+	for _, damaged := range []string{"missing", "malformed"} {
+		t.Run(damaged, func(t *testing.T) {
+			_, user := referralFixture(t, 1000)
+			user.Quota = 50
+			require.NoError(t, DB.Model(&user).Update("quota", user.Quota).Error)
+			previousDB, previousClient, previousEnabled := DB, common.RDB, common.RedisEnabled
+			client := redis.NewClient(&redis.Options{Addr: address, DB: 12, MaxRetries: -1})
+			require.NoError(t, client.Ping(t.Context()).Err())
+			unavailable := redis.NewClient(&redis.Options{Addr: address, DB: 12, MaxRetries: -1})
+			require.NoError(t, unavailable.Close())
+			common.RDB, common.RedisEnabled = client, true
+			keys := []string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id), getWalletCacheFillKey(user.Id)}
+			t.Cleanup(func() {
+				DB, common.RDB, common.RedisEnabled = previousDB, previousClient, previousEnabled
+				assert.NoError(t, client.Del(context.Background(), keys...).Err())
+				assert.NoError(t, client.Close())
+			})
+			require.NoError(t, populateUserCache(user))
+			credit := 100
+			order := TopUp{UserId: user.Id, TradeNo: "signed-cache-damaged-credit", CreditedQuota: &credit, PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending}
+			require.NoError(t, order.Insert())
+			DB = previousDB.Session(&gorm.Session{Context: t.Context()})
+			DB.Statement.ConnPool = creditCommitPool{ConnPool: previousDB.Statement.ConnPool, afterCommit: func() error {
+				common.RDB = unavailable
+				return nil
+			}}
+			_, err := RechargeEpay(order.TradeNo, "", "")
+			require.Error(t, err)
+			DB, common.RDB = previousDB, client
+			require.NoError(t, DB.First(&user, user.Id).Error)
+			assert.Equal(t, 150, user.Quota, "the principal was committed before cache finalization failed")
+			if damaged == "missing" {
+				require.NoError(t, client.HDel(t.Context(), keys[0], "Quota").Err())
+			} else {
+				require.NoError(t, client.HSet(t.Context(), keys[0], "Quota", "corrupted").Err())
+			}
+			_, err = GetUserCache(user.Id)
+			require.ErrorIs(t, err, ErrWalletCacheRecoveryRequired, "a SQL snapshot already containing the credit cannot retain its pending delta")
+			_, err = RechargeEpay(order.TradeNo, "", "")
+			require.Error(t, err, "a missing counter must not become zero plus the credit")
+			marker, err := client.HGet(t.Context(), keys[0], "WalletCredit:topup:"+strconv.Itoa(order.Id)).Result()
+			require.NoError(t, err)
+			assert.NotEmpty(t, marker)
+			assert.NotEqual(t, "done", marker)
+			// Undo this test's counter corruption to the known, captured pre-credit
+			// value. The same durable order then completes exactly once.
+			require.NoError(t, client.HSet(t.Context(), keys[0], "Quota", 50).Err())
+			for range 2 {
+				duplicate, err := RechargeEpay(order.TradeNo, "", "")
+				require.NoError(t, err)
+				assert.True(t, duplicate)
+			}
+			cached, err := cacheGetUserBase(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, 150, cached.Quota)
+		})
+	}
+}
+
+func TestSignedUserCacheMetadataRefreshKeepsLiveQuota(t *testing.T) {
+	address := os.Getenv("NEW_API_REFERRAL_REDIS_ADDR")
+	if address == "" {
+		t.Skip("set NEW_API_REFERRAL_REDIS_ADDR to a disposable isolated Redis instance")
+	}
+	_, user := referralFixture(t, 1000)
+	user.Quota = 100
+	require.NoError(t, DB.Model(&user).Update("quota", user.Quota).Error)
+	previousClient, previousEnabled := common.RDB, common.RedisEnabled
+	client := redis.NewClient(&redis.Options{Addr: address, DB: 12, MaxRetries: -1})
+	require.NoError(t, client.Ping(t.Context()).Err())
+	common.RDB, common.RedisEnabled = client, true
+	keys := []string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id), getWalletCacheFillKey(user.Id)}
+	t.Cleanup(func() {
+		common.RDB, common.RedisEnabled = previousClient, previousEnabled
+		assert.NoError(t, client.Del(context.Background(), keys...).Err())
+		assert.NoError(t, client.Close())
+	})
+	require.NoError(t, populateUserCache(user))
+	result, err := cacheApplyUserQuotaDelta(user.Id, -70)
+	require.NoError(t, err)
+	require.Equal(t, cacheQuotaOK, result)
+	for _, mutation := range []string{"missing_signature", "invalid_signature", "expired_signature", "modified_role"} {
+		t.Run(mutation, func(t *testing.T) {
+			switch mutation {
+			case "missing_signature":
+				require.NoError(t, client.HDel(t.Context(), keys[0], "CacheMAC", "CacheExpiresAt").Err())
+			case "invalid_signature":
+				require.NoError(t, client.HSet(t.Context(), keys[0], "CacheMAC", "invalid").Err())
+			case "expired_signature":
+				cached, err := cacheGetUserBase(user.Id)
+				require.NoError(t, err)
+				cached.CacheExpiresAt = time.Now().Add(-time.Second).UnixMilli()
+				mac, err := cached.cacheMAC()
+				require.NoError(t, err)
+				require.NoError(t, client.HSet(t.Context(), keys[0], "CacheExpiresAt", cached.CacheExpiresAt, "CacheMAC", mac).Err())
+			case "modified_role":
+				require.NoError(t, client.HSet(t.Context(), keys[0], "Role", common.RoleRootUser).Err())
+			}
+			_, err := cacheGetUserBase(user.Id)
+			require.Error(t, err)
+			loaded, err := GetUserCache(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, user.Role, loaded.Role)
+			assert.Equal(t, 30, loaded.Quota, "successful metadata repair must return the live reserved balance, not the older SQL balance")
+			cached, err := cacheGetUserBase(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, 30, cached.Quota)
+		})
+	}
+}
+
+func TestSignedUserCacheAcrossProcessesAndRedisRestart(t *testing.T) {
+	address := os.Getenv("NEW_API_REFERRAL_REDIS_ADDR")
+	if address == "" {
+		t.Skip("set NEW_API_REFERRAL_REDIS_ADDR to a disposable isolated Redis instance")
+	}
+	previousClient, previousEnabled, previousSecret := common.RDB, common.RedisEnabled, common.CryptoSecret
+	client := redis.NewClient(&redis.Options{Addr: address, DB: 12, MaxRetries: -1})
+	require.NoError(t, client.Ping(t.Context()).Err())
+	common.RDB, common.RedisEnabled = client, true
+	// This fixed key belongs only to the isolated test deployment. It proves
+	// configured nodes interoperate; it never substitutes for a production key.
+	common.CryptoSecret = "new-api-isolated-cache-signature-contract"
+	t.Cleanup(func() {
+		common.RDB, common.RedisEnabled, common.CryptoSecret = previousClient, previousEnabled, previousSecret
+		assert.NoError(t, client.Close())
+	})
+	if mode := os.Getenv("NEW_API_CACHE_SIGNATURE_WORKER"); mode != "" {
+		id, err := strconv.Atoi(os.Getenv("NEW_API_CACHE_SIGNATURE_USER_ID"))
+		require.NoError(t, err)
+		if mode == "different_key" {
+			common.CryptoSecret = "different-isolated-cache-signature-contract"
+			_, err := cacheGetUserBase(id)
+			require.Error(t, err)
+			return
+		}
+		require.Equal(t, "same_key", mode)
+		require.NoError(t, DB.Callback().Query().Before("gorm:query").Register("deny_cache_worker_database_fallback", func(tx *gorm.DB) {
+			tx.AddError(errors.New("a valid shared cache must not query this independent database"))
+		}))
+		cached, err := GetUserCache(id)
+		require.NoError(t, err)
+		assert.Equal(t, 30, cached.Quota)
+		assert.Equal(t, "referral-invitee", cached.Username)
+		return
+	}
+
+	_, user := referralFixture(t, 1000)
+	user.Quota = 100
+	require.NoError(t, DB.Model(&user).Update("quota", user.Quota).Error)
+	keys := []string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id), getWalletCacheFillKey(user.Id)}
+	t.Cleanup(func() { assert.NoError(t, client.Del(context.Background(), keys...).Err()) })
+	require.NoError(t, populateUserCache(user))
+	result, err := cacheApplyUserQuotaDelta(user.Id, -70)
+	require.NoError(t, err)
+	require.Equal(t, cacheQuotaOK, result)
+	// Persist the reservation so an explicitly reconciled post-restart cold
+	// fill can use SQL without discarding any transaction or pending deduction.
+	require.NoError(t, DB.Model(&user).Update("quota", 30).Error)
+	for _, mode := range []string{"same_key", "different_key"} {
+		t.Run(mode, func(t *testing.T) {
+			command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestSignedUserCacheAcrossProcessesAndRedisRestart$", "-test.count=1")
+			command.Env = append(os.Environ(), "NEW_API_CACHE_SIGNATURE_WORKER="+mode, "NEW_API_CACHE_SIGNATURE_USER_ID="+strconv.Itoa(user.Id))
+			output, err := command.CombinedOutput()
+			require.NoError(t, err, "%s", output)
+		})
+	}
+	t.Run("persisted_cache_after_real_restart", func(t *testing.T) {
+		container := os.Getenv("NEW_API_CACHE_RESTART_CONTAINER")
+		if container == "" {
+			t.Skip("set NEW_API_CACHE_RESTART_CONTAINER to a dedicated new-api-test-cache-* Redis container")
+		}
+		require.True(t, strings.HasPrefix(container, "new-api-test-cache-"), "restart only the explicitly dedicated test container")
+		before, err := client.Info(t.Context(), "server").Result()
+		require.NoError(t, err)
+		fillToken, err := reserveWalletCacheFill(t.Context(), client, user.Id)
+		require.NoError(t, err)
+		require.NoError(t, client.Save(t.Context()).Err())
+		command := exec.CommandContext(t.Context(), "docker", "restart", container)
+		output, err := command.CombinedOutput()
+		require.NoError(t, err, "%s", output)
+		command = exec.CommandContext(t.Context(), "docker", "exec", container, "redis-cli", "PING")
+		output, err = command.CombinedOutput()
+		require.NoError(t, err, "%s", output)
+		require.Contains(t, string(output), "PONG")
+		after, err := client.Info(t.Context(), "server").Result()
+		if err != nil {
+			// With retries disabled, the first read may observe the dead pooled
+			// socket. The following read must reconnect to the restarted server.
+			require.ErrorIs(t, err, io.EOF)
+			after, err = client.Info(t.Context(), "server").Result()
+		}
+		require.NoError(t, err)
+		beforeID, _, _ := strings.Cut(strings.SplitN(before, "run_id:", 2)[1], "\r\n")
+		afterID, _, _ := strings.Cut(strings.SplitN(after, "run_id:", 2)[1], "\r\n")
+		require.NotEqual(t, beforeID, afterID)
+		storedID, err := client.HGet(t.Context(), keys[0], "WalletRedisRunID").Result()
+		require.NoError(t, err)
+		require.Equal(t, beforeID, storedID, "the restart must load the persisted old cache")
+		_, err = GetUserCache(user.Id)
+		require.ErrorIs(t, err, ErrWalletCacheRecoveryRequired)
+		require.ErrorIs(t, publishUserCache(t.Context(), client, user.ToBaseUser(), fillToken), ErrWalletCacheRecoveryRequired)
+		// This isolated fixture is idle, its deduction is persisted, and it has
+		// no unfinished credit. Only after that reconciliation may this user's
+		// old hash be removed; never flush the shared Redis to recover funds.
+		require.NoError(t, client.Del(t.Context(), keys[0]).Err())
+		loaded, err := GetUserCache(user.Id)
+		require.NoError(t, err)
+		assert.Equal(t, 30, loaded.Quota)
+		storedID, err = client.HGet(t.Context(), keys[0], "WalletRedisRunID").Result()
+		require.NoError(t, err)
+		assert.Equal(t, afterID, storedID)
+	})
 }

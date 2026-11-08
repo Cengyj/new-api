@@ -44,22 +44,25 @@ func SetUpLogger(server *gin.Engine) {
 		c.Set(accessLogPathKey, path)
 		c.Next()
 	})
-	server.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
-		requestID, _ := param.Keys[common.RequestIdKey].(string)
-		tag, _ := param.Keys[RouteTagKey].(string)
-		if tag == "" {
-			tag = "web"
-		}
-		path, _ := param.Keys[accessLogPathKey].(string)
-		return fmt.Sprintf("[GIN] %s | %s | %s | %3d | %13v | %15s | %7s %s\n",
-			param.TimeStamp.Format("2006/01/02 - 15:04:05"),
-			tag,
-			requestID,
-			param.StatusCode,
-			param.Latency,
-			param.ClientIP,
-			param.Method,
-			path,
-		)
+	server.Use(gin.LoggerWithConfig(gin.LoggerConfig{
+		Output: common.LogWriter,
+		Formatter: func(param gin.LogFormatterParams) string {
+			requestID, _ := param.Keys[common.RequestIdKey].(string)
+			tag, _ := param.Keys[RouteTagKey].(string)
+			if tag == "" {
+				tag = "web"
+			}
+			path, _ := param.Keys[accessLogPathKey].(string)
+			return fmt.Sprintf("[GIN] %s | %s | %s | %3d | %13v | %15s | %7s %s\n",
+				param.TimeStamp.Format("2006/01/02 - 15:04:05"),
+				tag,
+				requestID,
+				param.StatusCode,
+				param.Latency,
+				param.ClientIP,
+				param.Method,
+				path,
+			)
+		},
 	}))
 }

@@ -59,6 +59,62 @@ func TestStreamResponseGeminiChat2OpenAIAttachesUsageMetadata(t *testing.T) {
 	require.Nil(t, withoutUsage.Usage)
 }
 
+func TestGeminiEmbeddingUsesUpstreamUsageAcrossEndpoints(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, endpoint := range []string{"openai", "native-single", "native-batch"} {
+		for _, tc := range []struct {
+			name     string
+			metadata string
+			want     int
+		}{
+			{name: "reported usage replaces estimate", metadata: `,"usageMetadata":{"promptTokenCount":7,"promptTokenDetails":[{"modality":"TEXT","tokenCount":7}]}`, want: 7},
+			{name: "missing usage keeps estimate", want: 99},
+			{name: "invalid usage keeps estimate", metadata: `,"usageMetadata":{"promptTokenCount":-1}`, want: 99},
+		} {
+			t.Run(endpoint+"/"+tc.name, func(t *testing.T) {
+				recorder := httptest.NewRecorder()
+				c, _ := gin.CreateTestContext(recorder)
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/embeddings", nil)
+				info := &relaycommon.RelayInfo{
+					IsGeminiBatchEmbedding: endpoint == "native-batch",
+					ChannelMeta:            &relaycommon.ChannelMeta{UpstreamModelName: "gemini-embedding-001"},
+				}
+				info.SetEstimatePromptTokens(99)
+				body := `{"embeddings":[{"values":[0.25,0.75]}]` + tc.metadata + `}`
+				if endpoint == "native-single" {
+					body = `{"embedding":{"values":[0.25,0.75]}` + tc.metadata + `}`
+				}
+				response := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(body)),
+				}
+				var usage *dto.Usage
+				var apiError *types.NewAPIError
+				if endpoint == "openai" {
+					usage, apiError = GeminiEmbeddingHandler(c, info, response)
+				} else {
+					usage, apiError = NativeGeminiEmbeddingHandler(c, response, info)
+				}
+				require.Nil(t, apiError)
+				require.NotNil(t, usage)
+				assert.Equal(t, tc.want, usage.PromptTokens)
+				assert.Zero(t, usage.CompletionTokens)
+				assert.Equal(t, tc.want, usage.TotalTokens)
+				if endpoint == "openai" {
+					var converted dto.OpenAIEmbeddingResponse
+					require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &converted))
+					require.Len(t, converted.Data, 1)
+					assert.Equal(t, []float64{0.25, 0.75}, converted.Data[0].Embedding)
+					assert.Equal(t, tc.want, converted.Usage.PromptTokens)
+				} else {
+					assert.Equal(t, body, recorder.Body.String())
+				}
+			})
+		}
+	}
+}
+
 func TestGeminiChatStreamHandlerClaudeFirstFrameUsesUpstreamUsage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
