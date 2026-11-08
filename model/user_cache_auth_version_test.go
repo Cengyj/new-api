@@ -1655,7 +1655,7 @@ func TestSignedUserCacheDoesNotRebaseUnfinishedWalletCredit(t *testing.T) {
 	if address == "" {
 		t.Skip("set NEW_API_REFERRAL_REDIS_ADDR to a disposable isolated Redis instance")
 	}
-	for _, damaged := range []string{"missing", "malformed"} {
+	for _, damaged := range []string{"missing", "malformed", "9223372036854775808", "-9223372036854775809", "01", "+1", "-0"} {
 		t.Run(damaged, func(t *testing.T) {
 			_, user := referralFixture(t, 1000)
 			user.Quota = 50
@@ -1688,8 +1688,10 @@ func TestSignedUserCacheDoesNotRebaseUnfinishedWalletCredit(t *testing.T) {
 			assert.Equal(t, 150, user.Quota, "the principal was committed before cache finalization failed")
 			if damaged == "missing" {
 				require.NoError(t, client.HDel(t.Context(), keys[0], "Quota").Err())
-			} else {
+			} else if damaged == "malformed" {
 				require.NoError(t, client.HSet(t.Context(), keys[0], "Quota", "corrupted").Err())
+			} else {
+				require.NoError(t, client.HSet(t.Context(), keys[0], "Quota", damaged).Err())
 			}
 			_, err = GetUserCache(user.Id)
 			require.ErrorIs(t, err, ErrWalletCacheRecoveryRequired, "a SQL snapshot already containing the credit cannot retain its pending delta")
@@ -1736,7 +1738,7 @@ func TestSignedUserCacheMetadataRefreshKeepsLiveQuota(t *testing.T) {
 	result, err := cacheApplyUserQuotaDelta(user.Id, -70)
 	require.NoError(t, err)
 	require.Equal(t, cacheQuotaOK, result)
-	for _, mutation := range []string{"missing_signature", "invalid_signature", "expired_signature", "modified_role"} {
+	for _, mutation := range []string{"missing_signature", "invalid_signature", "expired_signature", "modified_role", "superseded_fill", "malformed_auth_floor", "denied_auth_floor", "reservation_failure_with_denied_floor"} {
 		t.Run(mutation, func(t *testing.T) {
 			switch mutation {
 			case "missing_signature":
@@ -1752,16 +1754,106 @@ func TestSignedUserCacheMetadataRefreshKeepsLiveQuota(t *testing.T) {
 				require.NoError(t, client.HSet(t.Context(), keys[0], "CacheExpiresAt", cached.CacheExpiresAt, "CacheMAC", mac).Err())
 			case "modified_role":
 				require.NoError(t, client.HSet(t.Context(), keys[0], "Role", common.RoleRootUser).Err())
+			case "superseded_fill":
+				require.NoError(t, client.HDel(t.Context(), keys[0], "CacheMAC").Err())
+				var reserved atomic.Bool
+				const hook = "test:supersede_signed_user_cache_fill"
+				require.NoError(t, DB.Callback().Query().After("gorm:query").Register(hook, func(tx *gorm.DB) {
+					if tx.Statement.Table != "users" || !reserved.CompareAndSwap(false, true) {
+						return
+					}
+					// Another reader reserves before waiting for this SQL lock.
+					// Its metadata has not been published when this reader returns.
+					connection := client.Conn(t.Context())
+					defer connection.Close()
+					_, err := reserveWalletCacheFill(t.Context(), connection, user.Id)
+					require.NoError(t, err)
+				}))
+				t.Cleanup(func() { assert.NoError(t, DB.Callback().Query().Remove(hook)) })
+			case "malformed_auth_floor":
+				require.NoError(t, client.HDel(t.Context(), keys[0], "CacheMAC").Err())
+				previousDB := DB
+				t.Cleanup(func() { DB = previousDB })
+				DB = previousDB.Session(&gorm.Session{Context: t.Context()})
+				DB.Statement.ConnPool = creditCommitPool{ConnPool: previousDB.Statement.ConnPool, afterCommit: func() error {
+					// The fill published valid metadata, then its floor became
+					// unreadable before GetUserCache's final verification.
+					return client.Set(t.Context(), getUserAuthVersionKey(user.Id), "malformed", 0).Err()
+				}}
+			case "denied_auth_floor", "reservation_failure_with_denied_floor":
+				require.NoError(t, client.HDel(t.Context(), keys[0], "CacheMAC").Err())
+				username, password := "cache-floor-"+common.GetUUID(), common.GetUUID()
+				acl := []any{"ACL", "SETUSER", username, "on", ">" + password, "+@all", "-mget"}
+				for _, key := range keys {
+					acl = append(acl, "~"+key)
+				}
+				require.NoError(t, client.Do(t.Context(), acl...).Err())
+				restricted := redis.NewClient(&redis.Options{Addr: address, DB: 12, Username: username, Password: password, MaxRetries: -1})
+				require.NoError(t, restricted.Ping(t.Context()).Err())
+				common.RDB = restricted
+				t.Cleanup(func() {
+					common.RDB = client
+					assert.NoError(t, restricted.Close())
+					assert.NoError(t, client.Do(context.Background(), "ACL", "DELUSER", username).Err())
+				})
+				if mutation == "reservation_failure_with_denied_floor" {
+					unavailable := redis.NewClient(&redis.Options{Addr: address, DB: 12, MaxRetries: -1})
+					require.NoError(t, unavailable.Close())
+					common.RDB = unavailable
+					const hook = "test:deny_auth_floor_after_failed_reservation"
+					var switched atomic.Bool
+					require.NoError(t, DB.Callback().Query().After("gorm:query").Register(hook, func(tx *gorm.DB) {
+						if tx.Statement.Table == "users" && switched.CompareAndSwap(false, true) {
+							common.RDB = restricted
+						}
+					}))
+					t.Cleanup(func() { assert.NoError(t, DB.Callback().Query().Remove(hook)) })
+				}
 			}
 			_, err := cacheGetUserBase(user.Id)
 			require.Error(t, err)
 			loaded, err := GetUserCache(user.Id)
+			switch mutation {
+			case "superseded_fill", "malformed_auth_floor", "denied_auth_floor", "reservation_failure_with_denied_floor":
+				require.ErrorIs(t, err, ErrWalletCacheValidationUnavailable)
+				require.Nil(t, loaded, "a rejected fill cannot expose SQL quota that omits live reservations")
+				quota, quotaErr := client.HGet(t.Context(), keys[0], "Quota").Result()
+				require.NoError(t, quotaErr)
+				require.Equal(t, "30", quota)
+				if mutation == "malformed_auth_floor" {
+					require.NoError(t, client.Set(t.Context(), getUserAuthVersionKey(user.Id), user.AuthVersion, 0).Err())
+				}
+				common.RDB = client
+				loaded, err = GetUserCache(user.Id)
+			}
 			require.NoError(t, err)
 			assert.Equal(t, user.Role, loaded.Role)
 			assert.Equal(t, 30, loaded.Quota, "successful metadata repair must return the live reserved balance, not the older SQL balance")
 			cached, err := cacheGetUserBase(user.Id)
 			require.NoError(t, err)
 			assert.Equal(t, 30, cached.Quota)
+		})
+	}
+	for _, quota := range []string{"0", "-9223372036854775808", "9223372036854775807", "9007199254740993"} {
+		t.Run("preserve_integer/"+quota, func(t *testing.T) {
+			require.NoError(t, client.HSet(t.Context(), keys[0], "Quota", quota, "CacheMAC", "invalid").Err())
+			loaded, err := GetUserCache(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, quota, strconv.Itoa(loaded.Quota), "metadata repair must retain every valid signed integer exactly")
+			stored, err := client.HGet(t.Context(), keys[0], "Quota").Result()
+			require.NoError(t, err)
+			assert.Equal(t, quota, stored)
+		})
+	}
+	for _, quota := range []string{"corrupted", "9223372036854775808", "-9223372036854775809", "01", "+1", "-0"} {
+		t.Run("repair_without_pending_credit/"+quota, func(t *testing.T) {
+			require.NoError(t, client.HSet(t.Context(), keys[0], "Quota", quota).Err())
+			loaded, err := GetUserCache(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, 100, loaded.Quota, "a damaged counter without an unfinished credit can hydrate from the locked SQL snapshot")
+			stored, err := client.HGet(t.Context(), keys[0], "Quota").Result()
+			require.NoError(t, err)
+			assert.Equal(t, "100", stored)
 		})
 	}
 }

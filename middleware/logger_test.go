@@ -2,10 +2,12 @@ package middleware
 
 import (
 	"bytes"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -172,8 +174,90 @@ func TestAccessAndPanicLogsFollowLogRotation(t *testing.T) {
 		assert.NotContains(t, string(content), secret)
 	}
 	assert.Contains(t, string(content), "[Recovery]")
-	assert.Contains(t, string(content), "rotation-panic-marker\n")
+	assert.Contains(t, string(content), "panic_type=string\n")
+	assert.NotContains(t, string(content), "rotation-panic-marker", "panic values can contain credentials")
 	assert.Contains(t, string(content), "middleware/logger_test.go")
+}
+
+func TestPanicRecoveryKeepsCredentialsOutOfLogsAndResponses(t *testing.T) {
+	previousMode, previousWriter, previousErrorWriter := gin.Mode(), gin.DefaultWriter, gin.DefaultErrorWriter
+	t.Cleanup(func() {
+		gin.SetMode(previousMode)
+		gin.DefaultWriter, gin.DefaultErrorWriter = previousWriter, previousErrorWriter
+	})
+	for _, recovery := range []struct {
+		name    string
+		handler func() gin.HandlerFunc
+	}{
+		{"server", PanicRecover},
+		{"relay", RelayPanicRecover},
+	} {
+		t.Run(recovery.name, func(t *testing.T) {
+			for _, tc := range []struct {
+				name, mode string
+				failure    any
+				disconnect bool
+			}{
+				{"debug", gin.DebugMode, "panic-secret\nforged-log-line", false},
+				{"release", gin.ReleaseMode, "panic-secret\nforged-log-line", false},
+				{"nil_network_error", gin.ReleaseMode, (*net.OpError)(nil), false},
+				{"broken_pipe", gin.ReleaseMode, &net.OpError{Op: "write", Net: "tcp", Err: &os.SyscallError{Syscall: "write", Err: syscall.EPIPE}}, true},
+				{"connection_reset", gin.ReleaseMode, &net.OpError{Op: "read", Net: "tcp", Err: &os.SyscallError{Syscall: "read", Err: syscall.ECONNRESET}}, true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					gin.SetMode(tc.mode)
+					var output bytes.Buffer
+					gin.DefaultWriter, gin.DefaultErrorWriter = &output, &output
+					router := gin.New()
+					var returned, responseWritten bool
+					router.Use(func(c *gin.Context) {
+						c.Next()
+						returned, responseWritten = true, c.Writer.Written()
+					}, recovery.handler(), RequestId())
+					SetUpLogger(router)
+					var capturedContext *gin.Context
+					router.GET("/api/oauth/:provider", func(c *gin.Context) {
+						capturedContext = c
+						assert.Equal(t, "code-secret", c.Query("code"), "verification still receives the original request")
+						assert.Equal(t, "state-secret", c.Query("state"))
+						assert.Equal(t, "signature-secret", c.Query("sign"))
+						assert.Equal(t, "session=cookie-secret", c.GetHeader("Cookie"))
+						c.Request.URL.RawQuery = "code=rewritten-secret"
+						panic(tc.failure)
+					}, func(c *gin.Context) { t.Error("handler ran after panic") })
+					request := httptest.NewRequest(http.MethodGet,
+						"/api/oauth/provider%0Aname?code=code-secret&state=state-secret&sign=signature-secret", nil)
+					request.Header.Set("Cookie", "session=cookie-secret")
+					request.Header.Set("Authorization", "Bearer authorization-secret")
+					request.Header.Set("X-Api-Key", "api-key-secret")
+					response := httptest.NewRecorder()
+					router.ServeHTTP(response, request)
+					require.True(t, returned)
+					require.NotNil(t, capturedContext)
+					assert.True(t, capturedContext.IsAborted())
+					assert.Equal(t, "code=rewritten-secret", request.URL.RawQuery, "recovery must not rewrite the verification request")
+					assert.Empty(t, capturedContext.Errors, "raw panic values must not be passed to another logger")
+					assert.Contains(t, output.String(), "[Recovery]")
+					assert.Contains(t, output.String(), `route="/api/oauth/:provider"`)
+					assert.Contains(t, output.String(), "middleware/logger_test.go")
+					requestID := response.Header().Get(common.RequestIdKey)
+					require.NotEmpty(t, requestID)
+					assert.Contains(t, output.String(), requestID)
+					for _, secret := range []string{"code-secret", "state-secret", "signature-secret", "cookie-secret", "authorization-secret", "api-key-secret", "rewritten-secret", "panic-secret", "forged-log-line"} {
+						assert.NotContains(t, output.String(), secret)
+						assert.NotContains(t, response.Body.String(), secret)
+					}
+					if tc.disconnect {
+						assert.False(t, responseWritten, "recovery must not write a response before Gin finalizes the request")
+						assert.Empty(t, response.Body.String())
+					} else {
+						assert.Equal(t, http.StatusInternalServerError, response.Code)
+						assert.JSONEq(t, `{"error":{"type":"new_api_panic","message":"Panic detected. Please submit a issue here: https://github.com/Calcium-Ion/new-api"}}`, response.Body.String())
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestSetUpLoggerOmitsQueryCredentialsTakenOutByHandlers(t *testing.T) {

@@ -25,6 +25,8 @@ var ErrUserAuthCachePending = errors.New("user authentication state update is pe
 
 var ErrUserAuthVersionConflict = errors.New("user authentication version update conflicted")
 
+var errUserCacheFillSuperseded = errors.New("user cache fill was superseded")
+
 // Fence and version keys use the user cache key as their hash tag so the
 // cache fill script and the floor MGET stay in one slot on sharded Redis.
 func getUserAuthFenceKey(userId int) string {
@@ -84,7 +86,13 @@ func publishUserCache(ctx context.Context, cacheCommands redis.Cmdable, user *Us
 		return err
 	}
 	const script = walletCacheRunGuard + `
-if ARGV[10] == '1' and not string.match(redis.call('HGET', KEYS[1], 'Quota') or '', '^-?%d+$') then
+local quota = redis.call('HGET', KEYS[1], 'Quota') or ''
+local magnitude = string.match(quota, '^%-?([1-9]%d*)$')
+local limit = string.sub(quota, 1, 1) == '-' and '9223372036854775808' or '9223372036854775807'
+-- Match Redis's signed int64 counter format without Lua number rounding.
+local validQuota = quota == '0' or (magnitude and
+  (#magnitude < 19 or (#magnitude == 19 and magnitude <= limit)))
+if ARGV[10] == '1' and not validQuota then
   -- SQL already includes committed credits. A damaged counter cannot be
   -- rebased while a pending delta could be added to that snapshot again.
   for _, field in ipairs(redis.call('HKEYS', KEYS[1])) do
@@ -123,7 +131,7 @@ redis.call('HSET', KEYS[1],
   'Status', ARGV[5], 'Role', ARGV[6], 'Username', ARGV[7],
   'Setting', ARGV[8], 'AuthVersion', ARGV[1], 'CacheSchema', ARGV[9],
   'CacheExpiresAt', ARGV[14], 'CacheMAC', ARGV[15])
-if ARGV[10] == '1' and not string.match(redis.call('HGET', KEYS[1], 'Quota') or '', '^-?%d+$') then
+if ARGV[10] == '1' and not validQuota then
   redis.call('HSET', KEYS[1], 'Quota', ARGV[11], 'WalletGeneration', ARGV[13], 'WalletRedisRunID', walletRunID)
 end
 redis.call('EXPIRE', KEYS[1], ARGV[12])
@@ -140,6 +148,9 @@ return 1`
 	if result == 0 {
 		return ErrUserAuthCachePending
 	}
+	if result == 2 {
+		return errUserCacheFillSuperseded
+	}
 	return nil
 }
 
@@ -149,7 +160,7 @@ func getUserAuthVersionFloor(ctx context.Context, cacheCommands redis.Cmdable, u
 	}
 	values, err := cacheCommands.MGet(ctx, getUserAuthFenceKey(userId), getUserAuthVersionKey(userId)).Result()
 	if err != nil {
-		return 0, err
+		return 0, walletCacheValidationError(err)
 	}
 	var floor int64
 	for _, value := range values {
@@ -158,7 +169,7 @@ func getUserAuthVersionFloor(ctx context.Context, cacheCommands redis.Cmdable, u
 		}
 		parsed, err := strconv.ParseInt(fmt.Sprint(value), 10, 64)
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("%w: %v", ErrWalletCacheValidationUnavailable, err)
 		}
 		if parsed > floor {
 			floor = parsed

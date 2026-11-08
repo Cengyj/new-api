@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -20,6 +21,8 @@ const walletCacheCoordinationTimeout = 5 * time.Second
 
 var ErrWalletCacheRecoveryRequired = common.NewMessage("Wallet cache recovery is required. Contact the administrator.")
 var ErrWalletCacheValidationUnavailable = common.NewMessage("Wallet cache validation is unavailable. Try again later.")
+
+var errUserCacheInvalid = errors.New("user cache is invalid")
 
 // A restored Redis snapshot can contain an old complete balance without a
 // committed credit's marker. Validate its server run inside the same command
@@ -200,16 +203,19 @@ func GetUserCache(userId int) (*UserBase, error) {
 		user = users[0]
 		connection := common.RDB.Conn(ctx)
 		defer connection.Close()
-		// Redis failures retain DB fallback. A newer auth fence is the one
-		// exception: never re-authorize a restrictive update still pending.
+		// Transport failures retain DB fallback. An unreadable auth fence or
+		// a newer version must never re-authorize a pending restrictive update.
 		floor, floorErr := getUserAuthVersionFloor(ctx, connection, userId)
+		if errors.Is(floorErr, ErrWalletCacheValidationUnavailable) {
+			return floorErr
+		}
 		if floorErr == nil && floor > user.AuthVersion {
 			return ErrUserAuthCachePending
 		}
 		if fillErr == nil {
 			fillErr = publishUserCache(ctx, connection, user.ToBaseUser(), fillToken)
 		}
-		if fillErr != nil {
+		if fillErr != nil && !errors.Is(fillErr, errUserCacheFillSuperseded) {
 			if errors.Is(fillErr, ErrUserAuthCachePending) || errors.Is(fillErr, ErrWalletCacheRecoveryRequired) || errors.Is(fillErr, ErrWalletCacheValidationUnavailable) {
 				return fillErr
 			}
@@ -220,7 +226,7 @@ func GetUserCache(userId int) (*UserBase, error) {
 	if err != nil {
 		return nil, err
 	}
-	if fillErr == nil {
+	if fillErr == nil || errors.Is(fillErr, errUserCacheFillSuperseded) {
 		// Metadata repair preserves live quota deltas. Return that same balance
 		// to callers, including the billing trust check, rather than the older
 		// SQL balance used only to initialize a genuinely missing counter.
@@ -230,6 +236,11 @@ func GetUserCache(userId int) (*UserBase, error) {
 		}
 		if errors.Is(cacheErr, ErrUserAuthCachePending) || errors.Is(cacheErr, ErrWalletCacheRecoveryRequired) || errors.Is(cacheErr, ErrWalletCacheValidationUnavailable) {
 			return nil, cacheErr
+		}
+		if errors.Is(cacheErr, errUserCacheInvalid) {
+			// A competing fill may still be waiting for our SQL lock. Until a
+			// valid cache is published, SQL cannot substitute for live reserves.
+			return nil, ErrWalletCacheValidationUnavailable
 		}
 	}
 	return user.ToBaseUser(), nil
@@ -247,20 +258,23 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 		return nil, walletCacheValidationError(err)
 	}
 	if len(command.Val()) == 0 {
-		return nil, fmt.Errorf("user cache is missing")
+		return nil, fmt.Errorf("%w: cache is missing", errUserCacheInvalid)
 	}
 	if _, ok := command.Val()["Quota"]; !ok {
-		return nil, fmt.Errorf("user cache quota is missing")
+		return nil, fmt.Errorf("%w: quota is missing", errUserCacheInvalid)
 	}
 	if err := command.Scan(&userCache); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errUserCacheInvalid, err)
+	}
+	if strconv.Itoa(userCache.Quota) != command.Val()["Quota"] {
+		return nil, fmt.Errorf("%w: quota is not a Redis integer", errUserCacheInvalid)
 	}
 	if userCache.Id != userId || userCache.CacheSchema != userCacheSchemaVersion || userCache.AuthVersion <= 0 {
-		return nil, fmt.Errorf("user cache schema is stale")
+		return nil, fmt.Errorf("%w: schema is stale", errUserCacheInvalid)
 	}
 	mac, err := userCache.cacheMAC()
 	if err != nil || !validAuthCacheMAC(mac, userCache.CacheMAC, userCache.CacheExpiresAt) {
-		return nil, fmt.Errorf("user cache integrity check failed")
+		return nil, fmt.Errorf("%w: integrity check failed", errUserCacheInvalid)
 	}
 	floor, err := getUserAuthVersionFloor(context.Background(), common.RDB, userId)
 	if err != nil {
