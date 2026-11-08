@@ -1738,8 +1738,9 @@ func TestSignedUserCacheMetadataRefreshKeepsLiveQuota(t *testing.T) {
 	result, err := cacheApplyUserQuotaDelta(user.Id, -70)
 	require.NoError(t, err)
 	require.Equal(t, cacheQuotaOK, result)
-	for _, mutation := range []string{"missing_signature", "invalid_signature", "expired_signature", "modified_role", "superseded_fill", "malformed_auth_floor", "denied_auth_floor", "reservation_failure_with_denied_floor"} {
+	for _, mutation := range []string{"missing_signature", "invalid_signature", "expired_signature", "modified_role", "superseded_fill", "repeatedly_superseded_fill", "retry_loses_sql_lock", "malformed_auth_floor", "denied_auth_floor", "reservation_failure_with_denied_floor"} {
 		t.Run(mutation, func(t *testing.T) {
+			var stopContending atomic.Bool
 			switch mutation {
 			case "missing_signature":
 				require.NoError(t, client.HDel(t.Context(), keys[0], "CacheMAC", "CacheExpiresAt").Err())
@@ -1754,16 +1755,26 @@ func TestSignedUserCacheMetadataRefreshKeepsLiveQuota(t *testing.T) {
 				require.NoError(t, client.HSet(t.Context(), keys[0], "CacheExpiresAt", cached.CacheExpiresAt, "CacheMAC", mac).Err())
 			case "modified_role":
 				require.NoError(t, client.HSet(t.Context(), keys[0], "Role", common.RoleRootUser).Err())
-			case "superseded_fill":
+			case "superseded_fill", "repeatedly_superseded_fill", "retry_loses_sql_lock":
 				require.NoError(t, client.HDel(t.Context(), keys[0], "CacheMAC").Err())
-				var reserved atomic.Bool
+				var reads atomic.Int32
 				const hook = "test:supersede_signed_user_cache_fill"
 				require.NoError(t, DB.Callback().Query().After("gorm:query").Register(hook, func(tx *gorm.DB) {
-					if tx.Statement.Table != "users" || !reserved.CompareAndSwap(false, true) {
+					if tx.Statement.Table != "users" || stopContending.Load() {
+						return
+					}
+					read := reads.Add(1)
+					if mutation == "retry_loses_sql_lock" && read == 2 {
+						transaction, ok := tx.Statement.ConnPool.(gorm.TxCommitter)
+						require.True(t, ok)
+						require.NoError(t, transaction.Rollback(), "the second authoritative read must detect the lost retry lock")
+						return
+					}
+					if mutation != "repeatedly_superseded_fill" && read != 1 {
 						return
 					}
 					// Another reader reserves before waiting for this SQL lock.
-					// Its metadata has not been published when this reader returns.
+					// Its metadata is not yet available for this publication.
 					connection := client.Conn(t.Context())
 					defer connection.Close()
 					_, err := reserveWalletCacheFill(t.Context(), connection, user.Id)
@@ -1814,12 +1825,17 @@ func TestSignedUserCacheMetadataRefreshKeepsLiveQuota(t *testing.T) {
 			require.Error(t, err)
 			loaded, err := GetUserCache(user.Id)
 			switch mutation {
-			case "superseded_fill", "malformed_auth_floor", "denied_auth_floor", "reservation_failure_with_denied_floor":
-				require.ErrorIs(t, err, ErrWalletCacheValidationUnavailable)
+			case "repeatedly_superseded_fill", "retry_loses_sql_lock", "malformed_auth_floor", "denied_auth_floor", "reservation_failure_with_denied_floor":
+				if mutation == "retry_loses_sql_lock" {
+					require.ErrorIs(t, err, sql.ErrTxDone)
+				} else {
+					require.ErrorIs(t, err, ErrWalletCacheValidationUnavailable)
+				}
 				require.Nil(t, loaded, "a rejected fill cannot expose SQL quota that omits live reservations")
 				quota, quotaErr := client.HGet(t.Context(), keys[0], "Quota").Result()
 				require.NoError(t, quotaErr)
 				require.Equal(t, "30", quota)
+				stopContending.Store(true)
 				if mutation == "malformed_auth_floor" {
 					require.NoError(t, client.Set(t.Context(), getUserAuthVersionKey(user.Id), user.AuthVersion, 0).Err())
 				}

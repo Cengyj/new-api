@@ -24,6 +24,10 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+// Only the disposable integration deployment uses this key. Every process
+// sharing its signed user cache must use the same effective configuration.
+const referralProcessCacheSecret = "new-api-isolated-referral-process-cache"
+
 func insertUserForPaymentGuardTest(t *testing.T, id int, quota int) *User {
 	t.Helper()
 	user := &User{
@@ -474,6 +478,9 @@ func TestReferralCrossProcessWorker(t *testing.T) {
 	common.QuotaPerUnit = 1
 	payment := operation_setting.GetPaymentSetting()
 	payment.ComplianceConfirmed, payment.ComplianceTermsVersion = true, operation_setting.CurrentComplianceTermsVersion
+	if mode == "cache_fill" || mode == "cache_credit" || os.Getenv("REFERRAL_PROCESS_INTERRUPT") != "" {
+		common.CryptoSecret = referralProcessCacheSecret
+	}
 	if interruption := os.Getenv("REFERRAL_PROCESS_INTERRUPT"); interruption != "" {
 		client := redis.NewClient(&redis.Options{Addr: os.Getenv("NEW_API_REFERRAL_REDIS_ADDR"), DB: 14, MaxRetries: -1})
 		require.NoError(t, client.Ping(t.Context()).Err())
@@ -1276,6 +1283,9 @@ func TestReferralWalletRecoversIndependentProcessInterruption(t *testing.T) {
 	if address == "" {
 		t.Skip("set NEW_API_REFERRAL_REDIS_ADDR to a disposable isolated Redis instance")
 	}
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = referralProcessCacheSecret
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
 	for _, dialect := range []string{"mysql", "postgres"} {
 		for _, interruption := range []string{"before_commit", "after_commit"} {
 			t.Run(dialect+"/"+interruption, func(t *testing.T) {
@@ -1468,6 +1478,9 @@ func TestReferralColdCacheAndWalletCreditAcrossProcesses(t *testing.T) {
 	if address == "" {
 		t.Skip("set NEW_API_REFERRAL_REDIS_ADDR to a disposable isolated Redis instance")
 	}
+	previousSecret := common.CryptoSecret
+	common.CryptoSecret = referralProcessCacheSecret
+	t.Cleanup(func() { common.CryptoSecret = previousSecret })
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		for _, scenario := range []string{"fill_first_without_snapshot", "credit_first_paused", "credit_first_qualified", "fill_loses_sql_connection"} {
 			// Both lock orders and the qualified rebate run on every engine.

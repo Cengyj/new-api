@@ -183,76 +183,109 @@ func GetUserCache(userId int) (*UserBase, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), walletCacheCoordinationTimeout)
 	defer cancel()
-	// Reserve before reading SQL. If the database later drops our lock, a
-	// concurrent credit can still cancel this token before the old read publishes.
-	// Pin the reservation command so an ambiguous SET cannot be replayed on
-	// another socket. Release its connection before waiting for SQL: all code
-	// holding both resources acquires the user lock before a Redis connection.
-	reservation := common.RDB.Conn(ctx)
-	fillToken, fillErr := reserveWalletCacheFill(ctx, reservation, userId)
-	_ = reservation.Close()
-	var user User
-	err = DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		users, err := lockWalletUsersTx(tx, userId)
-		if err != nil {
-			return err
+	for attempt := range 3 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		if len(users) != 1 {
-			return gorm.ErrRecordNotFound
+		// Reserve before reading SQL. If the database later drops our lock, a
+		// concurrent credit can still cancel this token before the old read publishes.
+		// Pin the reservation command so an ambiguous SET cannot be replayed on
+		// another socket. Release its connection before waiting for SQL: all code
+		// holding both resources acquires the user lock before a Redis connection.
+		var fillToken string
+		var fillErr error
+		if attempt == 0 {
+			reservation := common.RDB.Conn(ctx)
+			fillToken, fillErr = reserveWalletCacheFill(ctx, reservation, userId)
+			_ = reservation.Close()
 		}
-		user = users[0]
-		connection := common.RDB.Conn(ctx)
-		defer connection.Close()
-		// Transport failures retain DB fallback. An unreadable auth fence or
-		// a newer version must never re-authorize a pending restrictive update.
-		floor, floorErr := getUserAuthVersionFloor(ctx, connection, userId)
-		if errors.Is(floorErr, ErrWalletCacheValidationUnavailable) {
-			return floorErr
-		}
-		if floorErr == nil && floor > user.AuthVersion {
-			return ErrUserAuthCachePending
-		}
-		if fillErr == nil {
-			fillErr = publishUserCache(ctx, connection, user.ToBaseUser(), fillToken)
-		}
-		if fillErr != nil && !errors.Is(fillErr, errUserCacheFillSuperseded) {
-			if errors.Is(fillErr, ErrUserAuthCachePending) || errors.Is(fillErr, ErrWalletCacheRecoveryRequired) || errors.Is(fillErr, ErrWalletCacheValidationUnavailable) {
-				return fillErr
+		var user User
+		err := DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			users, err := lockWalletUsersTx(tx, userId)
+			if err != nil {
+				return err
 			}
-			common.SysLog(common.LogText("failed to synchronously populate user cache: %s", fillErr.Error()))
+			if len(users) != 1 {
+				return gorm.ErrRecordNotFound
+			}
+			connection := common.RDB.Conn(ctx)
+			defer connection.Close()
+			if attempt > 0 {
+				// Serialize competing retries before replacing their reservation.
+				// Discard the first snapshot: the new token must precede the
+				// authoritative read, including when the SQL connection is lost.
+				fillToken, fillErr = reserveWalletCacheFill(ctx, connection, userId)
+				users, err = lockWalletUsersTx(tx, userId)
+				if err != nil {
+					return err
+				}
+				if len(users) != 1 {
+					return gorm.ErrRecordNotFound
+				}
+			}
+			user = users[0]
+			// Transport failures retain DB fallback. An unreadable auth fence or
+			// a newer version must never re-authorize a pending restrictive update.
+			floor, floorErr := getUserAuthVersionFloor(ctx, connection, userId)
+			if errors.Is(floorErr, ErrWalletCacheValidationUnavailable) {
+				return floorErr
+			}
+			if floorErr == nil && floor > user.AuthVersion {
+				return ErrUserAuthCachePending
+			}
+			if fillErr == nil {
+				fillErr = publishUserCache(ctx, connection, user.ToBaseUser(), fillToken)
+			}
+			if fillErr != nil && !errors.Is(fillErr, errUserCacheFillSuperseded) {
+				if errors.Is(fillErr, ErrUserAuthCachePending) || errors.Is(fillErr, ErrWalletCacheRecoveryRequired) || errors.Is(fillErr, ErrWalletCacheValidationUnavailable) {
+					return fillErr
+				}
+				common.SysLog(common.LogText("failed to synchronously populate user cache: %s", fillErr.Error()))
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
+		if fillErr == nil || errors.Is(fillErr, errUserCacheFillSuperseded) {
+			// Metadata repair preserves live quota deltas. Return that same balance
+			// to callers, including the billing trust check, rather than the older
+			// SQL balance used only to initialize a genuinely missing counter.
+			refreshed, cacheErr := cacheGetUserBaseWithContext(ctx, userId)
+			if cacheErr == nil {
+				return refreshed, nil
+			}
+			if errors.Is(cacheErr, ErrUserAuthCachePending) || errors.Is(cacheErr, ErrWalletCacheRecoveryRequired) || errors.Is(cacheErr, ErrWalletCacheValidationUnavailable) {
+				return nil, cacheErr
+			}
+			if errors.Is(cacheErr, errUserCacheInvalid) {
+				if errors.Is(fillErr, errUserCacheFillSuperseded) {
+					// A credit or competing reader cancelled this reservation. Start
+					// again with a new token and locked SQL snapshot, never replay it.
+					continue
+				}
+				return nil, ErrWalletCacheValidationUnavailable
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return user.ToBaseUser(), nil
 	}
-	if fillErr == nil || errors.Is(fillErr, errUserCacheFillSuperseded) {
-		// Metadata repair preserves live quota deltas. Return that same balance
-		// to callers, including the billing trust check, rather than the older
-		// SQL balance used only to initialize a genuinely missing counter.
-		refreshed, cacheErr := cacheGetUserBase(userId)
-		if cacheErr == nil {
-			return refreshed, nil
-		}
-		if errors.Is(cacheErr, ErrUserAuthCachePending) || errors.Is(cacheErr, ErrWalletCacheRecoveryRequired) || errors.Is(cacheErr, ErrWalletCacheValidationUnavailable) {
-			return nil, cacheErr
-		}
-		if errors.Is(cacheErr, errUserCacheInvalid) {
-			// A competing fill may still be waiting for our SQL lock. Until a
-			// valid cache is published, SQL cannot substitute for live reserves.
-			return nil, ErrWalletCacheValidationUnavailable
-		}
-	}
-	return user.ToBaseUser(), nil
+	return nil, ErrWalletCacheValidationUnavailable
 }
 
 func cacheGetUserBase(userId int) (*UserBase, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), walletCacheCoordinationTimeout)
+	defer cancel()
+	return cacheGetUserBaseWithContext(ctx, userId)
+}
+
+func cacheGetUserBaseWithContext(ctx context.Context, userId int) (*UserBase, error) {
 	if !common.RedisEnabled {
 		return nil, fmt.Errorf("redis is not enabled")
 	}
 	var userCache UserBase
-	ctx, cancel := context.WithTimeout(context.Background(), walletCacheCoordinationTimeout)
-	defer cancel()
 	command := redis.NewStringStringMapCmd(ctx, "eval", walletCacheRunGuard+`return redis.call('HGETALL', KEYS[1])`, 1, getUserCacheKey(userId))
 	if err := common.RDB.Process(ctx, command); err != nil {
 		return nil, walletCacheValidationError(err)
@@ -276,7 +309,7 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 	if err != nil || !validAuthCacheMAC(mac, userCache.CacheMAC, userCache.CacheExpiresAt) {
 		return nil, fmt.Errorf("%w: integrity check failed", errUserCacheInvalid)
 	}
-	floor, err := getUserAuthVersionFloor(context.Background(), common.RDB, userId)
+	floor, err := getUserAuthVersionFloor(ctx, common.RDB, userId)
 	if err != nil {
 		return nil, err
 	}
