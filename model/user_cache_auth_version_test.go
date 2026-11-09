@@ -1214,6 +1214,204 @@ func TestReferralWalletCacheAttemptOwnership(t *testing.T) {
 	}
 }
 
+func TestReferralWalletMixedCreditsRecoverOriginalIdentitiesAcrossDatabases(t *testing.T) {
+	address := os.Getenv("NEW_API_REFERRAL_REDIS_ADDR")
+	if address == "" {
+		t.Skip("set NEW_API_REFERRAL_REDIS_ADDR to a disposable isolated Redis instance")
+	}
+	setupAffiliateTransferCompliance(t)
+	resetBatchUpdateTestState(t)
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			db, _ := newReferralIntegrationDatabase(t, dialect)
+			previousDB, previousLogDB := DB, LOG_DB
+			previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+			previousClient, previousEnabled := common.RDB, common.RedisEnabled
+			previousUnit, previousFrequency := common.QuotaPerUnit, common.SyncFrequency
+			DB, LOG_DB = db, db
+			common.SetDatabaseTypes(common.DatabaseType(dialect), common.DatabaseType(dialect))
+			common.QuotaPerUnit, common.SyncFrequency = 1, 60
+			client := redis.NewClient(&redis.Options{Addr: address, DB: 12, MaxRetries: -1})
+			common.RDB, common.RedisEnabled = client, true
+			t.Cleanup(func() {
+				DB, LOG_DB = previousDB, previousLogDB
+				common.SetDatabaseTypes(previousMain, previousLog)
+				common.RDB, common.RedisEnabled = previousClient, previousEnabled
+				common.QuotaPerUnit, common.SyncFrequency = previousUnit, previousFrequency
+				assert.NoError(t, client.Close())
+			})
+			require.NoError(t, client.Ping(t.Context()).Err())
+			const userID = 480501
+			keys := []string{getUserCacheKey(userID), getUserAuthFenceKey(userID), getUserAuthVersionKey(userID), getWalletCacheFillKey(userID)}
+			exists, err := client.Exists(t.Context(), keys...).Result()
+			require.NoError(t, err)
+			require.Zero(t, exists, "the isolated fixture must not replace existing keys")
+			t.Cleanup(func() { assert.NoError(t, client.Del(context.Background(), keys...).Err()) })
+			require.NoError(t, db.AutoMigrate(&User{}, &Option{}, &TopUp{}, &SubscriptionOrder{}, &ReferralRebate{}, &AffiliateTransfer{}))
+			require.NoError(t, InitializeReferralRebateRule(db))
+			require.NoError(t, SaveReferralRebateRule(ReferralRebateRule{Enabled: true, RateBPS: 1000, ValidDays: 1}))
+			inviter := User{Id: userID + 1, Username: "mixed-credit-inviter", AffCode: "mixed-credit-inviter", Status: common.UserStatusEnabled, AffQuota: 7, AffHistoryQuota: 11}
+			require.NoError(t, db.Create(&inviter).Error)
+			user := User{Id: userID, Username: "mixed-credit-user", AffCode: "mixed-credit-user", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, Group: "default", AuthVersion: 1,
+				Quota: 9007199254739000, AffQuota: 500, AffHistoryQuota: 500, InviterId: inviter.Id, CreatedAt: time.Now().Unix() - 60, ReferralRateBPS: 1000, ReferralExpiresAt: time.Now().Unix() + 86400}
+			require.NoError(t, db.Create(&user).Error)
+			cached, err := GetUserCache(user.Id)
+			require.NoError(t, err)
+			require.Equal(t, 9007199254739000, cached.Quota)
+			initialHash, err := client.HGetAll(t.Context(), keys[0]).Result()
+			require.NoError(t, err)
+			runID := initialHash["WalletRedisRunID"]
+			require.NotEmpty(t, runID)
+			server, err := client.Info(t.Context(), "server").Result()
+			require.NoError(t, err)
+			require.Contains(t, server, "run_id:"+runID+"\r\n")
+			t.Logf("same-run mixed credit recovery uses real Redis DB 12, run_id=%s", runID)
+
+			credit := 1001
+			order := TopUp{UserId: user.Id, TradeNo: "mixed-credit-original-topup", CreditedQuota: &credit, PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending}
+			require.NoError(t, order.Insert())
+			unavailable := redis.NewClient(&redis.Options{Addr: address, DB: 12, MaxRetries: -1})
+			require.NoError(t, unavailable.Close())
+			connection, err := db.DB()
+			require.NoError(t, err)
+			commits := 0
+			interrupted := db.Session(&gorm.Session{Context: t.Context()})
+			interrupted.Statement.ConnPool = creditCommitPool{ConnPool: connection, afterCommit: func() error {
+				commits++
+				common.RDB = unavailable
+				return nil
+			}}
+			// Both SQL transactions really commit. Only their subsequent cache
+			// finalizations see the closed client, leaving distinct pending credits.
+			DB = interrupted
+			settled, credited, duplicate, err := settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", "", TopUpSettlementAudit{Source: "payment"})
+			require.ErrorIs(t, err, redis.ErrClosed)
+			require.NotNil(t, settled)
+			require.False(t, duplicate)
+			require.Equal(t, 1001, credited)
+			DB, common.RDB = db, client
+			require.NoError(t, db.First(&order, order.Id).Error)
+			require.NotNil(t, order.SettlementAudit)
+			require.Positive(t, order.CompleteTime)
+			firstSettlement, firstCompleteTime := *order.SettlementAudit, order.CompleteTime
+			const requestID = "mixed-credit-original-transfer"
+			DB = interrupted
+			transfer, err := user.TransferAffQuotaToQuota(250, requestID)
+			require.ErrorIs(t, err, redis.ErrClosed)
+			require.NotNil(t, transfer)
+			assert.Equal(t, user.Id, transfer.UserID)
+			assert.Equal(t, requestID, transfer.RequestID)
+			assert.Equal(t, 250, transfer.Quota)
+			assert.Equal(t, "success", transfer.Status)
+			DB, common.RDB = db, client
+			require.Equal(t, 2, commits)
+			require.NoError(t, db.First(&user, user.Id).Error)
+			assert.Equal(t, 9007199254740251, user.Quota, "both credits are already authoritative in SQL")
+			assert.Equal(t, 250, user.AffQuota)
+			topupMarker := "WalletCredit:topup:" + strconv.Itoa(order.Id)
+			transferMarker := "WalletCredit:affiliate:" + requestID
+			pending, err := client.HGetAll(t.Context(), keys[0]).Result()
+			require.NoError(t, err)
+			assert.Equal(t, "9007199254739000", pending["Quota"])
+			assert.Equal(t, runID, pending["WalletRedisRunID"])
+			for _, marker := range []string{topupMarker, transferMarker} {
+				require.NotEmpty(t, pending[marker])
+				require.NotEqual(t, "done", pending[marker])
+			}
+			require.NotEqual(t, pending[topupMarker], pending[transferMarker])
+
+			found, err := GetAffiliateTransfer(user.Id, requestID)
+			require.NoError(t, err)
+			assert.Equal(t, transfer, found)
+			partial, err := client.HGetAll(t.Context(), keys[0]).Result()
+			require.NoError(t, err)
+			assert.Equal(t, "9007199254739250", partial["Quota"])
+			assert.NotContains(t, partial, transferMarker)
+			assert.Equal(t, pending[topupMarker], partial[topupMarker], "transfer recovery must retain the other operation")
+			assert.NotEqual(t, pending["WalletGeneration"], partial["WalletGeneration"])
+
+			// The authoritative metadata snapshot includes both SQL credits.
+			// Publishing it between recoveries must retain the partially restored
+			// live counter, its valid signature, and the original top-up marker.
+			require.NoError(t, db.Model(&User{}).Where("id = ?", user.Id).Updates(map[string]any{"email": "mixed-credit@example.invalid", "group": "mixed-credit-group"}).Error)
+			require.NoError(t, PublishUserAuthCache(user.Id))
+			cached, err = cacheGetUserBase(user.Id)
+			require.NoError(t, err, "the refreshed metadata must pass real cache signature verification")
+			assert.Equal(t, "mixed-credit@example.invalid", cached.Email)
+			assert.Equal(t, "mixed-credit-group", cached.Group)
+			assert.Equal(t, 9007199254739250, cached.Quota)
+			refreshed, err := client.HGetAll(t.Context(), keys[0]).Result()
+			require.NoError(t, err)
+			assert.Equal(t, pending[topupMarker], refreshed[topupMarker])
+			assert.NotContains(t, refreshed, transferMarker)
+			assert.Equal(t, partial["WalletGeneration"], refreshed["WalletGeneration"])
+			assert.Equal(t, runID, refreshed["WalletRedisRunID"])
+
+			for range 2 {
+				settled, credited, duplicate, err = settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", "", TopUpSettlementAudit{Source: "payment"})
+				require.NoError(t, err)
+				require.True(t, duplicate)
+				require.NotNil(t, settled)
+				assert.Equal(t, order.Id, settled.Id)
+				assert.Equal(t, 1001, credited)
+				found, err = GetAffiliateTransfer(user.Id, requestID)
+				require.NoError(t, err)
+				assert.Equal(t, transfer, found)
+				retried, err := user.TransferAffQuotaToQuota(250, requestID)
+				require.NoError(t, err)
+				assert.Equal(t, transfer, retried)
+			}
+			changedAmount, err := user.TransferAffQuotaToQuota(251, requestID)
+			require.EqualError(t, err, "Invalid parameters")
+			assert.Nil(t, changedAmount)
+			cached, err = cacheGetUserBase(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, 9007199254740251, cached.Quota)
+			finalHash, err := client.HGetAll(t.Context(), keys[0]).Result()
+			require.NoError(t, err)
+			assert.Equal(t, "9007199254740251", finalHash["Quota"])
+			assert.NotContains(t, finalHash, topupMarker)
+			assert.NotContains(t, finalHash, transferMarker)
+			assert.NotContains(t, finalHash, "WalletCreditNextQuota")
+			assert.Len(t, finalHash, len(initialHash), "completed identities leave no growing cache marker history")
+			assert.Equal(t, runID, finalHash["WalletRedisRunID"])
+			server, err = client.Info(t.Context(), "server").Result()
+			require.NoError(t, err)
+			assert.Contains(t, server, "run_id:"+runID+"\r\n", "this case does not rely on restart or key expiry")
+			require.NoError(t, db.First(&user, user.Id).Error)
+			require.NoError(t, db.First(&inviter, inviter.Id).Error)
+			assert.Equal(t, 9007199254740251, user.Quota)
+			assert.Equal(t, 250, user.AffQuota)
+			assert.Equal(t, 500, user.AffHistoryQuota)
+			assert.Equal(t, 107, inviter.AffQuota)
+			assert.Equal(t, 111, inviter.AffHistoryQuota)
+			var orders []TopUp
+			var transfers []AffiliateTransfer
+			var rebates []ReferralRebate
+			require.NoError(t, db.Find(&orders).Error)
+			require.NoError(t, db.Find(&transfers).Error)
+			require.NoError(t, db.Find(&rebates).Error)
+			require.Len(t, orders, 1)
+			require.Len(t, transfers, 1)
+			require.Len(t, rebates, 1)
+			assert.Equal(t, order.Id, orders[0].Id)
+			assert.Equal(t, user.Id, orders[0].UserId)
+			assert.Equal(t, order.TradeNo, orders[0].TradeNo)
+			assert.Equal(t, common.TopUpStatusSuccess, orders[0].Status)
+			assert.Equal(t, firstCompleteTime, orders[0].CompleteTime)
+			assert.Equal(t, &credit, orders[0].CreditedQuota)
+			require.NotNil(t, orders[0].SettlementAudit)
+			assert.Equal(t, firstSettlement, *orders[0].SettlementAudit)
+			assert.Equal(t, *transfer, transfers[0])
+			assert.Equal(t, order.Id, rebates[0].TopUpID)
+			assert.Equal(t, user.Id, rebates[0].InviteeID)
+			assert.Equal(t, inviter.Id, rebates[0].InviterID)
+			assert.EqualValues(t, 1001, rebates[0].CreditedQuota)
+			assert.EqualValues(t, 100, rebates[0].RewardQuota)
+		})
+	}
+}
+
 // Exercise real transaction loss before the first cache mutation. A successful
 // retry must not let the older caller recreate the completed operation marker.
 func TestReferralWalletRejectsCaptureAfterSQLLockReleaseAcrossDatabases(t *testing.T) {
