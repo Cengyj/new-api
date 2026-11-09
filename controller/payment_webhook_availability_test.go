@@ -2305,6 +2305,105 @@ func TestWalletPancakeSharedCheckoutPreservesSubscriptionDispatch(t *testing.T) 
 	}
 }
 
+func TestWalletPancakeSubscriptionLookupFailureRemainsRetryable(t *testing.T) {
+	for _, scenario := range []string{"lookup_unavailable", "missing_order", "wrong_provider", "wrong_buyer", "invalid_signature"} {
+		t.Run(scenario, func(t *testing.T) {
+			router, keys := walletWebhookFixture(t)
+			sqlDB, err := model.DB.DB()
+			require.NoError(t, err)
+			sqlDB.SetMaxOpenConns(2)
+			require.NoError(t, model.DB.AutoMigrate(&model.SubscriptionPlan{}, &model.UserSubscription{}))
+			plan := model.SubscriptionPlan{Id: 905, Title: "Pancake subscription retry fixture", PriceAmount: 100, Enabled: true, DurationUnit: model.SubscriptionDurationMonth, DurationValue: 1}
+			require.NoError(t, model.DB.Create(&plan).Error)
+			model.InvalidateSubscriptionPlanCache(plan.Id)
+			t.Cleanup(func() { model.InvalidateSubscriptionPlanCache(plan.Id) })
+			order := model.SubscriptionOrder{UserId: 902, PlanId: plan.Id, Money: 100, TradeNo: "WAFFO_PANCAKE_SUB-lookup-original", PaymentMethod: model.PaymentMethodWaffoPancake, PaymentProvider: model.PaymentProviderWaffoPancake, Status: common.TopUpStatusPending}
+			require.NoError(t, order.Insert())
+			original := walletWebhookRequest(t, keys, model.PaymentProviderWaffoPancake, order.TradeNo, "100.00", true)
+			originalBody, err := io.ReadAll(original.Body)
+			require.NoError(t, err)
+			first := original.Clone(t.Context())
+			first.Body = io.NopCloser(bytes.NewReader(originalBody))
+			if scenario == "invalid_signature" {
+				first.Header.Set("X-Waffo-Signature", "invalid")
+			} else if scenario != "lookup_unavailable" {
+				tradeNo, buyer := order.TradeNo, "new-api-user-902"
+				switch scenario {
+				case "missing_order":
+					tradeNo = "WAFFO_PANCAKE_SUB-absent"
+				case "wrong_provider":
+					tradeNo = "WAFFO_PANCAKE_SUB-other-provider"
+					require.NoError(t, model.DB.Create(&model.SubscriptionOrder{UserId: 902, PlanId: plan.Id, TradeNo: tradeNo, PaymentProvider: model.PaymentProviderStripe, Status: common.TopUpStatusPending}).Error)
+				case "wrong_buyer":
+					buyer = "new-api-user-901"
+				}
+				first = signedWalletWebhookRequest(t, keys, model.PaymentProviderWaffoPancake, map[string]any{
+					"id": "event_unrelated_subscription", "eventType": "order.completed", "mode": "test", "storeId": "store_fixture",
+					"data": map[string]any{"orderId": "ORD_fixture", "orderMerchantExternalId": tradeNo, "merchantProvidedBuyerIdentity": buyer, "amount": "100.00", "currency": "USD"},
+				})
+			}
+			injected := false
+			if scenario == "lookup_unavailable" {
+				require.NoError(t, model.DB.Callback().Query().Before("gorm:query").Register("test:pancake_subscription_lookup_unavailable", func(tx *gorm.DB) {
+					if !injected && tx.Statement.Table == "subscription_orders" {
+						injected = true
+						tx.AddError(errors.New("isolated subscription lookup unavailable"))
+					}
+				}))
+				t.Cleanup(func() {
+					assert.NoError(t, model.DB.Callback().Query().Remove("test:pancake_subscription_lookup_unavailable"))
+				})
+			}
+			for attempt := range 3 {
+				request := first
+				if attempt > 0 {
+					// Replay the original signed body and timestamp, not a new
+					// checkout or newly signed substitute for the failed delivery.
+					request = original.Clone(t.Context())
+					request.Body = io.NopCloser(bytes.NewReader(originalBody))
+				}
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+				wantHTTP := http.StatusOK
+				if attempt == 0 {
+					if scenario == "lookup_unavailable" {
+						require.True(t, injected, "the real subscription lookup must reach the fault boundary")
+						wantHTTP = http.StatusInternalServerError
+					} else if scenario == "invalid_signature" {
+						wantHTTP = http.StatusUnauthorized
+					}
+				}
+				assert.Equal(t, wantHTTP, response.Code)
+				assert.NotContains(t, response.Body.String(), "isolated subscription lookup unavailable")
+				require.NoError(t, model.DB.First(&order, order.Id).Error)
+				var subscriptions, topups, rebates int64
+				require.NoError(t, model.DB.Model(&model.UserSubscription{}).Count(&subscriptions).Error)
+				require.NoError(t, model.DB.Model(&model.TopUp{}).Count(&topups).Error)
+				require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+				if attempt == 0 {
+					assert.Equal(t, common.TopUpStatusPending, order.Status)
+					assert.Zero(t, order.CompleteTime)
+					assert.Zero(t, subscriptions)
+					assert.Zero(t, topups)
+				} else {
+					assert.Equal(t, common.TopUpStatusSuccess, order.Status)
+					assert.EqualValues(t, 1, subscriptions)
+					assert.EqualValues(t, 1, topups)
+					assert.Equal(t, string(originalBody), order.ProviderPayload)
+				}
+				assert.Zero(t, rebates)
+				var buyer, inviter model.User
+				require.NoError(t, model.DB.First(&buyer, 902).Error)
+				require.NoError(t, model.DB.First(&inviter, 901).Error)
+				assert.Equal(t, -10, buyer.Quota)
+				assert.Zero(t, inviter.Quota)
+				assert.Equal(t, 7, inviter.AffQuota)
+				assert.Equal(t, 11, inviter.AffHistoryQuota)
+			}
+		})
+	}
+}
+
 func TestWalletReferralManualCompletionRejectsSubscriptionDisplayOrder(t *testing.T) {
 	router, _ := walletWebhookFixture(t)
 	order := walletWebhookOrder(t, model.PaymentProviderStripe, "subscription_display")
@@ -2973,8 +3072,8 @@ func TestWalletCheckoutDisplaySnapshotPreservesPricingAndCapacity(t *testing.T) 
 }
 
 // A failed BeginTx happens before the subscription lookup can distinguish a
-// wallet order. A paid wallet event must be retried, while existing unrelated
-// source and subscription acknowledgements retain their original contract.
+// wallet order. Legitimate wallet and subscription sources remain retryable
+// until dispatch can resolve the order; unrelated sources retain their ACK.
 func TestWalletStripeDispatchTransactionFailureRemainsRetryable(t *testing.T) {
 	for _, eventType := range []string{"checkout.session.completed", "checkout.session.async_payment_succeeded"} {
 		for _, source := range []struct {
@@ -3013,7 +3112,7 @@ func TestWalletStripeDispatchTransactionFailureRemainsRetryable(t *testing.T) {
 				router.ServeHTTP(recorder, signedWalletWebhookRequest(t, keys, model.PaymentProviderStripe, payload))
 				model.DB = healthy
 				wantStatus := http.StatusOK
-				if source.wallet {
+				if source.wallet || source.mode == "subscription" {
 					wantStatus = http.StatusInternalServerError
 				}
 				assert.Equal(t, wantStatus, recorder.Code)
@@ -3053,6 +3152,145 @@ func TestWalletStripeDispatchTransactionFailureRemainsRetryable(t *testing.T) {
 					assert.Equal(t, 7, inviter.AffQuota)
 					assert.Equal(t, 11, inviter.AffHistoryQuota)
 					assert.Zero(t, facts)
+				}
+			})
+		}
+	}
+}
+
+func TestWalletSharedSubscriptionCallbacksPreserveRetryableFailures(t *testing.T) {
+	for _, source := range []struct {
+		name, provider, eventType string
+		faults                    []string
+	}{
+		{"stripe_completed", model.PaymentProviderStripe, "checkout.session.completed", []string{"begin", "lookup", "order_write", "commit_reply_lost", "wrong_provider", "invalid_status", "purchase_limit"}},
+		{"stripe_async", model.PaymentProviderStripe, "checkout.session.async_payment_succeeded", []string{"begin", "lookup", "order_write", "commit_reply_lost"}},
+		{"stripe_expired", model.PaymentProviderStripe, "checkout.session.expired", []string{"begin", "lookup", "order_write", "commit_reply_lost"}},
+		{"creem_paid", model.PaymentProviderCreem, "checkout.completed", []string{"lookup"}},
+		{"pancake_paid", model.PaymentProviderWaffoPancake, "order.completed", []string{"locked_lookup"}},
+	} {
+		for _, fault := range source.faults {
+			t.Run(source.name+"/"+fault, func(t *testing.T) {
+				router, keys := walletWebhookFixture(t)
+				healthy := model.DB
+				sqlDB, err := healthy.DB()
+				require.NoError(t, err)
+				sqlDB.SetMaxOpenConns(2)
+				require.NoError(t, healthy.AutoMigrate(&model.SubscriptionPlan{}, &model.UserSubscription{}))
+				plan := model.SubscriptionPlan{Id: 906, Title: "Subscription callback recovery fixture", PriceAmount: 100, Enabled: true, DurationUnit: model.SubscriptionDurationMonth, DurationValue: 1}
+				businessRejection := fault == "wrong_provider" || fault == "invalid_status" || fault == "purchase_limit"
+				if fault == "purchase_limit" {
+					plan.MaxPurchasePerUser = 1
+					require.NoError(t, healthy.Create(&model.UserSubscription{UserId: 902, PlanId: plan.Id, Status: "active", Source: "order"}).Error)
+				}
+				require.NoError(t, healthy.Create(&plan).Error)
+				model.InvalidateSubscriptionPlanCache(plan.Id)
+				t.Cleanup(func() { model.InvalidateSubscriptionPlanCache(plan.Id) })
+				order := model.SubscriptionOrder{UserId: 902, PlanId: plan.Id, Money: 100, TradeNo: "subscription-original-event", PaymentMethod: source.provider, PaymentProvider: source.provider, Status: common.TopUpStatusPending}
+				if source.provider == model.PaymentProviderWaffoPancake {
+					order.TradeNo = "WAFFO_PANCAKE_SUB-original-event"
+				}
+				if fault == "wrong_provider" {
+					order.PaymentProvider, order.PaymentMethod = model.PaymentProviderCreem, model.PaymentMethodCreem
+				} else if fault == "invalid_status" {
+					order.Status = common.TopUpStatusFailed
+				}
+				require.NoError(t, order.Insert())
+				initialStatus := order.Status
+				object := map[string]any{"id": "cs_subscription_original", "object": "checkout.session", "mode": "subscription", "payment_link": nil, "status": "complete", "payment_status": "paid", "client_reference_id": order.TradeNo, "amount_total": 10000, "currency": "usd"}
+				if source.eventType == "checkout.session.expired" {
+					object["status"], object["payment_status"] = "expired", "unpaid"
+				}
+				payload := map[string]any{"id": "evt_subscription_original", "object": "event", "type": source.eventType, "data": map[string]any{"object": object}}
+				if source.provider == model.PaymentProviderCreem {
+					payload = map[string]any{"id": "evt_subscription_original", "eventType": source.eventType, "object": map[string]any{"request_id": order.TradeNo, "order": map[string]any{"id": "ord_subscription_original", "amount": 10000, "status": "paid", "type": "recurring", "currency": "USD"}}}
+				} else if source.provider == model.PaymentProviderWaffoPancake {
+					payload = map[string]any{"id": "evt_subscription_original", "eventType": source.eventType, "mode": "test", "storeId": "store_fixture", "data": map[string]any{"orderId": "ORD_fixture", "orderMerchantExternalId": order.TradeNo, "merchantProvidedBuyerIdentity": "new-api-user-902", "amount": "100.00", "currency": "USD"}}
+				}
+				original := signedWalletWebhookRequest(t, keys, source.provider, payload)
+				body, err := io.ReadAll(original.Body)
+				require.NoError(t, err)
+				injected, subscriptionReads := false, 0
+				const callbackName = "test:subscription_callback_failure"
+				processor := healthy.Callback().Query()
+				anchor := "gorm:query"
+				if fault == "order_write" {
+					processor, anchor = healthy.Callback().Update(), "gorm:update"
+				}
+				if fault == "lookup" || fault == "locked_lookup" || fault == "order_write" {
+					require.NoError(t, processor.Before(anchor).Register(callbackName, func(tx *gorm.DB) {
+						if injected || tx.Statement.Table != "subscription_orders" {
+							return
+						}
+						subscriptionReads++
+						if fault == "locked_lookup" && subscriptionReads == 1 {
+							return // The Pancake resolver succeeds before the locked read fails.
+						}
+						injected = true
+						tx.AddError(errors.New("isolated subscription database failure"))
+					}))
+					t.Cleanup(func() { assert.NoError(t, processor.Remove(callbackName)) })
+				} else if fault == "begin" {
+					unavailable, err := gorm.Open(healthy.Dialector, &gorm.Config{})
+					require.NoError(t, err)
+					closedPool, err := unavailable.DB()
+					require.NoError(t, err)
+					require.NoError(t, closedPool.Close())
+					model.DB = unavailable // The real SQL driver rejects BeginTx.
+				} else if fault == "commit_reply_lost" {
+					wrapped := healthy.Session(&gorm.Session{NewDB: true})
+					wrapped.Statement = &gorm.Statement{DB: wrapped, Context: t.Context(), ConnPool: walletSettlementCommitPool{ConnPool: healthy.Statement.ConnPool, orderTable: "subscription_orders", afterSettlement: func() error {
+						injected = true
+						return errors.New("isolated committed subscription acknowledgement lost")
+					}}}
+					model.DB = wrapped
+				}
+				t.Cleanup(func() { model.DB = healthy })
+				for attempt := range 3 {
+					request := original.Clone(t.Context())
+					request.Body = io.NopCloser(bytes.NewReader(body))
+					response := httptest.NewRecorder()
+					router.ServeHTTP(response, request)
+					model.DB = healthy
+					wantHTTP := http.StatusOK
+					if attempt == 0 && !businessRejection {
+						wantHTTP = http.StatusInternalServerError
+						if fault != "begin" {
+							require.True(t, injected, "the real subscription transaction must reach the fault boundary")
+						}
+					}
+					assert.Equal(t, wantHTTP, response.Code, response.Body.String())
+					assert.NotContains(t, response.Body.String(), "isolated")
+					require.NoError(t, healthy.First(&order, order.Id).Error)
+					var subscriptions, topups, rebates int64
+					require.NoError(t, healthy.Model(&model.UserSubscription{}).Count(&subscriptions).Error)
+					require.NoError(t, healthy.Model(&model.TopUp{}).Count(&topups).Error)
+					require.NoError(t, healthy.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+					settled := !businessRejection && (attempt > 0 || fault == "commit_reply_lost")
+					wantStatus, wantSubscriptions, wantTopups := initialStatus, int64(0), int64(0)
+					if fault == "purchase_limit" {
+						wantSubscriptions = 1
+					}
+					if settled {
+						wantStatus, wantSubscriptions, wantTopups = common.TopUpStatusSuccess, 1, 1
+						if source.eventType == "checkout.session.expired" {
+							wantStatus, wantSubscriptions, wantTopups = common.TopUpStatusExpired, 0, 0
+						}
+						assert.Positive(t, order.CompleteTime)
+					} else {
+						assert.Zero(t, order.CompleteTime)
+					}
+					assert.Equal(t, wantStatus, order.Status)
+					assert.Equal(t, wantSubscriptions, subscriptions)
+					assert.Equal(t, wantTopups, topups)
+					assert.Zero(t, rebates)
+					var buyer, inviter model.User
+					require.NoError(t, healthy.First(&buyer, 902).Error)
+					require.NoError(t, healthy.First(&inviter, 901).Error)
+					assert.Equal(t, -10, buyer.Quota)
+					assert.Zero(t, inviter.Quota)
+					assert.Equal(t, 7, inviter.AffQuota)
+					assert.Equal(t, 11, inviter.AffHistoryQuota)
 				}
 			})
 		}
@@ -3246,7 +3484,11 @@ func TestWalletExpirySharedHelperPreservesSubscriptionCallers(t *testing.T) {
 					router.ServeHTTP(recorder, request)
 					assert.Contains(t, recorder.Body.String(), "Failed to start payment")
 				}
-				assert.Equal(t, http.StatusOK, recorder.Code)
+				wantHTTP := http.StatusOK
+				if caller == "stripe_subscription" && fault != "none" {
+					wantHTTP = http.StatusInternalServerError
+				}
+				assert.Equal(t, wantHTTP, recorder.Code)
 				if fault != "none" {
 					require.NoError(t, processor.Remove(callbackName))
 					assert.Positive(t, faultCount)
@@ -3913,6 +4155,7 @@ func TestWalletSettlementResponsibilitySurvivesLogFailure(t *testing.T) {
 type walletSettlementCommitPool struct {
 	gorm.ConnPool
 	afterSettlement func() error
+	orderTable      string
 }
 
 func (pool walletSettlementCommitPool) BeginTx(ctx context.Context, options *sql.TxOptions) (gorm.ConnPool, error) {
@@ -3920,18 +4163,23 @@ func (pool walletSettlementCommitPool) BeginTx(ctx context.Context, options *sql
 	if err != nil {
 		return nil, err
 	}
-	return &walletSettlementCommitTx{Tx: tx, afterSettlement: pool.afterSettlement}, nil
+	orderTable := pool.orderTable
+	if orderTable == "" {
+		orderTable = "top_ups"
+	}
+	return &walletSettlementCommitTx{Tx: tx, afterSettlement: pool.afterSettlement, orderTable: orderTable}, nil
 }
 
 type walletSettlementCommitTx struct {
 	*sql.Tx
 	afterSettlement func() error
+	orderTable      string
 	settled         bool
 }
 
 func (tx *walletSettlementCommitTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	result, err := tx.Tx.ExecContext(ctx, query, args...)
-	if err == nil && strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "UPDATE ") && strings.Contains(query, "top_ups") && strings.Contains(query, "status") {
+	if err == nil && strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "UPDATE ") && strings.Contains(query, tx.orderTable) && strings.Contains(query, "status") {
 		tx.settled = true
 	}
 	return result, err

@@ -365,9 +365,9 @@ func fulfillOrder(ctx context.Context, event stripe.Event, referenceId string, c
 		return nil
 	} else if !errors.Is(err, model.ErrSubscriptionOrderNotFound) {
 		logger.LogError(ctx, common.LogText("Stripe subscription order processing failed trade_no=%s event_type=%s client_ip=%s error=%q", referenceId, string(event.Type), callerIp, err.Error()))
-		// A wallet checkout has not reached its settlement transaction yet.
-		// A failed dispatch transaction must remain retryable by Stripe.
-		if isStripeWalletCheckout(ctx, event) {
+		// Neither a dispatch failure nor a lost commit reply proves completion.
+		// Retry the original event without changing known business rejections.
+		if isStripeWalletCheckout(ctx, event) || shouldRetryStripeSubscriptionEvent(event, err) {
 			return err
 		}
 		return nil
@@ -413,7 +413,7 @@ func sessionExpired(ctx context.Context, event stripe.Event) error {
 		return nil
 	} else if err != nil && !errors.Is(err, model.ErrSubscriptionOrderNotFound) {
 		logger.LogError(ctx, common.LogText("Stripe subscription order expiry processing failed trade_no=%s error=%q", referenceId, err.Error()))
-		if isStripeWalletCheckout(ctx, event) {
+		if isStripeWalletCheckout(ctx, event) || shouldRetryStripeSubscriptionEvent(event, err) {
 			return err
 		}
 		return nil
@@ -453,6 +453,18 @@ func isStripeWalletCheckout(ctx context.Context, event stripe.Event) bool {
 	}
 	logger.LogWarn(ctx, common.LogText("Stripe wallet event ignored reason=checkout_source_mismatch trade_no=%s event_type=%s mode=%q payment_link=%t connected_account=%t", event.GetObjectValue("client_reference_id"), string(event.Type), mode, hasPaymentLink, connectedAccount))
 	return false
+}
+
+// API-created subscription sessions need retryable completion/expiry failures
+// too. Preserve the existing ACK for known business refusals and other sources.
+func shouldRetryStripeSubscriptionEvent(event stripe.Event, err error) bool {
+	if err == nil || event.GetObjectValue("mode") != string(stripe.CheckoutSessionModeSubscription) ||
+		event.GetObjectValue("payment_link") != "" || event.Account != "" {
+		return false
+	}
+	var message *common.Message
+	return !errors.Is(err, model.ErrPaymentMethodMismatch) &&
+		!errors.Is(err, model.ErrSubscriptionOrderStatusInvalid) && !errors.As(err, &message)
 }
 
 // The SDK's error logger includes provider response bodies. Keep its configured

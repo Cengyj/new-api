@@ -425,7 +425,10 @@ func ResolveWaffoPancakeSubscriptionTradeNo(event *WaffoPancakeWebhookEvent) (st
 	if tradeNo == "" {
 		return "", fmt.Errorf("missing webhook orderMerchantExternalId")
 	}
-	order := model.GetSubscriptionOrderByTradeNo(tradeNo)
+	order, err := model.GetSubscriptionOrderByTradeNoWithError(tradeNo)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", errors.Join(ErrWaffoPancakeOrderLookup, err)
+	}
 	if order == nil || order.PaymentProvider != model.PaymentProviderWaffoPancake {
 		return "", fmt.Errorf("waffo pancake subscription order not found for tradeNo=%s", tradeNo)
 	}
