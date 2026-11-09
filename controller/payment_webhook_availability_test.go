@@ -3513,6 +3513,75 @@ func TestWalletTopUpQueriesRejectCancelledAndInvalidPagination(t *testing.T) {
 	}
 }
 
+func TestWalletTopUpQueriesPropagatePanics(t *testing.T) {
+	router, _ := walletWebhookFixture(t)
+	order := walletWebhookOrder(t, model.PaymentProviderStripe, "panic-history-order")
+	router.GET("/history/user", middleware.PanicRecover(), func(c *gin.Context) { c.Set("id", 902) }, GetUserTopUps)
+	router.GET("/history/admin", middleware.PanicRecover(), GetAllTopUps)
+	var recoveryLog bytes.Buffer
+	previousWriter := common.ErrorLogWriter
+	common.ErrorLogWriter = &recoveryLog
+	t.Cleanup(func() { common.ErrorLogWriter = previousWriter })
+	for _, path := range []string{"/history/user", "/history/admin", "/history/user?keyword=panic-history-order", "/history/admin?keyword=panic-history-order"} {
+		for _, stage := range []string{"count", "rows"} {
+			t.Run(path+"/"+stage, func(t *testing.T) {
+				recoveryLog.Reset()
+				injected := false
+				require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register("test:topup_history_panic", func(tx *gorm.DB) {
+					countQuery := strings.Contains(strings.ToLower(tx.Statement.SQL.String()), "count(")
+					if !injected && tx.Statement.Table == "top_ups" && countQuery == (stage == "count") {
+						injected = true
+						panic("isolated-query-panic-sensitive-value")
+					}
+				}))
+				defer func() { require.NoError(t, model.DB.Callback().Query().Remove("test:topup_history_panic")) }()
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+				require.True(t, injected, "the actual count or row query must reach the fault boundary")
+				assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+				var response struct{ Success bool }
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+				assert.False(t, response.Success, "a rolled-back incomplete query must not be a successful empty or partial history")
+				assert.NotContains(t, recorder.Body.String(), order.TradeNo)
+				assert.NotContains(t, recorder.Body.String(), "isolated-query-panic-sensitive-value")
+				require.NotEmpty(t, recorder.Header().Get(common.RequestIdKey))
+				assert.Contains(t, recoveryLog.String(), recorder.Header().Get(common.RequestIdKey))
+				assert.Contains(t, recoveryLog.String(), "panic_type=string")
+				assert.NotContains(t, recoveryLog.String(), "isolated-query-panic-sensitive-value")
+
+				// The real one-connection pool must be released by rollback. A
+				// subsequent request reads the original order and exact total.
+				next := httptest.NewRecorder()
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				router.ServeHTTP(next, httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx))
+				var history struct {
+					Success bool
+					Data    struct {
+						Total int
+						Items []model.TopUp
+					}
+				}
+				require.NoError(t, common.Unmarshal(next.Body.Bytes(), &history))
+				require.True(t, history.Success, next.Body.String())
+				assert.Equal(t, 1, history.Data.Total)
+				require.Len(t, history.Data.Items, 1)
+				assert.Equal(t, order.TradeNo, history.Data.Items[0].TradeNo)
+				assert.Equal(t, common.TopUpStatusPending, history.Data.Items[0].Status)
+			})
+		}
+	}
+	var invitee, inviter model.User
+	require.NoError(t, model.DB.First(&invitee, 902).Error)
+	require.NoError(t, model.DB.First(&inviter, 901).Error)
+	assert.Equal(t, -10, invitee.Quota)
+	assert.Equal(t, 7, inviter.AffQuota)
+	assert.Equal(t, 11, inviter.AffHistoryQuota)
+	var rebateCount int64
+	require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebateCount).Error)
+	assert.Zero(t, rebateCount)
+}
+
 // Fail only the post-commit Redis finalization command before it reaches Redis.
 // Capture/fencing, SQL commits, retries and the eventual Lua execution stay real.
 type walletFinishFailureHook struct {

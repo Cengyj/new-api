@@ -453,6 +453,7 @@ func GetUserTopUps(ctx context.Context, userId int, pageInfo *common.PageInfo) (
 	defer func() {
 		if r := recover(); r != nil {
 			tx.Rollback()
+			panic(r)
 		}
 	}()
 
@@ -492,6 +493,7 @@ func GetAllTopUps(ctx context.Context, pageInfo *common.PageInfo) (topups []*Top
 	defer func() {
 		if r := recover(); r != nil {
 			tx.Rollback()
+			panic(r)
 		}
 	}()
 
@@ -528,6 +530,7 @@ func SearchUserTopUps(ctx context.Context, userId int, keyword string, pageInfo 
 	defer func() {
 		if r := recover(); r != nil {
 			tx.Rollback()
+			panic(r)
 		}
 	}()
 
@@ -571,6 +574,7 @@ func SearchAllTopUps(ctx context.Context, keyword string, pageInfo *common.PageI
 	defer func() {
 		if r := recover(); r != nil {
 			tx.Rollback()
+			panic(r)
 		}
 	}()
 
