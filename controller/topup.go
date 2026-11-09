@@ -676,6 +676,18 @@ func AdminCompleteTopUp(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
+	requestSucceeded := false
+	defer func() {
+		// A failed response can follow a committed credit whose cache still needs
+		// repair. Record the request result and original order, not a rollback.
+		auditInfo := &model.AuditRequestInfo{
+			Method: c.Request.Method, Route: c.FullPath(), Path: c.FullPath(),
+			Status: c.Writer.Status(), Success: requestSucceeded,
+		}
+		model.RecordOperationAuditLog(c.GetInt("id"), c.GetInt("role"), c.Request.Method+" "+c.FullPath(), c.ClientIP(),
+			"user.topup_complete", map[string]any{"trade_no": req.TradeNo}, auditOperatorInfo(c), auditInfo, c)
+		markAuditLogged(c)
+	}()
 
 	// 订单级互斥，防止并发补单
 	LockOrder(req.TradeNo)
@@ -686,4 +698,5 @@ func AdminCompleteTopUp(c *gin.Context) {
 		return
 	}
 	common.ApiSuccess(c, nil)
+	requestSucceeded = true
 }

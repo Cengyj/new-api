@@ -621,7 +621,7 @@ func walletWebhookFixture(t *testing.T) (*gin.Engine, *waffoutils.KeyPair) {
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, db.AutoMigrate(&model.User{}, &model.TopUp{}, &model.SubscriptionOrder{}, &model.Option{}, &model.ReferralRebate{}, &model.Log{}))
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.TopUp{}, &model.SubscriptionOrder{}, &model.Option{}, &model.ReferralRebate{}, &model.Log{}, &model.AuditLog{}))
 	model.DB, model.LOG_DB = db, db
 	common.SetDatabaseTypes(databaseType, databaseType)
 	common.QuotaPerUnit, common.RedisEnabled = 10, false
@@ -998,12 +998,16 @@ func TestWalletReferralCallbacksPaymentProofAndRollback(t *testing.T) {
 					if address == "" {
 						t.Skip("set NEW_API_REFERRAL_REDIS_ADDR to a disposable isolated Redis instance")
 					}
-					// DB 13 is isolated from the model fixtures. Own only this key;
+					// DB 13 is isolated from the model fixtures. Own only this user's keys;
 					// never flush the server or overwrite an existing fixture.
 					faultRedis = redis.NewClient(&redis.Options{Addr: address, DB: 13, MaxRetries: -1})
 					t.Cleanup(func() { assert.NoError(t, faultRedis.Close()) })
 					require.NoError(t, faultRedis.Ping(t.Context()).Err())
 					faultKey = fmt.Sprintf("user:%d", order.UserId)
+					ownedKeys := []string{faultKey, "wallet:user:fill:{" + faultKey + "}", "auth:user:fence:{" + faultKey + "}", "auth:user:version:{" + faultKey + "}"}
+					count, err := faultRedis.Exists(t.Context(), ownedKeys...).Result()
+					require.NoError(t, err)
+					require.Zero(t, count, "never overwrite another Redis fixture")
 					owned, err := faultRedis.SetNX(t.Context(), faultKey, "wrong-type-fixture", time.Minute).Result()
 					require.NoError(t, err)
 					require.True(t, owned, "the Redis fixture key must not already belong to another test")
@@ -1011,7 +1015,7 @@ func TestWalletReferralCallbacksPaymentProofAndRollback(t *testing.T) {
 					common.RDB, common.RedisEnabled = faultRedis, true
 					t.Cleanup(func() {
 						common.RDB, common.RedisEnabled = oldClient, oldEnabled
-						assert.NoError(t, faultRedis.Del(context.Background(), faultKey).Err())
+						assert.NoError(t, faultRedis.Del(context.Background(), ownedKeys...).Err())
 					})
 					require.ErrorContains(t, faultRedis.HGet(t.Context(), faultKey, "Quota").Err(), "WRONGTYPE")
 				case "lookup_failure", "subscription_lookup_failure":
@@ -3509,6 +3513,140 @@ func (*walletFinishFailureHook) AfterProcessPipeline(context.Context, []redis.Cm
 	return nil
 }
 
+func TestWalletManualCompletionAuditBindsOrderAndRequestResult(t *testing.T) {
+	for _, scenario := range []struct {
+		name      string
+		rejected  bool
+		cacheFail bool
+		pat       bool
+	}{
+		{name: "session_success_and_replay"},
+		{name: "access_token_success_and_replay", pat: true},
+		{name: "terminal_order_rejected", rejected: true},
+		{name: "committed_cache_failure_and_retry", cacheFail: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			address := os.Getenv("NEW_API_REFERRAL_REDIS_ADDR")
+			if scenario.cacheFail && address == "" {
+				t.Skip("set NEW_API_REFERRAL_REDIS_ADDR to a disposable isolated Redis instance")
+			}
+			router, _ := walletWebhookFixture(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.UserAccessToken{}, &model.AuditLog{}))
+			require.NoError(t, model.DB.Create(&model.User{Id: 903, Username: "manual_order_admin", AffCode: "w903", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default"}).Error)
+			_, credential := createAccessTokenTestSession(t, 903, "manual-order-audit")
+			authMethod := "session"
+			if scenario.pat {
+				credential, _ = createScopedAccessToken(t, 903, time.Now().Unix()+3600, "billing:write")
+				authMethod = "access_token"
+			}
+			const route = "/api/user/topup/complete"
+			router.POST(route, middleware.AdminAuth(), AdminCompleteTopUp)
+			order := walletWebhookOrder(t, model.PaymentProviderStripe, "audit-"+scenario.name)
+			if scenario.rejected {
+				require.NoError(t, model.UpdatePendingTopUpStatus(order.TradeNo, model.PaymentProviderStripe, common.TopUpStatusFailed))
+			}
+			var client *redis.Client
+			var hook *walletFinishFailureHook
+			if scenario.cacheFail {
+				client = redis.NewClient(&redis.Options{Addr: address, DB: 13, MaxRetries: -1})
+				require.NoError(t, client.Ping(t.Context()).Err())
+				// Only this fixture's wallet, administrator and session keys are owned.
+				keys := []string{
+					"user:902", "wallet:user:fill:{user:902}", "auth:user:fence:{user:902}", "auth:user:version:{user:902}",
+					"user:903", "wallet:user:fill:{user:903}", "auth:user:fence:{user:903}", "auth:user:version:{user:903}",
+					"auth:session:" + common.GenerateHMACWithKey([]byte("user-session-cache-v1:"+common.SessionSecret), "manual-order-audit"),
+				}
+				count, err := client.Exists(t.Context(), keys...).Result()
+				require.NoError(t, err)
+				require.Zero(t, count, "never overwrite another Redis fixture")
+				oldClient, oldRedis := common.RDB, common.RedisEnabled
+				common.RDB, common.RedisEnabled = client, true
+				t.Cleanup(func() {
+					common.RDB, common.RedisEnabled = oldClient, oldRedis
+					assert.NoError(t, client.Del(context.Background(), keys...).Err())
+					assert.NoError(t, client.Close())
+				})
+				cache, err := model.GetUserCache(902)
+				require.NoError(t, err)
+				require.Equal(t, -10, cache.Quota)
+				hook = &walletFinishFailureHook{}
+				hook.fail.Store(true)
+				client.AddHook(hook)
+			}
+			for attempt := range 3 {
+				body := fmt.Sprintf(`{"trade_no":%q,"api_key":"must-not-log-body","user_id":902}`, order.TradeNo)
+				response := accessTokenRequest(router, http.MethodPost, route+"?state=must-not-log-query", credential, "", body)
+				wantSuccess := !scenario.rejected && (!scenario.cacheFail || attempt > 0)
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				assert.Contains(t, response.Body.String(), fmt.Sprintf(`"success":%t`, wantSuccess))
+				var entries []model.AuditLog
+				require.NoError(t, model.LOG_DB.Where("action = ?", "user.topup_complete").Order("id").Find(&entries).Error)
+				require.Len(t, entries, attempt+1, "one operation audit per request, including retries")
+				entry := entries[attempt]
+				assert.Equal(t, 903, entry.UserId)
+				assert.Equal(t, "manual_order_admin", entry.Username)
+				assert.Equal(t, common.RoleAdminUser, entry.ActorRole)
+				assert.Equal(t, model.AuditCategoryOperation, entry.Category)
+				assert.Equal(t, authMethod, entry.AuthMethod)
+				assert.Equal(t, wantSuccess, entry.Success)
+				assert.Equal(t, http.StatusOK, entry.Status)
+				assert.Equal(t, route, entry.Route)
+				assert.NotEmpty(t, entry.RequestId)
+				require.NotNil(t, entry.Other.Op)
+				params, err := common.Marshal(entry.Other.Op.Params)
+				require.NoError(t, err)
+				assert.JSONEq(t, fmt.Sprintf(`{"trade_no":%q}`, order.TradeNo), string(params))
+				require.NotNil(t, entry.Other.AdminInfo)
+				assert.Equal(t, 903, entry.Other.AdminInfo.AdminID)
+				require.NotNil(t, entry.Other.AuditInfo)
+				assert.Equal(t, wantSuccess, entry.Other.AuditInfo.Success)
+				encoded, err := common.Marshal(entries)
+				require.NoError(t, err)
+				for _, secret := range []string{credential, "must-not-log-body", "must-not-log-query"} {
+					assert.NotContains(t, string(encoded), secret)
+				}
+				var invitee, inviter model.User
+				require.NoError(t, model.DB.First(&invitee, 902).Error)
+				require.NoError(t, model.DB.First(&inviter, 901).Error)
+				require.NoError(t, model.DB.First(order, order.Id).Error)
+				var facts []model.ReferralRebate
+				require.NoError(t, model.DB.Find(&facts).Error)
+				if scenario.rejected {
+					assert.Equal(t, common.TopUpStatusFailed, order.Status)
+					assert.Equal(t, -10, invitee.Quota)
+					assert.Equal(t, 7, inviter.AffQuota)
+					assert.Equal(t, 11, inviter.AffHistoryQuota)
+					assert.Empty(t, facts)
+				} else {
+					assert.Equal(t, common.TopUpStatusSuccess, order.Status)
+					assert.Equal(t, 990, invitee.Quota)
+					assert.Equal(t, 107, inviter.AffQuota)
+					assert.Equal(t, 111, inviter.AffHistoryQuota)
+					require.Len(t, facts, 1)
+					assert.EqualValues(t, 1000, facts[0].CreditedQuota)
+					assert.EqualValues(t, 100, facts[0].RewardQuota)
+				}
+				if scenario.cacheFail {
+					cached, err := client.HGet(t.Context(), "user:902", "Quota").Int()
+					require.NoError(t, err)
+					marker, err := client.HExists(t.Context(), "user:902", fmt.Sprintf("WalletCredit:topup:%d", order.Id)).Result()
+					require.NoError(t, err)
+					assert.Equal(t, attempt == 0, marker)
+					if attempt == 0 {
+						assert.Equal(t, -10, cached)
+					} else {
+						assert.Equal(t, 990, cached)
+					}
+					hook.fail.Store(false)
+				}
+			}
+			if scenario.cacheFail {
+				assert.EqualValues(t, 1, hook.blocked.Load())
+			}
+		})
+	}
+}
+
 func TestWalletCallbacksRetryPostCommitCacheFailure(t *testing.T) {
 	address := os.Getenv("NEW_API_REFERRAL_REDIS_ADDR")
 	if address == "" {
@@ -3529,14 +3667,15 @@ func TestWalletCallbacksRetryPostCommitCacheFailure(t *testing.T) {
 			client := redis.NewClient(&redis.Options{Addr: address, DB: 13, MaxRetries: -1})
 			require.NoError(t, client.Ping(t.Context()).Err())
 			cacheKey, fillKey := "user:902", "wallet:user:fill:{user:902}"
-			count, err := client.Exists(t.Context(), cacheKey, fillKey).Result()
+			ownedKeys := []string{cacheKey, fillKey, "auth:user:fence:{user:902}", "auth:user:version:{user:902}"}
+			count, err := client.Exists(t.Context(), ownedKeys...).Result()
 			require.NoError(t, err)
 			require.Zero(t, count, "never overwrite another Redis fixture")
 			oldClient, oldRedis := common.RDB, common.RedisEnabled
 			common.RDB, common.RedisEnabled = client, true
 			t.Cleanup(func() {
 				common.RDB, common.RedisEnabled = oldClient, oldRedis
-				assert.NoError(t, client.Del(context.Background(), cacheKey, fillKey).Err())
+				assert.NoError(t, client.Del(context.Background(), ownedKeys...).Err())
 				assert.NoError(t, client.Close())
 			})
 			cache, err := model.GetUserCache(902)
