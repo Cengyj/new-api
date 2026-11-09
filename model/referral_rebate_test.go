@@ -630,7 +630,7 @@ func TestReferralLegacyCompletionRecordsActualQuotaWithoutRepricingReplay(t *tes
 			t.Cleanup(func() { common.QuotaPerUnit = previousUnit })
 			order := TopUp{UserId: user.Id, TradeNo: "legacy-actual-credit", Amount: 100, Money: 90, PaymentProvider: provider, Status: common.TopUpStatusPending}
 			require.NoError(t, DB.Create(&order).Error, "legacy rows have no creation-time credit snapshot")
-			_, actual, duplicate, err := settleWalletTopUp(order.TradeNo, provider, "", "", "")
+			_, actual, duplicate, err := settleWalletTopUp(order.TradeNo, provider, "", "", "", TopUpSettlementAudit{Source: "payment"})
 			require.NoError(t, err)
 			assert.False(t, duplicate)
 			expected := 200
@@ -644,18 +644,18 @@ func TestReferralLegacyCompletionRecordsActualQuotaWithoutRepricingReplay(t *tes
 			require.NotNil(t, order.CreditedQuota)
 			assert.Equal(t, expected, *order.CreditedQuota)
 			common.QuotaPerUnit = 3
-			_, actual, duplicate, err = settleWalletTopUp(order.TradeNo, provider, "", "", "")
+			_, actual, duplicate, err = settleWalletTopUp(order.TradeNo, provider, "", "", "", TopUpSettlementAudit{Source: "payment"})
 			require.NoError(t, err)
 			assert.True(t, duplicate)
 			assert.Equal(t, expected, actual, "commit recovery must use the exact successful credit")
-			require.NoError(t, ManualCompleteTopUp(order.TradeNo, ""))
+			require.NoError(t, ManualCompleteTopUp(order.TradeNo, "", TopUpSettlementOperator{ID: 999, Username: "manual_fixture_admin", Role: common.RoleAdminUser, AuthMethod: "session", RequestID: "manual-fixture-request"}))
 			require.NoError(t, DB.First(&user, user.Id).Error)
 			assert.Equal(t, expected, user.Quota)
 			// Already-successful pre-feature rows stay untouched and are never
 			// assigned a made-up amount for cache recovery or retroactive awards.
 			oldSuccess := TopUp{UserId: user.Id, TradeNo: "legacy-already-success", Amount: 100, Money: 90, PaymentProvider: provider, Status: common.TopUpStatusSuccess, CompleteTime: 100}
 			require.NoError(t, DB.Create(&oldSuccess).Error)
-			_, actual, duplicate, err = settleWalletTopUp(oldSuccess.TradeNo, provider, "", "", "")
+			_, actual, duplicate, err = settleWalletTopUp(oldSuccess.TradeNo, provider, "", "", "", TopUpSettlementAudit{Source: "payment"})
 			require.NoError(t, err)
 			assert.True(t, duplicate)
 			assert.Zero(t, actual)

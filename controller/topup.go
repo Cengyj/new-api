@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
@@ -660,8 +661,41 @@ func GetAllTopUps(c *gin.Context) {
 		return
 	}
 
+	// Billing history exposes the settlement source. Operator details follow the
+	// audit permission and token scope, including frozen root-actor visibility.
+	viewerRole := c.GetInt("role")
+	canReadOperator := authz.Can(c.GetInt("id"), viewerRole, authz.AuditRead)
+	if c.GetBool("use_access_token") && !c.GetBool("access_token_legacy") {
+		canReadOperator = canReadOperator && service.AccessTokenScopeGranted(c.GetStringSlice("access_token_scopes"), service.AccessTokenScopeOf(authz.AuditRead))
+	}
+	type settlementView struct {
+		Source           string                         `json:"source"`
+		Operator         *model.TopUpSettlementOperator `json:"operator,omitempty"`
+		OperatorRedacted bool                           `json:"operator_redacted,omitempty"`
+	}
+	type adminTopUp struct {
+		*model.TopUp
+		Settlement *settlementView `json:"settlement"`
+	}
+	items := make([]adminTopUp, 0, len(topups))
+	for _, topUp := range topups {
+		settlement, err := topUp.GetSettlementAudit()
+		if err != nil {
+			common.ApiErrorT(c, "Database error, please contact the administrator")
+			return
+		}
+		var view *settlementView
+		if settlement != nil {
+			view = &settlementView{Source: settlement.Source, Operator: settlement.Operator}
+			if view.Operator != nil && (!canReadOperator || (viewerRole != common.RoleRootUser && view.Operator.Role == common.RoleRootUser)) {
+				view.Operator = nil
+				view.OperatorRedacted = true
+			}
+		}
+		items = append(items, adminTopUp{TopUp: topUp, Settlement: view})
+	}
 	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(topups)
+	pageInfo.SetItems(items)
 	common.ApiSuccess(c, pageInfo)
 }
 
@@ -675,6 +709,16 @@ func AdminCompleteTopUp(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil || req.TradeNo == "" {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
+	}
+	requestID := c.GetString(common.RequestIdKey)
+	if requestID == "" {
+		requestID = common.NewRequestId()
+		c.Set(common.RequestIdKey, requestID)
+		c.Header(common.RequestIdKey, requestID)
+	}
+	operator := model.TopUpSettlementOperator{
+		ID: c.GetInt("id"), Username: c.GetString("username"), Role: c.GetInt("role"),
+		AuthMethod: auditAuthMethod(c), RequestID: requestID,
 	}
 	requestSucceeded := false
 	defer func() {
@@ -693,7 +737,7 @@ func AdminCompleteTopUp(c *gin.Context) {
 	LockOrder(req.TradeNo)
 	defer UnlockOrder(req.TradeNo)
 
-	if err := model.ManualCompleteTopUp(req.TradeNo, c.ClientIP()); err != nil {
+	if err := model.ManualCompleteTopUp(req.TradeNo, c.ClientIP(), operator); err != nil {
 		common.ApiError(c, err)
 		return
 	}

@@ -628,7 +628,7 @@ func TestReferralCrossProcessWorker(t *testing.T) {
 	case "callback":
 		_, err = RechargeEpay(tradeNo, "alipay", "127.0.0.1")
 	case "manual":
-		err = ManualCompleteTopUp(tradeNo, "127.0.0.1")
+		err = ManualCompleteTopUp(tradeNo, "127.0.0.1", TopUpSettlementOperator{ID: 999, Username: "manual_fixture_admin", Role: common.RoleAdminUser, AuthMethod: "session", RequestID: "manual-fixture-request"})
 	case "transfer":
 		quota, parseErr := strconv.Atoi(os.Getenv("REFERRAL_PROCESS_QUOTA"))
 		require.NoError(t, parseErr)
@@ -764,7 +764,7 @@ func TestReferralWalletSettlementAndTransferAcrossProcesses(t *testing.T) {
 			duplicate, err := RechargeEpay(order.TradeNo, "alipay", "127.0.0.1")
 			require.NoError(t, err)
 			assert.True(t, duplicate)
-			require.NoError(t, ManualCompleteTopUp(order.TradeNo, "127.0.0.1"))
+			require.NoError(t, ManualCompleteTopUp(order.TradeNo, "127.0.0.1", TopUpSettlementOperator{ID: 999, Username: "manual_fixture_admin", Role: common.RoleAdminUser, AuthMethod: "session", RequestID: "manual-fixture-request"}))
 			require.NoError(t, db.First(&invitee, invitee.Id).Error)
 			require.NoError(t, db.First(&owner, owner.Id).Error)
 			require.NoError(t, db.First(&order, order.Id).Error)
@@ -1574,7 +1574,7 @@ func TestReferralColdCacheAndWalletCreditAcrossProcesses(t *testing.T) {
 					// Use the wallet transaction boundary directly: a post-commit
 					// log's username read could refill quota 107 and mask a stale
 					// publication bug by making the hash already contain Quota.
-					_, settledQuota, duplicate, err := settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "alipay", "", "")
+					_, settledQuota, duplicate, err := settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "alipay", "", "", TopUpSettlementAudit{Source: "payment"})
 					require.NoError(t, err)
 					require.False(t, duplicate)
 					require.Equal(t, 100, settledQuota)

@@ -130,6 +130,8 @@ export function auditFieldLabel(key: string, t: TFunction): string {
       return t('Username')
     case 'target_user_id':
       return t('User ID')
+    case 'trade_no':
+      return t('Order number')
     case 'plan_id':
       return t('Plan ID')
     case 'plan_title':

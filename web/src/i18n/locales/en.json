@@ -3638,6 +3638,7 @@
     "Manage your security settings and account access": "Manage your security settings and account access",
     "Mantle (Messages API)": "Mantle (Messages API)",
     "Manual Disabled": "Manual Disabled",
+    "Manual top-up completion request": "Manual top-up completion request",
     "Map fields from the user info response to local user attributes. Supports nested paths (e.g. ocs.data.id).": "Map fields from the user info response to local user attributes. Supports nested paths (e.g. ocs.data.id).",
     "Map model identifiers to Gemini API versions. A `default` entry applies when no specific match is found.": "Map model identifiers to Gemini API versions. A `default` entry applies when no specific match is found.",
     "Map request model names to actual provider model names (JSON format)": "Map request model names to actual provider model names (JSON format)",

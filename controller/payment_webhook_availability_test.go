@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
@@ -29,10 +30,12 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -43,6 +46,8 @@ import (
 	waffonet "github.com/waffo-com/waffo-go/net"
 	"github.com/waffo-com/waffo-go/types/order"
 	waffoutils "github.com/waffo-com/waffo-go/utils"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -676,12 +681,20 @@ func walletWebhookFixture(t *testing.T) (*gin.Engine, *waffoutils.KeyPair) {
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
+	router.Use(middleware.RequestId())
 	router.POST("/epay", EpayNotify)
 	router.POST("/stripe", StripeWebhook)
 	router.POST("/creem", CreemWebhook)
 	router.POST("/waffo", WaffoWebhook)
 	router.POST("/waffo_pancake/:env", WaffoPancakeWebhook)
-	router.POST("/manual", AdminCompleteTopUp)
+	// Direct handler fixtures supply an explicit server identity. Authorization
+	// itself is exercised by the AdminAuth/session/PAT regression cases.
+	router.POST("/manual", func(c *gin.Context) {
+		c.Set("id", 999)
+		c.Set("username", "manual_fixture_admin")
+		c.Set("role", common.RoleAdminUser)
+		c.Next()
+	}, AdminCompleteTopUp)
 	return router, keys
 }
 
@@ -941,7 +954,7 @@ func TestWalletReferralSignedCallbacksAndManualCompletion(t *testing.T) {
 					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 					assert.NotContains(t, recorder.Body.String(), "fail")
 				}
-				require.NoError(t, model.ManualCompleteTopUp(order.TradeNo, "127.0.0.1"))
+				require.NoError(t, model.ManualCompleteTopUp(order.TradeNo, "127.0.0.1", model.TopUpSettlementOperator{ID: 999, Username: "manual_fixture_admin", Role: common.RoleAdminUser, AuthMethod: "session", RequestID: "manual-fixture-request"}))
 				// A late failure cannot overwrite success or clear its snapshot.
 				order.Status = common.TopUpStatusFailed
 				require.ErrorIs(t, order.Update(), model.ErrTopUpStatusInvalid)
@@ -956,6 +969,18 @@ func TestWalletReferralSignedCallbacksAndManualCompletion(t *testing.T) {
 				require.Len(t, facts, 1)
 				assert.EqualValues(t, 1000, facts[0].CreditedQuota)
 				assert.EqualValues(t, 100, facts[0].RewardQuota)
+				require.NoError(t, model.DB.First(order, order.Id).Error)
+				settlement, err := order.GetSettlementAudit()
+				require.NoError(t, err)
+				require.NotNil(t, settlement)
+				if manualFirst {
+					assert.Equal(t, "manual", settlement.Source)
+					require.NotNil(t, settlement.Operator)
+					assert.Equal(t, 999, settlement.Operator.ID)
+				} else {
+					assert.Equal(t, "payment", settlement.Source)
+					assert.Nil(t, settlement.Operator)
+				}
 				reloaded, err := model.GetTopUpByTradeNoWithError(order.TradeNo)
 				require.NoError(t, err)
 				assert.Equal(t, common.TopUpStatusSuccess, reloaded.Status)
@@ -3098,7 +3123,7 @@ func TestWalletTerminalNotificationsRetryDatabaseFailures(t *testing.T) {
 				require.NoError(t, model.DB.First(&order, order.Id).Error)
 				assert.Equal(t, tc.wantStatus, order.Status)
 				assert.Zero(t, order.CompleteTime)
-				assert.ErrorContains(t, model.ManualCompleteTopUp(order.TradeNo, "127.0.0.1"), "Order is not pending payment and cannot be completed")
+				assert.ErrorContains(t, model.ManualCompleteTopUp(order.TradeNo, "127.0.0.1", model.TopUpSettlementOperator{ID: 999, Username: "manual_fixture_admin", Role: common.RoleAdminUser, AuthMethod: "session", RequestID: "manual-fixture-request"}), "Order is not pending payment and cannot be completed")
 				var user model.User
 				require.NoError(t, model.DB.First(&user, 902).Error)
 				assert.Equal(t, -10, user.Quota)
@@ -3138,7 +3163,7 @@ func TestWalletTerminalNotificationsAcknowledgeUnrelatedAndFinalOrders(t *testin
 					require.Equal(t, http.StatusOK, recorder.Code)
 					wantQuota, wantFacts = 990, 1
 				case "manually_completed":
-					require.NoError(t, model.ManualCompleteTopUp(order.TradeNo, "127.0.0.1"))
+					require.NoError(t, model.ManualCompleteTopUp(order.TradeNo, "127.0.0.1", model.TopUpSettlementOperator{ID: 999, Username: "manual_fixture_admin", Role: common.RoleAdminUser, AuthMethod: "session", RequestID: "manual-fixture-request"}))
 					wantQuota, wantFacts = 990, 1
 				}
 				require.NoError(t, model.DB.First(order, order.Id).Error)
@@ -3511,6 +3536,607 @@ func (*walletFinishFailureHook) BeforeProcessPipeline(ctx context.Context, _ []r
 }
 func (*walletFinishFailureHook) AfterProcessPipeline(context.Context, []redis.Cmder) error {
 	return nil
+}
+
+func TestWalletSettlementResponsibilityRespectsAuditVisibility(t *testing.T) {
+	router, keys := walletWebhookFixture(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.UserAccessToken{}, &model.CasbinRule{}, &model.AuthzRole{}))
+	previousMaster := common.IsMasterNode
+	common.IsMasterNode = true
+	t.Cleanup(func() { common.IsMasterNode = previousMaster })
+	require.NoError(t, authz.Init(model.DB))
+	require.NoError(t, model.EnsureLegacyAccessTokenRetireAt(time.Now().Unix()))
+	sessions := make(map[int]string)
+	for _, user := range []model.User{
+		{Id: 903, Username: "settlement_root_actor", Role: common.RoleRootUser},
+		{Id: 904, Username: "settlement_admin_actor", Role: common.RoleAdminUser},
+		{Id: 905, Username: "billing_only_viewer", Role: common.RoleAdminUser},
+		{Id: 906, Username: "audit_granted_viewer", Role: common.RoleAdminUser},
+		{Id: 907, Username: "root_viewer", Role: common.RoleRootUser},
+	} {
+		user.Status, user.AuthVersion, user.Group = common.UserStatusEnabled, 1, "default"
+		user.AffCode = fmt.Sprintf("visibility-%d", user.Id)
+		require.NoError(t, model.DB.Create(&user).Error)
+		_, sessions[user.Id] = createAccessTokenTestSession(t, user.Id, fmt.Sprintf("settlement-visibility-%d", user.Id))
+	}
+	require.NoError(t, authz.SetUserPermissions(906, authz.PermissionsMap{authz.ResourceAudit: {authz.ActionRead: true}}))
+	router.POST("/api/user/topup/complete", middleware.AdminAuth(), AdminCompleteTopUp)
+	router.GET("/api/user/topup", middleware.AdminAuth(), GetAllTopUps)
+	originals := make(map[string]*model.TopUpSettlementAudit)
+	for _, actorID := range []int{903, 904} {
+		order := walletWebhookOrder(t, model.PaymentProviderEpay, fmt.Sprintf("visibility-manual-%d", actorID))
+		response := accessTokenRequest(router, http.MethodPost, "/api/user/topup/complete", sessions[actorID], "", fmt.Sprintf(`{"trade_no":%q}`, order.TradeNo))
+		require.Contains(t, response.Body.String(), `"success":true`)
+		require.NoError(t, model.DB.First(order, order.Id).Error)
+		snapshot, err := order.GetSettlementAudit()
+		require.NoError(t, err)
+		require.NotNil(t, snapshot)
+		require.NotNil(t, snapshot.Operator)
+		originals[order.TradeNo] = snapshot
+	}
+	// Actor visibility uses the frozen role, even after the account is demoted.
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 903).Update("role", common.RoleAdminUser).Error)
+	payment := walletWebhookOrder(t, model.PaymentProviderEpay, "visibility-payment")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, walletWebhookRequest(t, keys, model.PaymentProviderEpay, payment.TradeNo, "100", true))
+	require.Equal(t, "success", response.Body.String())
+	legacy := walletWebhookOrder(t, model.PaymentProviderEpay, "visibility-legacy")
+	require.NoError(t, model.DB.Model(legacy).Update("status", common.TopUpStatusSuccess).Error)
+	for _, scenario := range []struct {
+		name              string
+		viewer            int
+		scopes            []string
+		legacy            bool
+		seeAdmin, seeRoot bool
+	}{
+		{name: "session_without_audit", viewer: 905},
+		{name: "own_operator_without_audit", viewer: 904},
+		{name: "session_with_audit", viewer: 906, seeAdmin: true},
+		{name: "scoped_pat_without_audit_scope", viewer: 906, scopes: []string{"billing:read"}},
+		{name: "scoped_pat_without_user_grant", viewer: 905, scopes: []string{"billing:read", "audit:read"}},
+		{name: "scoped_pat_with_audit", viewer: 906, scopes: []string{"billing:read", "audit:read"}, seeAdmin: true},
+		{name: "root_session", viewer: 907, seeAdmin: true, seeRoot: true},
+		{name: "root_scoped_pat_without_audit_scope", viewer: 907, scopes: []string{"billing:read"}},
+		{name: "root_scoped_pat_with_audit", viewer: 907, scopes: []string{"billing:read", "audit:read"}, seeAdmin: true, seeRoot: true},
+		{name: "legacy_pat_with_audit", viewer: 906, legacy: true, seeAdmin: true},
+		{name: "legacy_pat_without_user_grant", viewer: 905, legacy: true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			credential := sessions[scenario.viewer]
+			if scenario.scopes != nil {
+				credential, _ = createScopedAccessToken(t, scenario.viewer, time.Now().Unix()+3600, scenario.scopes...)
+			}
+			if scenario.legacy {
+				credential = fmt.Sprintf("legacy-visibility-%d", scenario.viewer)
+				require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", scenario.viewer).Update("access_token", credential).Error)
+			}
+			for _, path := range []string{"/api/user/topup", "/api/user/topup?keyword=" + url.QueryEscape("visibility-%")} {
+				response := accessTokenRequest(router, http.MethodGet, path, credential, "", "")
+				require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				var result struct {
+					Success bool
+					Data    struct {
+						Items []struct {
+							TradeNo    string `json:"trade_no"`
+							Settlement *struct {
+								Source           string                         `json:"source"`
+								Operator         *model.TopUpSettlementOperator `json:"operator"`
+								OperatorRedacted bool                           `json:"operator_redacted"`
+							} `json:"settlement"`
+						}
+					}
+				}
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+				require.True(t, result.Success, response.Body.String())
+				require.Len(t, result.Data.Items, 4, "billing history remains available without audit-detail permission")
+				for _, item := range result.Data.Items {
+					if item.TradeNo == legacy.TradeNo {
+						assert.Nil(t, item.Settlement, "historical unknown source must remain distinct from redacted responsibility")
+						continue
+					}
+					require.NotNil(t, item.Settlement)
+					if item.TradeNo == payment.TradeNo {
+						assert.Equal(t, "payment", item.Settlement.Source)
+						assert.Nil(t, item.Settlement.Operator)
+						assert.False(t, item.Settlement.OperatorRedacted)
+						continue
+					}
+					original := originals[item.TradeNo]
+					require.NotNil(t, original)
+					assert.Equal(t, "manual", item.Settlement.Source)
+					visible := scenario.seeAdmin
+					if original.Operator.Role == common.RoleRootUser {
+						visible = scenario.seeRoot
+					}
+					assert.Equal(t, !visible, item.Settlement.OperatorRedacted)
+					if visible {
+						assert.Equal(t, original.Operator, item.Settlement.Operator)
+					} else {
+						assert.Nil(t, item.Settlement.Operator, "billing:read cannot bypass audit permissions or root-actor visibility")
+						assert.NotContains(t, response.Body.String(), original.Operator.Username)
+						assert.NotContains(t, response.Body.String(), original.Operator.RequestID)
+					}
+				}
+				assert.NotContains(t, response.Body.String(), `"settlement_audit":`)
+			}
+		})
+	}
+	for tradeNo, original := range originals {
+		var order model.TopUp
+		require.NoError(t, model.DB.Where("trade_no = ?", tradeNo).First(&order).Error)
+		snapshot, err := order.GetSettlementAudit()
+		require.NoError(t, err)
+		assert.Equal(t, original, snapshot, "redaction changes only the response, never the authoritative responsibility")
+	}
+}
+
+func TestWalletSettlementResponsibilitySurvivesLogFailure(t *testing.T) {
+	for _, scenario := range []string{"manual_session", "manual_access_token", "payment_first", "manual_first_cache_failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			router, keys := walletWebhookFixture(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.UserAccessToken{}, &model.CasbinRule{}, &model.AuthzRole{}))
+			previousMaster := common.IsMasterNode
+			common.IsMasterNode = true
+			t.Cleanup(func() { common.IsMasterNode = previousMaster })
+			require.NoError(t, authz.Init(model.DB))
+			require.NoError(t, authz.SetUserPermissions(903, authz.PermissionsMap{authz.ResourceAudit: {authz.ActionRead: true}}))
+			require.NoError(t, model.DB.Create(&model.User{Id: 903, Username: "settlement_admin", AffCode: "w903", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default"}).Error)
+			_, credential := createAccessTokenTestSession(t, 903, "settlement-responsibility")
+			authMethod := "session"
+			if scenario == "manual_access_token" {
+				credential, _ = createScopedAccessToken(t, 903, time.Now().Unix()+3600, "billing:write", "billing:read", "audit:read")
+				authMethod = "access_token"
+			}
+			const route = "/api/user/topup/complete"
+			router.POST(route, middleware.AdminAuth(), AdminCompleteTopUp)
+			router.GET("/api/user/topup", middleware.AdminAuth(), GetAllTopUps)
+			router.GET("/api/user/topup/self", middleware.UserAuth(), GetUserTopUps)
+			order := walletWebhookOrder(t, model.PaymentProviderEpay, "settlement-"+scenario)
+			require.NoError(t, model.DB.Model(order).Update("create_time", time.Now().Add(-45*24*time.Hour).Unix()).Error)
+			dialect := string(common.MainDatabaseType())
+			logDB, _ := newAuditTestDatabase(t, dialect, os.Getenv("TEST_"+strings.ToUpper(dialect)+"_DSN"))
+			require.NoError(t, logDB.AutoMigrate(&model.Log{}, &model.AuditLog{}))
+			logConnection, err := logDB.DB()
+			require.NoError(t, err)
+			mainConnection, err := model.DB.DB()
+			require.NoError(t, err)
+			require.NotSame(t, mainConnection, logConnection, "fail only the independently configured log database")
+			model.LOG_DB = logDB
+			require.NoError(t, logConnection.Close())
+			require.NoError(t, mainConnection.PingContext(t.Context()))
+			var client *redis.Client
+			var hook *walletFinishFailureHook
+			if scenario == "manual_first_cache_failure" {
+				address := os.Getenv("NEW_API_REFERRAL_REDIS_ADDR")
+				if address == "" {
+					t.Skip("set NEW_API_REFERRAL_REDIS_ADDR to a disposable isolated Redis instance")
+				}
+				client = redis.NewClient(&redis.Options{Addr: address, DB: 13, MaxRetries: -1})
+				require.NoError(t, client.Ping(t.Context()).Err())
+				owned := []string{"user:902", "wallet:user:fill:{user:902}", "auth:user:fence:{user:902}", "auth:user:version:{user:902}", "user:903", "wallet:user:fill:{user:903}", "auth:user:fence:{user:903}", "auth:user:version:{user:903}", "auth:session:" + common.GenerateHMACWithKey([]byte("user-session-cache-v1:"+common.SessionSecret), "settlement-responsibility"), "auth:session:" + common.GenerateHMACWithKey([]byte("user-session-cache-v1:"+common.SessionSecret), "settlement-self-reader")}
+				exists, err := client.Exists(t.Context(), owned...).Result()
+				require.NoError(t, err)
+				require.Zero(t, exists, "do not overwrite another Redis fixture")
+				previousClient, previousRedis := common.RDB, common.RedisEnabled
+				common.RDB, common.RedisEnabled = client, true
+				t.Cleanup(func() {
+					common.RDB, common.RedisEnabled = previousClient, previousRedis
+					assert.NoError(t, client.Del(context.Background(), owned...).Err())
+					assert.NoError(t, client.Close())
+				})
+				cache, err := model.GetUserCache(902)
+				require.NoError(t, err)
+				require.Equal(t, -10, cache.Quota)
+				hook = &walletFinishFailureHook{}
+				hook.fail.Store(true)
+				client.AddHook(hook)
+			}
+			if scenario == "payment_first" {
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, walletWebhookRequest(t, keys, model.PaymentProviderEpay, order.TradeNo, "100", true))
+				require.Equal(t, "success", response.Body.String())
+			}
+			firstRequestID := ""
+			var firstSnapshot string
+			for attempt := range 2 {
+				response := accessTokenRequest(router, http.MethodPost, route, credential, "", fmt.Sprintf(`{"trade_no":%q,"operator_id":999,"api_key":"untrusted-body-secret"}`, order.TradeNo))
+				require.Equal(t, http.StatusOK, response.Code)
+				wantSuccess := hook == nil || attempt > 0
+				assert.Contains(t, response.Body.String(), fmt.Sprintf(`"success":%t`, wantSuccess))
+				if attempt == 0 {
+					firstRequestID = response.Header().Get(common.RequestIdKey)
+				}
+				require.NotEmpty(t, firstRequestID)
+				var row map[string]any
+				require.NoError(t, model.DB.Table("top_ups").Where("id = ?", order.Id).Take(&row).Error)
+				stored := row["settlement_audit"]
+				if !assert.NotNil(t, stored, "committed funds must retain their first settlement source and responsible operator in the main database") {
+					return
+				}
+				encoded := fmt.Sprint(stored)
+				if value, ok := stored.([]byte); ok {
+					encoded = string(value)
+				}
+				var snapshot struct {
+					Source   string `json:"source"`
+					Operator *struct {
+						ID         int    `json:"id"`
+						Username   string `json:"username"`
+						Role       int    `json:"role"`
+						AuthMethod string `json:"auth_method"`
+						RequestID  string `json:"request_id"`
+					} `json:"operator"`
+				}
+				require.NoError(t, common.UnmarshalJsonStr(encoded, &snapshot))
+				if scenario == "payment_first" {
+					assert.Equal(t, "payment", snapshot.Source)
+					assert.Nil(t, snapshot.Operator, "a later manual retry cannot claim responsibility for a payment callback")
+				} else {
+					assert.Equal(t, "manual", snapshot.Source)
+					require.NotNil(t, snapshot.Operator)
+					assert.Equal(t, 903, snapshot.Operator.ID)
+					assert.Equal(t, "settlement_admin", snapshot.Operator.Username)
+					assert.Equal(t, common.RoleAdminUser, snapshot.Operator.Role)
+					assert.Equal(t, authMethod, snapshot.Operator.AuthMethod)
+					assert.Equal(t, firstRequestID, snapshot.Operator.RequestID)
+				}
+				if attempt == 0 {
+					firstSnapshot = encoded
+				} else {
+					assert.Equal(t, firstSnapshot, encoded, "retry must not replace the original financial responsibility")
+				}
+				assert.NotContains(t, encoded, credential)
+				assert.NotContains(t, encoded, "untrusted-body-secret")
+				var invitee, inviter model.User
+				require.NoError(t, model.DB.First(&invitee, 902).Error)
+				require.NoError(t, model.DB.First(&inviter, 901).Error)
+				assert.Equal(t, 990, invitee.Quota)
+				assert.Equal(t, 107, inviter.AffQuota)
+				var facts []model.ReferralRebate
+				require.NoError(t, model.DB.Find(&facts).Error)
+				require.Len(t, facts, 1)
+				assert.EqualValues(t, 100, facts[0].RewardQuota)
+				if hook != nil {
+					cached, err := client.HGet(t.Context(), "user:902", "Quota").Int()
+					require.NoError(t, err)
+					if attempt == 0 {
+						assert.Equal(t, -10, cached)
+					} else {
+						assert.Equal(t, 990, cached)
+					}
+					hook.fail.Store(false)
+				}
+			}
+			for _, path := range []string{"/api/user/topup", "/api/user/topup?keyword=" + order.TradeNo} {
+				response := accessTokenRequest(router, http.MethodGet, path, credential, "", "")
+				assert.Contains(t, response.Body.String(), `"settlement":`, "an operator can query responsibility while the log database is unavailable")
+				assert.Contains(t, response.Body.String(), firstSnapshot)
+			}
+			require.NoError(t, model.DB.First(order, order.Id).Error)
+			encoded, err := common.Marshal(order)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encoded), "settlement_audit", "ordinary TopUp serialization must not expose administrator metadata")
+			assert.NotContains(t, string(encoded), firstRequestID)
+			// Old orders remain searchable to administrators. For the self endpoint's
+			// normal 30-day window, also verify an actually visible settled order.
+			require.NoError(t, model.DB.Model(order).Update("create_time", time.Now().Unix()).Error)
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 902).Updates(map[string]any{"role": common.RoleCommonUser, "auth_version": 1, "group": "default"}).Error)
+			_, userCredential := createAccessTokenTestSession(t, 902, "settlement-self-reader")
+			for _, path := range []string{"/api/user/topup/self", "/api/user/topup/self?keyword=" + order.TradeNo} {
+				response := accessTokenRequest(router, http.MethodGet, path, userCredential, "", "")
+				assert.Contains(t, response.Body.String(), order.TradeNo)
+				assert.NotContains(t, response.Body.String(), `"settlement":`)
+				assert.NotContains(t, response.Body.String(), `"settlement_audit":`)
+				assert.NotContains(t, response.Body.String(), "settlement_admin")
+				assert.NotContains(t, response.Body.String(), firstRequestID)
+			}
+			denied := accessTokenRequest(router, http.MethodGet, "/api/user/topup", userCredential, "", "")
+			assert.Equal(t, http.StatusForbidden, denied.Code)
+			writeOnly, _ := createScopedAccessToken(t, 903, time.Now().Unix()+3600, "billing:write")
+			denied = accessTokenRequest(router, http.MethodGet, "/api/user/topup", writeOnly, "", "")
+			assert.Equal(t, http.StatusForbidden, denied.Code)
+		})
+	}
+}
+
+// This fixture interrupts only a transaction that actually updated an order.
+// Auth/session writes cannot accidentally trigger the post-settlement failure.
+type walletSettlementCommitPool struct {
+	gorm.ConnPool
+	afterSettlement func() error
+}
+
+func (pool walletSettlementCommitPool) BeginTx(ctx context.Context, options *sql.TxOptions) (gorm.ConnPool, error) {
+	tx, err := pool.ConnPool.(gorm.TxBeginner).BeginTx(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &walletSettlementCommitTx{Tx: tx, afterSettlement: pool.afterSettlement}, nil
+}
+
+type walletSettlementCommitTx struct {
+	*sql.Tx
+	afterSettlement func() error
+	settled         bool
+}
+
+func (tx *walletSettlementCommitTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	result, err := tx.Tx.ExecContext(ctx, query, args...)
+	if err == nil && strings.HasPrefix(strings.ToUpper(strings.TrimSpace(query)), "UPDATE ") && strings.Contains(query, "top_ups") && strings.Contains(query, "status") {
+		tx.settled = true
+	}
+	return result, err
+}
+
+func (tx *walletSettlementCommitTx) Commit() error {
+	if err := tx.Tx.Commit(); err != nil {
+		return err
+	}
+	if tx.settled {
+		return tx.afterSettlement()
+	}
+	return nil
+}
+
+func TestWalletSettlementResponsibilitySurvivesProcessExit(t *testing.T) {
+	if dsn := os.Getenv("NEW_API_SETTLEMENT_CRASH_WORKER_DSN"); dsn != "" {
+		kind := os.Getenv("NEW_API_PAYMENT_TEST_DIALECT")
+		var dialector gorm.Dialector
+		switch kind {
+		case "mysql":
+			require.Contains(t, dsn, "/newapi_audit_")
+			dialector = mysql.Open(dsn)
+		case "postgres":
+			require.Contains(t, dsn, "/newapi_audit_")
+			dialector = postgres.Open(dsn)
+		case "sqlite":
+			require.Contains(t, dsn, "TestWalletSettlementResponsibilitySurvivesProcessExit")
+			dialector = sqlite.Open(dsn)
+		default:
+			t.Fatalf("unexpected isolated worker dialect %q", kind)
+		}
+		db, err := gorm.Open(dialector, &gorm.Config{})
+		require.NoError(t, err)
+		model.DB, model.LOG_DB = db, db
+		common.SetDatabaseTypes(common.DatabaseType(kind), common.DatabaseType(kind))
+		common.RedisEnabled, common.QuotaPerUnit = false, 10
+		confirmPaymentComplianceForTest(t)
+		_, credential := createAccessTokenTestSession(t, 903, "settlement-crash-worker")
+		wrapped := db.Session(&gorm.Session{NewDB: true})
+		wrapped.Statement = &gorm.Statement{DB: wrapped, Context: t.Context(), ConnPool: walletSettlementCommitPool{ConnPool: db.Statement.ConnPool, afterSettlement: func() error {
+			// Real SQL commit has returned. Exit before ManualCompleteTopUp can
+			// return or any handler defer can write the request audit.
+			os.Exit(97)
+			return nil
+		}}}
+		model.DB = wrapped
+		router := gin.New()
+		router.Use(middleware.RequestId())
+		router.POST("/api/user/topup/complete", middleware.AdminAuth(), AdminCompleteTopUp)
+		response := accessTokenRequest(router, http.MethodPost, "/api/user/topup/complete", credential, "", `{"trade_no":"settlement-process-exit"}`)
+		t.Fatalf("settlement worker did not exit after SQL commit: %s", response.Body.String())
+	}
+	router, _ := walletWebhookFixture(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.UserAccessToken{}))
+	require.NoError(t, model.DB.Create(&model.User{Id: 903, Username: "original_admin", AffCode: "w903", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default"}).Error)
+	require.NoError(t, model.DB.Create(&model.User{Id: 904, Username: "retry_admin", AffCode: "w904", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default"}).Error)
+	order := walletWebhookOrder(t, model.PaymentProviderEpay, "settlement-process-exit")
+	var dsn string
+	switch dialector := model.DB.Dialector.(type) {
+	case *mysql.Dialector:
+		dsn = dialector.DSN
+	case *postgres.Dialector:
+		dsn = dialector.DSN
+	case *sqlite.Dialector:
+		dsn = dialector.DSN
+	default:
+		t.Fatalf("unexpected test database %T", dialector)
+	}
+	command := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestWalletSettlementResponsibilitySurvivesProcessExit$", "-test.count=1")
+	command.Env = append(os.Environ(), "NEW_API_SETTLEMENT_CRASH_WORKER_DSN="+dsn, "NEW_API_PAYMENT_TEST_DIALECT="+string(common.MainDatabaseType()))
+	output, err := command.CombinedOutput()
+	var exit *exec.ExitError
+	require.ErrorAs(t, err, &exit, "%s", output)
+	require.Equal(t, 97, exit.ExitCode(), "%s", output)
+	require.NoError(t, model.DB.First(order, order.Id).Error)
+	require.Equal(t, common.TopUpStatusSuccess, order.Status)
+	snapshot, err := order.GetSettlementAudit()
+	require.NoError(t, err)
+	require.NotNil(t, snapshot)
+	require.NotNil(t, snapshot.Operator)
+	assert.Equal(t, "manual", snapshot.Source)
+	assert.Equal(t, 903, snapshot.Operator.ID)
+	assert.Equal(t, "original_admin", snapshot.Operator.Username)
+	assert.NotEmpty(t, snapshot.Operator.RequestID)
+	var count int64
+	require.NoError(t, model.LOG_DB.Model(&model.AuditLog{}).Where("action = ?", "user.topup_complete").Count(&count).Error)
+	assert.Zero(t, count, "the process exited before best-effort request auditing")
+	original := *order.SettlementAudit
+	_, credential := createAccessTokenTestSession(t, 904, "settlement-crash-retry")
+	router.POST("/api/user/topup/complete", middleware.AdminAuth(), AdminCompleteTopUp)
+	for range 2 {
+		response := accessTokenRequest(router, http.MethodPost, "/api/user/topup/complete", credential, "", `{"trade_no":"settlement-process-exit"}`)
+		assert.Contains(t, response.Body.String(), `"success":true`)
+	}
+	require.NoError(t, model.DB.First(order, order.Id).Error)
+	require.NotNil(t, order.SettlementAudit)
+	assert.Equal(t, original, *order.SettlementAudit, "a later administrator cannot replace the first settlement operator")
+	var invitee, inviter model.User
+	require.NoError(t, model.DB.First(&invitee, 902).Error)
+	require.NoError(t, model.DB.First(&inviter, 901).Error)
+	assert.Equal(t, 990, invitee.Quota)
+	assert.Equal(t, 107, inviter.AffQuota)
+	require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+}
+
+func TestWalletSettlementResponsibilityKeepsConcurrentWinner(t *testing.T) {
+	for _, manualFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("manual_first_%t", manualFirst), func(t *testing.T) {
+			_, keys := walletWebhookFixture(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.UserAccessToken{}))
+			require.NoError(t, model.DB.Create(&model.User{Id: 903, Username: "concurrent_admin", AffCode: "w903", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default"}).Error)
+			_, credential := createAccessTokenTestSession(t, 903, "settlement-concurrent")
+			order := walletWebhookOrder(t, model.PaymentProviderEpay, "settlement-concurrent")
+			reached, release, contender := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			var unblock sync.Once
+			t.Cleanup(func() { unblock.Do(func() { close(release) }) })
+			var first atomic.Bool
+			require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("test:hold_first_settlement", func(tx *gorm.DB) {
+				if tx.Statement.Table == "top_ups" && first.CompareAndSwap(false, true) {
+					close(reached)
+					select {
+					case <-release:
+					case <-t.Context().Done():
+						tx.AddError(t.Context().Err())
+					}
+				}
+			}))
+			t.Cleanup(func() { _ = model.DB.Callback().Update().Remove("test:hold_first_settlement") })
+			router := gin.New()
+			router.Use(middleware.RequestId(), func(c *gin.Context) {
+				if c.GetHeader("X-Test-Contender") == "true" {
+					close(contender)
+				}
+				c.Next()
+			})
+			router.POST("/epay", EpayNotify)
+			router.POST("/api/user/topup/complete", middleware.AdminAuth(), AdminCompleteTopUp)
+			manual := httptest.NewRequest(http.MethodPost, "/api/user/topup/complete", strings.NewReader(`{"trade_no":"settlement-concurrent"}`))
+			manual.Header.Set("Content-Type", "application/json")
+			manual.Header.Set("Authorization", "Bearer "+credential)
+			payment := walletWebhookRequest(t, keys, model.PaymentProviderEpay, order.TradeNo, "100", true)
+			firstRequest, secondRequest := payment, manual
+			if manualFirst {
+				firstRequest, secondRequest = manual, payment
+			}
+			secondRequest.Header.Set("X-Test-Contender", "true")
+			responses := make(chan *httptest.ResponseRecorder, 2)
+			go func() {
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, firstRequest)
+				responses <- response
+			}()
+			select {
+			case <-reached:
+			case <-t.Context().Done():
+				t.Fatal(t.Context().Err())
+			}
+			go func() {
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, secondRequest)
+				responses <- response
+			}()
+			select {
+			case <-contender:
+			case <-t.Context().Done():
+				t.Fatal(t.Context().Err())
+			}
+			unblock.Do(func() { close(release) })
+			for range 2 {
+				response := <-responses
+				assert.Equal(t, http.StatusOK, response.Code)
+				assert.NotContains(t, response.Body.String(), "false")
+				assert.NotContains(t, response.Body.String(), "fail")
+			}
+			require.NoError(t, model.DB.First(order, order.Id).Error)
+			settlement, err := order.GetSettlementAudit()
+			require.NoError(t, err)
+			require.NotNil(t, settlement)
+			if manualFirst {
+				assert.Equal(t, "manual", settlement.Source)
+				require.NotNil(t, settlement.Operator)
+				assert.Equal(t, 903, settlement.Operator.ID)
+			} else {
+				assert.Equal(t, "payment", settlement.Source)
+				assert.Nil(t, settlement.Operator)
+			}
+			var invitee, inviter model.User
+			require.NoError(t, model.DB.First(&invitee, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			assert.Equal(t, 990, invitee.Quota)
+			assert.Equal(t, 107, inviter.AffQuota)
+			var count int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&count).Error)
+			assert.EqualValues(t, 1, count)
+		})
+	}
+}
+
+func TestWalletSettlementResponsibilityAtomicFailureAndLegacy(t *testing.T) {
+	for _, scenario := range []string{"order_write_failure", "commit_reply_lost", "legacy_success", "invalid_operator"} {
+		t.Run(scenario, func(t *testing.T) {
+			router, _ := walletWebhookFixture(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.UserAccessToken{}))
+			require.NoError(t, model.DB.Create(&model.User{Id: 903, Username: "settlement_admin", AffCode: "w903", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default"}).Error)
+			_, credential := createAccessTokenTestSession(t, 903, "settlement-atomicity")
+			router.POST("/api/user/topup/complete", middleware.AdminAuth(), AdminCompleteTopUp)
+			router.GET("/api/user/topup", middleware.AdminAuth(), GetAllTopUps)
+			order := walletWebhookOrder(t, model.PaymentProviderEpay, "settlement-"+scenario)
+			if scenario == "legacy_success" {
+				require.NoError(t, model.DB.Model(order).Updates(map[string]any{"status": common.TopUpStatusSuccess, "credited_quota": nil}).Error)
+			}
+			if scenario == "invalid_operator" {
+				err := model.ManualCompleteTopUp(order.TradeNo, "127.0.0.1", model.TopUpSettlementOperator{})
+				require.Error(t, err)
+			}
+			healthy := model.DB
+			if scenario == "order_write_failure" {
+				require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("test:reject_settlement_record", func(tx *gorm.DB) {
+					if tx.Statement.Table == "top_ups" {
+						tx.AddError(errors.New("isolated settlement row write rejected"))
+					}
+				}))
+				t.Cleanup(func() { _ = healthy.Callback().Update().Remove("test:reject_settlement_record") })
+			}
+			if scenario == "commit_reply_lost" {
+				wrapped := healthy.Session(&gorm.Session{NewDB: true})
+				wrapped.Statement = &gorm.Statement{DB: wrapped, Context: t.Context(), ConnPool: walletSettlementCommitPool{ConnPool: healthy.Statement.ConnPool, afterSettlement: func() error {
+					return errors.New("isolated committed transaction acknowledgement lost")
+				}}}
+				model.DB = wrapped
+				t.Cleanup(func() { model.DB = healthy })
+			}
+			response := accessTokenRequest(router, http.MethodPost, "/api/user/topup/complete", credential, "", fmt.Sprintf(`{"trade_no":%q}`, order.TradeNo))
+			assert.Contains(t, response.Body.String(), fmt.Sprintf(`"success":%t`, scenario != "order_write_failure"))
+			model.DB = healthy
+			require.NoError(t, model.DB.First(order, order.Id).Error)
+			var invitee, inviter model.User
+			require.NoError(t, model.DB.First(&invitee, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			var facts int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
+			if scenario == "order_write_failure" || scenario == "legacy_success" {
+				assert.Nil(t, order.SettlementAudit)
+				assert.Equal(t, -10, invitee.Quota)
+				assert.Equal(t, 7, inviter.AffQuota)
+				assert.Zero(t, facts)
+				if scenario == "order_write_failure" {
+					assert.Equal(t, common.TopUpStatusPending, order.Status)
+				} else {
+					assert.Nil(t, order.CreditedQuota)
+					response = accessTokenRequest(router, http.MethodGet, "/api/user/topup?keyword="+order.TradeNo, credential, "", "")
+					assert.Contains(t, response.Body.String(), `"settlement":null`)
+				}
+			} else {
+				assert.Equal(t, 990, invitee.Quota)
+				assert.Equal(t, 107, inviter.AffQuota)
+				assert.EqualValues(t, 1, facts)
+				snapshot, err := order.GetSettlementAudit()
+				require.NoError(t, err)
+				require.NotNil(t, snapshot)
+				assert.Equal(t, response.Header().Get(common.RequestIdKey), snapshot.Operator.RequestID)
+				var audit model.AuditLog
+				require.NoError(t, model.LOG_DB.Where("action = ? AND request_id = ?", "user.topup_complete", snapshot.Operator.RequestID).First(&audit).Error)
+				assert.Equal(t, snapshot.Operator.ID, audit.UserId)
+				assert.Equal(t, snapshot.Operator.RequestID, audit.RequestId)
+				require.NoError(t, model.DB.Model(order).Update("settlement_audit", "{damaged").Error)
+				response = accessTokenRequest(router, http.MethodGet, "/api/user/topup", credential, "", "")
+				assert.Contains(t, response.Body.String(), `"success":false`)
+				assert.Contains(t, response.Body.String(), "Database error, please contact the administrator")
+			}
+		})
+	}
 }
 
 func TestWalletManualCompletionAuditBindsOrderAndRequestResult(t *testing.T) {
@@ -4306,7 +4932,7 @@ func TestWalletCreemOptionalPaidAmountPreservesDocumentedCheckout(t *testing.T) 
 				replay := httptest.NewRecorder()
 				router.ServeHTTP(replay, signedWalletWebhookRequest(t, keys, model.PaymentProviderCreem, payload))
 				assert.Equal(t, http.StatusOK, replay.Code)
-				require.NoError(t, model.ManualCompleteTopUp(topUp.TradeNo, "127.0.0.1"))
+				require.NoError(t, model.ManualCompleteTopUp(topUp.TradeNo, "127.0.0.1", model.TopUpSettlementOperator{ID: 999, Username: "manual_fixture_admin", Role: common.RoleAdminUser, AuthMethod: "session", RequestID: "manual-fixture-request"}))
 			} else if tc.status == "pending" {
 				assert.Equal(t, http.StatusOK, recorder.Code)
 			} else {

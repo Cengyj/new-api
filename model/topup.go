@@ -8,6 +8,8 @@ import (
 	"maps"
 	"math"
 	"strconv"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
@@ -27,9 +29,62 @@ type TopUp struct {
 	CreateTime      int64   `json:"create_time"`
 	CompleteTime    int64   `json:"complete_time"`
 	CreditedQuota   *int    `json:"credited_quota" gorm:"type:bigint"`
+	// NULL means the first settlement source was not recorded by older code.
+	SettlementAudit *string `json:"-" gorm:"type:text"`
 	// Waffo merchant identity is frozen at checkout; nil marks legacy orders.
 	WaffoMerchantID *string `json:"-" gorm:"type:varchar(64)"`
 	Status          string  `json:"status"`
+}
+
+// TopUpSettlementOperator is a server-authenticated identity, never request body data.
+// It describes the administrator who first settled the order, not a later retry.
+type TopUpSettlementOperator struct {
+	ID         int    `json:"id"`
+	Username   string `json:"username"`
+	Role       int    `json:"role"`
+	AuthMethod string `json:"auth_method"`
+	RequestID  string `json:"request_id"`
+}
+
+// TopUpSettlementAudit is committed with the order, principal and rebate facts.
+// Request attempts and response outcomes remain in the separate operation audit.
+type TopUpSettlementAudit struct {
+	Source   string                   `json:"source"`
+	Operator *TopUpSettlementOperator `json:"operator,omitempty"`
+}
+
+func (settlement TopUpSettlementAudit) validate() error {
+	switch settlement.Source {
+	case "payment":
+		if settlement.Operator == nil {
+			return nil
+		}
+	case "manual":
+		operator := settlement.Operator
+		if operator != nil && operator.ID > 0 &&
+			(operator.Role == common.RoleAdminUser || operator.Role == common.RoleRootUser) &&
+			strings.TrimSpace(operator.Username) != "" && utf8.RuneCountInString(operator.Username) <= 64 &&
+			(operator.AuthMethod == "session" || operator.AuthMethod == "access_token") &&
+			strings.TrimSpace(operator.RequestID) != "" && len(operator.RequestID) <= 64 {
+			return nil
+		}
+	}
+	return common.NewMessage("Invalid parameters")
+}
+
+// GetSettlementAudit distinguishes unknown historical provenance from corrupt data.
+func (topUp *TopUp) GetSettlementAudit() (*TopUpSettlementAudit, error) {
+	if topUp.SettlementAudit == nil {
+		return nil, nil
+	}
+	var settlement TopUpSettlementAudit
+	if len(*topUp.SettlementAudit) > 4096 || common.UnmarshalJsonStr(*topUp.SettlementAudit, &settlement) != nil {
+		return nil, errors.New("invalid top-up settlement audit")
+	}
+	if err := settlement.validate(); err != nil {
+		return nil, err
+	}
+	return &settlement, nil
 }
 
 const (
@@ -226,16 +281,24 @@ func UpdatePendingTopUpStatus(tradeNo string, expectedPaymentProvider string, ta
 // across processes. Subscription display rows are never wallet orders.
 // A non-nil order confirms SQL success; an accompanying error means its cache
 // completion still needs retrying with this same order, never a new credit.
-func settleWalletTopUp(tradeNo, expectedProvider, actualMethod, customerID, customerEmail string) (*TopUp, int, bool, error) {
+func settleWalletTopUp(tradeNo, expectedProvider, actualMethod, customerID, customerEmail string, settlement TopUpSettlementAudit) (*TopUp, int, bool, error) {
 	if tradeNo == "" {
 		return nil, 0, false, errors.New("payment order number not provided")
 	}
+	if err := settlement.validate(); err != nil {
+		return nil, 0, false, err
+	}
+	encodedSettlement, err := common.Marshal(settlement)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	settlementSnapshot := string(encodedSettlement)
 	var topUp TopUp
 	var quota int
 	alreadyDone := false
 	var cacheOperation, cacheAttempt string
 	commitAttempted := false
-	err := DB.Transaction(func(tx *gorm.DB) error {
+	err = DB.Transaction(func(tx *gorm.DB) error {
 		if err := lockForUpdate(tx).Where("trade_no = ?", tradeNo).First(&topUp).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrTopUpNotFound
@@ -293,7 +356,7 @@ func settleWalletTopUp(tradeNo, expectedProvider, actualMethod, customerID, cust
 		}
 		// For legacy pending orders this records what was actually credited
 		// now; it does not claim a historical checkout-time price snapshot.
-		orderUpdates := map[string]any{"status": common.TopUpStatusSuccess, "complete_time": topUp.CompleteTime, "credited_quota": quota}
+		orderUpdates := map[string]any{"status": common.TopUpStatusSuccess, "complete_time": topUp.CompleteTime, "credited_quota": quota, "settlement_audit": settlementSnapshot}
 		if actualMethod != "" {
 			topUp.PaymentMethod = actualMethod
 			orderUpdates["payment_method"] = actualMethod
@@ -307,6 +370,7 @@ func settleWalletTopUp(tradeNo, expectedProvider, actualMethod, customerID, cust
 		}
 		topUp.Status = common.TopUpStatusSuccess
 		topUp.CreditedQuota = &quota
+		topUp.SettlementAudit = &settlementSnapshot
 		commitAttempted = true
 		return nil
 	})
@@ -334,7 +398,7 @@ func settleWalletTopUp(tradeNo, expectedProvider, actualMethod, customerID, cust
 }
 
 func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (bool, error) {
-	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, PaymentProviderEpay, actualPaymentMethod, "", "")
+	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, PaymentProviderEpay, actualPaymentMethod, "", "", TopUpSettlementAudit{Source: "payment"})
 	if topUp == nil || alreadyDone {
 		return alreadyDone, err
 	}
@@ -343,7 +407,7 @@ func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (
 }
 
 func Recharge(referenceId string, customerId string, callerIp string) error {
-	topUp, quota, alreadyDone, err := settleWalletTopUp(referenceId, PaymentProviderStripe, "", customerId, "")
+	topUp, quota, alreadyDone, err := settleWalletTopUp(referenceId, PaymentProviderStripe, "", customerId, "", TopUpSettlementAudit{Source: "payment"})
 	if topUp == nil || alreadyDone {
 		return err
 	}
@@ -540,11 +604,11 @@ func SearchAllTopUps(ctx context.Context, keyword string, pageInfo *common.PageI
 
 // ManualCompleteTopUp preserves the existing pending-only manual completion
 // policy and uses the same frozen credit and atomic settlement as callbacks.
-func ManualCompleteTopUp(tradeNo string, callerIp string) error {
+func ManualCompleteTopUp(tradeNo string, callerIp string, operator TopUpSettlementOperator) error {
 	if tradeNo == "" {
 		return common.NewMessage("Order number not provided")
 	}
-	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, "", "", "", "")
+	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, "", "", "", "", TopUpSettlementAudit{Source: "manual", Operator: &operator})
 	if errors.Is(err, ErrTopUpNotFound) {
 		return common.NewMessage("Top-up order does not exist")
 	}
@@ -559,7 +623,7 @@ func ManualCompleteTopUp(tradeNo string, callerIp string) error {
 }
 
 func RechargeCreem(referenceId string, customerEmail string, customerName string, callerIp string) error {
-	topUp, quota, alreadyDone, err := settleWalletTopUp(referenceId, PaymentProviderCreem, "", "", customerEmail)
+	topUp, quota, alreadyDone, err := settleWalletTopUp(referenceId, PaymentProviderCreem, "", "", customerEmail, TopUpSettlementAudit{Source: "payment"})
 	if topUp == nil || alreadyDone {
 		return err
 	}
@@ -568,7 +632,7 @@ func RechargeCreem(referenceId string, customerEmail string, customerName string
 }
 
 func RechargeWaffo(tradeNo string, callerIp string) error {
-	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, PaymentProviderWaffo, "", "", "")
+	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, PaymentProviderWaffo, "", "", "", TopUpSettlementAudit{Source: "payment"})
 	if topUp == nil || alreadyDone {
 		return err
 	}
@@ -577,7 +641,7 @@ func RechargeWaffo(tradeNo string, callerIp string) error {
 }
 
 func RechargeWaffoPancake(tradeNo string) error {
-	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, PaymentProviderWaffoPancake, "", "", "")
+	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, PaymentProviderWaffoPancake, "", "", "", TopUpSettlementAudit{Source: "payment"})
 	if topUp == nil || alreadyDone {
 		return err
 	}
