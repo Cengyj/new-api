@@ -5145,7 +5145,7 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 		{name: "missing_code", raw: `{}`},
 		{name: "json_null", raw: `null`},
 		{name: "unknown_query", raw: `{"code":"E0001"}`},
-		{name: "query_not_found", raw: `{"code":"E0002"}`},
+		{name: "query_not_found", raw: `{"code":"A0009"}`},
 		{name: "network_failure"},
 		{name: "missing_query_signature"},
 		{name: "empty_query_signature"},

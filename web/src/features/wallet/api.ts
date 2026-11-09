@@ -55,8 +55,13 @@ export function isApiSuccess(response: ApiResponse): boolean {
 /**
  * Get topup configuration info
  */
-export async function getTopupInfo(): Promise<TopupInfoResponse> {
-  const res = await api.get('/api/user/topup/info')
+export async function getTopupInfo(
+  signal?: AbortSignal
+): Promise<TopupInfoResponse> {
+  const res = await api.get('/api/user/topup/info', {
+    signal,
+    disableDuplicate: true,
+  })
   return res.data
 }
 

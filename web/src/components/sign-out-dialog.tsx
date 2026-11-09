@@ -49,7 +49,8 @@ export function SignOutDialog({ open, onOpenChange }: SignOutDialogProps) {
 
       clearAuthenticatedClientState(queryClient)
       toast.success(t('Signed out'))
-      void navigate({ to: '/sign-in', replace: true })
+      // Revoking the session also unmounts any dirty-form confirmation.
+      void navigate({ to: '/sign-in', replace: true, ignoreBlocker: true })
     } catch (error: unknown) {
       handleServerError(error, t('Failed to sign out session'))
     } finally {

@@ -86,7 +86,9 @@ function RootComponent() {
 
         if (currentSID && event.sid === currentSID) {
           clearAuthenticatedClientState(queryClient, false)
-          void navigate({ to: '/sign-in', replace: true })
+          // The authenticated layout may unmount a dirty form and its blocker.
+          // A revoked session must always reach the sign-in page.
+          void navigate({ to: '/sign-in', replace: true, ignoreBlocker: true })
         }
       }),
     [navigate, queryClient]

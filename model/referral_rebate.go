@@ -254,17 +254,20 @@ func AwardReferralRebateTx(tx *gorm.DB, topUp *TopUp, creditedQuota int) error {
 		return gorm.ErrRecordNotFound
 	}
 	topUp.CompleteTime = time.Now().Unix()
+	// Validate the locked snapshot before a pause or inactive inviter can
+	// turn it into ordinary ineligibility. Both zero fields identify old users.
+	if invitee.ReferralRateBPS != 0 || invitee.ReferralExpiresAt != 0 {
+		if invitee.InviterId <= 0 || invitee.InviterId == invitee.Id ||
+			invitee.ReferralRateBPS < 1 || invitee.ReferralRateBPS > 10000 || invitee.CreatedAt <= 0 ||
+			invitee.ReferralExpiresAt <= invitee.CreatedAt || invitee.ReferralExpiresAt > maxReferralTimestamp {
+			return ErrInvalidReferralSnapshot
+		}
+	}
 	if !qualified {
 		return nil
 	}
-	if invitee.InviterId <= 0 || invitee.InviterId == invitee.Id {
-		return ErrInvalidReferralSnapshot
-	}
 	if inviter == nil || inviter.Status != common.UserStatusEnabled {
 		return nil
-	}
-	if invitee.ReferralRateBPS < 1 || invitee.ReferralRateBPS > 10000 || invitee.CreatedAt <= 0 || invitee.ReferralExpiresAt <= invitee.CreatedAt || invitee.ReferralExpiresAt > maxReferralTimestamp {
-		return ErrInvalidReferralSnapshot
 	}
 	if topUp.CompleteTime < invitee.CreatedAt || topUp.CompleteTime >= invitee.ReferralExpiresAt {
 		return nil

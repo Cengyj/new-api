@@ -719,6 +719,94 @@ func TestReferralCorruptRulesRollbackSettlementAcrossDatabases(t *testing.T) {
 					assert.Zero(t, count)
 				})
 			}
+			for _, tc := range []struct {
+				name, snapshot, inactive string
+			}{
+				{"paused_invalid_rate", "invalid_rate", "paused"},
+				{"paused_missing_rate", "missing_rate", "paused"},
+				{"disabled_missing_expiry", "missing_expiry", "disabled"},
+				{"deleted_invalid_expiry", "invalid_expiry", "deleted"},
+				{"compliance_no_creation", "missing_creation", "compliance"},
+				{"paused_self_invitation", "self_invitation", "paused"},
+				{"historical_no_snapshot", "none", ""},
+				{"valid_paused", "", "paused"},
+				{"valid_disabled", "", "disabled"},
+				{"valid_deleted", "", "deleted"},
+				{"valid_absent", "", "absent"},
+				{"valid_compliance_pause", "", "compliance"},
+			} {
+				t.Run("snapshot_"+tc.name, func(t *testing.T) {
+					require.NoError(t, SaveReferralRebateRule(ReferralRebateRule{Enabled: tc.inactive != "paused", RateBPS: 1000, ValidDays: 1}))
+					inviter := User{Username: tc.name, AffCode: tc.name, Status: common.UserStatusEnabled, AffQuota: 3, AffHistoryQuota: 5}
+					require.NoError(t, db.Create(&inviter).Error)
+					invitee := User{Username: tc.name + "-child", AffCode: tc.name + "-child", Status: common.UserStatusEnabled, InviterId: inviter.Id, Quota: 7, CreatedAt: time.Now().Unix(), ReferralRateBPS: 1000, ReferralExpiresAt: time.Now().Unix() + 86400}
+					require.NoError(t, db.Create(&invitee).Error)
+					snapshot := map[string]any{}
+					switch tc.snapshot {
+					case "invalid_rate":
+						snapshot["referral_rate_bps"] = 10001
+					case "missing_rate":
+						snapshot["referral_rate_bps"] = 0
+					case "missing_expiry":
+						snapshot["referral_expires_at"] = 0
+					case "invalid_expiry":
+						snapshot["referral_expires_at"] = invitee.CreatedAt
+					case "missing_creation":
+						snapshot["created_at"] = 0
+					case "self_invitation":
+						snapshot["inviter_id"] = invitee.Id
+					case "none":
+						snapshot = map[string]any{"created_at": 0, "referral_rate_bps": 0, "referral_expires_at": 0}
+					}
+					if len(snapshot) != 0 {
+						require.NoError(t, db.Model(&invitee).Updates(snapshot).Error)
+					}
+					switch tc.inactive {
+					case "disabled":
+						require.NoError(t, db.Model(&inviter).Update("status", common.UserStatusDisabled).Error)
+					case "deleted":
+						require.NoError(t, db.Delete(&inviter).Error)
+					case "absent":
+						require.NoError(t, db.Unscoped().Delete(&inviter).Error)
+					case "compliance":
+						settings.ComplianceConfirmed = false
+						t.Cleanup(func() { settings.ComplianceConfirmed = true })
+					}
+					credit := 100
+					order := TopUp{UserId: invitee.Id, TradeNo: tc.name, CreditedQuota: &credit, PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending}
+					require.NoError(t, order.Insert())
+					invalid := tc.snapshot != "" && tc.snapshot != "none"
+					for attempt := range 2 {
+						duplicate, err := RechargeEpay(order.TradeNo, "", "")
+						if invalid {
+							assert.ErrorIs(t, err, ErrInvalidReferralSnapshot, "a pause or inactive inviter cannot make a damaged snapshot ordinary ineligibility")
+							assert.False(t, duplicate)
+						} else {
+							require.NoError(t, err)
+							assert.Equal(t, attempt == 1, duplicate)
+						}
+					}
+					require.NoError(t, db.First(&order, order.Id).Error)
+					require.NoError(t, db.First(&invitee, invitee.Id).Error)
+					if invalid {
+						assert.Equal(t, common.TopUpStatusPending, order.Status)
+						assert.Zero(t, order.CompleteTime)
+						assert.Equal(t, 7, invitee.Quota)
+					} else {
+						assert.Equal(t, common.TopUpStatusSuccess, order.Status)
+						assert.Positive(t, order.CompleteTime)
+						assert.Equal(t, 107, invitee.Quota)
+					}
+					if tc.inactive != "absent" {
+						require.NoError(t, db.Unscoped().First(&inviter, inviter.Id).Error)
+						assert.Equal(t, 3, inviter.AffQuota)
+						assert.Equal(t, 5, inviter.AffHistoryQuota)
+					}
+					var count int64
+					require.NoError(t, db.Model(&ReferralRebate{}).Where("top_up_id = ?", order.Id).Count(&count).Error)
+					assert.Zero(t, count)
+				})
+			}
 			for index, raw := range []string{
 				"null", "{}", "missing_rule", "read_failure", "invalid-json", "{\"rate_bps\":1000,\"valid_days\":1}",
 				"{\"enabled\":null,\"rate_bps\":1000,\"valid_days\":1}",

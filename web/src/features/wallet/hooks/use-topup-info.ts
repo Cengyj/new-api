@@ -16,9 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 
 import { handleServerError } from '@/lib/handle-server-error'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getTopupInfo } from '../api'
 import {
@@ -26,6 +27,7 @@ import {
   mergePresetAmounts,
   getMinTopupAmount,
 } from '../lib'
+import { referralIdentity } from '../referral-api'
 import type {
   TopupInfo,
   PresetAmount,
@@ -173,15 +175,24 @@ function parseDiscountMap(data: unknown): Record<number, number> {
 }
 
 export function useTopupInfo() {
-  const [topupInfo, setTopupInfo] = useState<TopupInfo | null>(null)
+  const identity = useAuthStore(referralIdentity)
+  const request = useRef<AbortController | null>(null)
+  const [snapshot, setSnapshot] = useState<{
+    identity: string
+    data: TopupInfo
+  } | null>(null)
   const [presetAmounts, setPresetAmounts] = useState<PresetAmount[]>([])
   const [loading, setLoading] = useState(true)
 
   const fetchTopupInfo = useCallback(async () => {
+    request.current?.abort()
+    const controller = new AbortController()
+    request.current = controller
     try {
       setLoading(true)
 
-      const response = await getTopupInfo()
+      const response = await getTopupInfo(controller.signal)
+      if (controller.signal.aborted || referralIdentity() !== identity) return
 
       if (!response.success || !response.data) {
         handleServerError(response)
@@ -202,7 +213,7 @@ export function useTopupInfo() {
         ),
       }
 
-      setTopupInfo(processedData)
+      setSnapshot({ identity, data: processedData })
 
       if (processedData.amount_options.length > 0) {
         const customPresets = mergePresetAmounts(
@@ -216,11 +227,15 @@ export function useTopupInfo() {
         setPresetAmounts(defaultPresets)
       }
     } catch (err) {
-      handleServerError(err)
+      if (!controller.signal.aborted && referralIdentity() === identity) {
+        handleServerError(err)
+      }
     } finally {
-      setLoading(false)
+      if (!controller.signal.aborted && referralIdentity() === identity) {
+        setLoading(false)
+      }
     }
-  }, [])
+  }, [identity])
 
   useEffect(() => {
     let cancelled = false
@@ -231,12 +246,13 @@ export function useTopupInfo() {
 
     return () => {
       cancelled = true
+      request.current?.abort()
     }
   }, [fetchTopupInfo])
 
   return {
-    topupInfo,
-    presetAmounts,
+    topupInfo: snapshot?.identity === identity ? snapshot.data : null,
+    presetAmounts: snapshot?.identity === identity ? presetAmounts : [],
     loading,
     refetch: fetchTopupInfo,
   }
