@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -20,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -6979,5 +6981,175 @@ func TestWalletWaffoMissingCheckoutOutcomePreservesLateSettlement(t *testing.T) 
 				assert.Equal(t, stored.CompleteTime, facts[0].SettledAt)
 			}
 		})
+	}
+}
+
+// The controller operation audit runs inside the API panic boundary. Exercise
+// a real SQL panic and its ordinary business rejection control, without changing
+// production code or replacing authentication, settlement, or audit writes.
+func TestWalletManualPanicAuditMatchesFinalResponse(t *testing.T) {
+	for _, authMethod := range []string{"session", "access_token"} {
+		for _, failure := range []string{"sql_panic", "post_commit_panic", "business_rejection", "written_response_panic", "disconnected_panic"} {
+			t.Run(authMethod+"/"+failure, func(t *testing.T) {
+				walletWebhookFixture(t)
+				require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.UserAccessToken{}))
+				require.NoError(t, model.DB.Create(&model.User{Id: 903, Username: "manual_panic_admin", AffCode: "manual-panic-admin", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default"}).Error)
+				_, credential := createAccessTokenTestSession(t, 903, "manual-panic-audit")
+				if authMethod == "access_token" {
+					credential, _ = createScopedAccessToken(t, 903, time.Now().Unix()+3600, "billing:write")
+				}
+				const route = "/api/user/topup/complete"
+				// Same relevant relative middleware order as SetApiRouter, then
+				// its actual AdminAuth/controller. Compression cannot affect the
+				// controller's earlier deferred audit snapshot.
+				router := gin.New()
+				router.Use(middleware.RequestId(), middleware.AccessTokenAudit(), middleware.PanicRecover())
+				var requestContext *gin.Context
+				router.POST(route, middleware.AdminAuth(), func(c *gin.Context) { requestContext = c }, AdminCompleteTopUp)
+				order := walletWebhookOrder(t, model.PaymentProviderStripe, "manual-panic-original")
+				if failure == "business_rejection" {
+					require.NoError(t, model.UpdatePendingTopUpStatus(order.TradeNo, model.PaymentProviderStripe, common.TopUpStatusFailed))
+				}
+				var injected atomic.Int32
+				require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register("test:manual_panic_audit", func(tx *gorm.DB) {
+					if failure != "business_rejection" && failure != "post_commit_panic" && tx.Statement.Table == "top_ups" && injected.CompareAndSwap(0, 1) {
+						require.NoError(t, tx.Error)
+						require.EqualValues(t, 1, tx.RowsAffected)
+						if failure == "written_response_panic" {
+							requestContext.Status(http.StatusAccepted)
+							requestContext.Writer.WriteHeaderNow()
+						}
+						if failure == "disconnected_panic" {
+							panic(&net.OpError{Op: "write", Net: "tcp", Err: &os.SyscallError{Syscall: "write", Err: syscall.EPIPE}})
+						}
+						panic("isolated-manual-private-panic")
+					}
+				}))
+				t.Cleanup(func() { assert.NoError(t, model.DB.Callback().Query().Remove("test:manual_panic_audit")) })
+				require.NoError(t, model.DB.Callback().Create().After("gorm:create").Register("test:manual_log_panic", func(tx *gorm.DB) {
+					if failure == "post_commit_panic" && tx.Statement.Table == "logs" && injected.CompareAndSwap(0, 1) {
+						require.NoError(t, tx.Error)
+						require.EqualValues(t, 1, tx.RowsAffected)
+						panic("isolated-manual-private-panic")
+					}
+				}))
+				t.Cleanup(func() { assert.NoError(t, model.DB.Callback().Create().Remove("test:manual_log_panic")) })
+				var log bytes.Buffer
+				oldLog := common.ErrorLogWriter
+				common.ErrorLogWriter = &log
+				t.Cleanup(func() { common.ErrorLogWriter = oldLog })
+				response := accessTokenRequest(router, http.MethodPost, route, credential, "", fmt.Sprintf(`{"trade_no":%q}`, order.TradeNo))
+				wantStatus := http.StatusOK
+				wantOrderStatus := common.TopUpStatusFailed
+				if failure != "business_rejection" {
+					wantStatus, wantOrderStatus = http.StatusInternalServerError, common.TopUpStatusPending
+					require.EqualValues(t, 1, injected.Load(), "the real SQL query or post-settlement log insert must reach the panic boundary")
+					switch failure {
+					case "post_commit_panic":
+						wantOrderStatus = common.TopUpStatusSuccess
+					case "written_response_panic":
+						wantStatus = http.StatusAccepted
+					case "disconnected_panic":
+						wantStatus = http.StatusOK
+					}
+					if failure == "disconnected_panic" {
+						assert.Empty(t, response.Body.String())
+					} else {
+						assert.Contains(t, response.Body.String(), `"type":"new_api_panic"`)
+					}
+					assert.NotContains(t, response.Body.String(), "isolated-manual-private-panic")
+					assert.Contains(t, log.String(), response.Header().Get(common.RequestIdKey))
+				} else {
+					require.Zero(t, injected.Load())
+					assert.Contains(t, response.Body.String(), `"success":false`)
+				}
+				require.Equal(t, wantStatus, response.Code, response.Body.String())
+				requestID := response.Header().Get(common.RequestIdKey)
+				require.NotEmpty(t, requestID)
+				var audits []model.AuditLog
+				require.NoError(t, model.LOG_DB.Where("request_id = ?", requestID).Find(&audits).Error)
+				var operation *model.AuditLog
+				operationCount, patCount := 0, 0
+				for index := range audits {
+					entry := &audits[index]
+					if entry.Action == "user.topup_complete" {
+						operationCount++
+						operation = entry
+					}
+					if entry.Category == model.AuditCategoryAccessToken {
+						patCount++
+						assert.Equal(t, wantStatus, entry.Status)
+						if failure != "disconnected_panic" && failure != "written_response_panic" {
+							assert.False(t, entry.Success)
+						}
+					}
+				}
+				require.Equal(t, 1, operationCount, "no duplicate fallback operation audit")
+				require.NotNil(t, operation)
+				require.NotNil(t, operation.Other.AuditInfo)
+				if authMethod == "access_token" {
+					assert.Equal(t, 1, patCount)
+				} else {
+					assert.Zero(t, patCount)
+				}
+				t.Logf("observed boundary=%s auth=%s http=%d operation=%d/%t audit_info=%d/%t pat_count=%d request_id=%s", failure, authMethod, response.Code, operation.Status, operation.Success, operation.Other.AuditInfo.Status, operation.Other.AuditInfo.Success, patCount, requestID)
+				assert.Equal(t, wantStatus, operation.Status, "operation status must match final HTTP failure")
+				assert.Equal(t, wantStatus, operation.Other.AuditInfo.Status)
+				assert.False(t, operation.Success)
+				assert.False(t, operation.Other.AuditInfo.Success)
+				assert.Equal(t, authMethod, operation.AuthMethod)
+				assert.Equal(t, 903, operation.UserId)
+				require.NotNil(t, operation.Other.Op)
+				params, err := common.Marshal(operation.Other.Op.Params)
+				require.NoError(t, err)
+				assert.JSONEq(t, fmt.Sprintf(`{"trade_no":%q}`, order.TradeNo), string(params))
+				var invitee, inviter model.User
+				require.NoError(t, model.DB.First(&invitee, 902).Error)
+				require.NoError(t, model.DB.First(&inviter, 901).Error)
+				require.NoError(t, model.DB.First(order, order.Id).Error)
+				assert.Equal(t, wantOrderStatus, order.Status)
+				var facts int64
+				require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
+				if failure != "post_commit_panic" {
+					assert.Equal(t, -10, invitee.Quota)
+					assert.Equal(t, []int{7, 11}, []int{inviter.AffQuota, inviter.AffHistoryQuota})
+					assert.Nil(t, order.SettlementAudit)
+					assert.Zero(t, order.CompleteTime)
+					assert.Zero(t, facts)
+					return
+				}
+				assert.Equal(t, 990, invitee.Quota)
+				assert.Equal(t, []int{107, 111}, []int{inviter.AffQuota, inviter.AffHistoryQuota})
+				require.EqualValues(t, 1, facts)
+				settlement, err := order.GetSettlementAudit()
+				require.NoError(t, err)
+				require.NotNil(t, settlement)
+				assert.Equal(t, "manual", settlement.Source)
+				require.NotNil(t, settlement.Operator)
+				assert.Equal(t, requestID, settlement.Operator.RequestID)
+				firstAudit, firstCompleted := *order.SettlementAudit, order.CompleteTime
+				require.Positive(t, firstCompleted)
+				retry := accessTokenRequest(router, http.MethodPost, route, credential, "", fmt.Sprintf(`{"trade_no":%q}`, order.TradeNo))
+				require.Equal(t, http.StatusOK, retry.Code)
+				assert.Contains(t, retry.Body.String(), `"success":true`)
+				require.NoError(t, model.DB.First(&invitee, 902).Error)
+				require.NoError(t, model.DB.First(&inviter, 901).Error)
+				require.NoError(t, model.DB.First(order, order.Id).Error)
+				require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
+				assert.Equal(t, 990, invitee.Quota)
+				assert.Equal(t, []int{107, 111}, []int{inviter.AffQuota, inviter.AffHistoryQuota})
+				assert.EqualValues(t, 1, facts)
+				assert.Equal(t, firstAudit, *order.SettlementAudit)
+				assert.Equal(t, firstCompleted, order.CompleteTime)
+				var retried []model.AuditLog
+				require.NoError(t, model.LOG_DB.Where("action = ?", "user.topup_complete").Order("id").Find(&retried).Error)
+				require.Len(t, retried, 2)
+				assert.Equal(t, requestID, retried[0].RequestId)
+				assert.False(t, retried[0].Success)
+				assert.True(t, retried[1].Success)
+				assert.Equal(t, retry.Header().Get(common.RequestIdKey), retried[1].RequestId)
+
+			})
+		}
 	}
 }

@@ -18,6 +18,21 @@ func RelayPanicRecover() gin.HandlerFunc {
 	return PanicRecover()
 }
 
+// IsClientDisconnectPanic reports the network failures for which recovery must
+// not attempt another response. Keep request audits on the same classification.
+func IsClientDisconnectPanic(failure any) bool {
+	networkError, ok := failure.(*net.OpError)
+	if !ok || networkError == nil {
+		return false
+	}
+	var syscallError *os.SyscallError
+	if !errors.As(networkError, &syscallError) {
+		return false
+	}
+	message := strings.ToLower(syscallError.Error())
+	return strings.Contains(message, "broken pipe") || strings.Contains(message, "connection reset by peer")
+}
+
 // PanicRecover logs through the current writer without dumping requests or
 // panic values, either of which can contain payment or authentication secrets.
 func PanicRecover() gin.HandlerFunc {
@@ -31,14 +46,8 @@ func PanicRecover() gin.HandlerFunc {
 				c.Abort()
 				// A disconnected client cannot receive a response. Retain Gin's
 				// network-error classification without storing its raw error text.
-				if networkError, ok := failure.(*net.OpError); ok && networkError != nil {
-					var syscallError *os.SyscallError
-					if errors.As(networkError, &syscallError) {
-						message := strings.ToLower(syscallError.Error())
-						if strings.Contains(message, "broken pipe") || strings.Contains(message, "connection reset by peer") {
-							return
-						}
-					}
+				if IsClientDisconnectPanic(failure) {
+					return
 				}
 				c.JSON(http.StatusInternalServerError, gin.H{
 					"error": gin.H{

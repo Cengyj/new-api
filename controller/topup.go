@@ -15,6 +15,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
@@ -731,6 +732,16 @@ func AdminCompleteTopUp(c *gin.Context) {
 	}
 	requestSucceeded := false
 	defer func() {
+		if failure := recover(); failure != nil {
+			// Preserve the original panic for the API recovery/logging boundary.
+			// Audit the status it can still send, without replacing a response
+			// already written or inventing one for a disconnected client.
+			defer func() { panic(failure) }()
+			requestSucceeded = false
+			if !c.Writer.Written() && !middleware.IsClientDisconnectPanic(failure) {
+				c.Status(http.StatusInternalServerError)
+			}
+		}
 		// A failed response can follow a committed credit whose cache still needs
 		// repair. Record the request result and original order, not a rollback.
 		auditInfo := &model.AuditRequestInfo{
