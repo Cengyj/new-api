@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -173,6 +174,8 @@ func resolveWaffoPancakeAdminCreds(bodyMerchantID, bodyPrivateKey string) (strin
 	m := strings.TrimSpace(bodyMerchantID)
 	k := strings.TrimSpace(bodyPrivateKey)
 	if m == "" && k == "" {
+		common.OptionMapRWMutex.RLock()
+		defer common.OptionMapRWMutex.RUnlock()
 		return setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey
 	}
 	return m, k
@@ -229,16 +232,34 @@ func CreateWaffoPancakePair(c *gin.Context) {
 }
 
 // ListWaffoPancakeCatalog returns the merchant's Stores + OnetimeProducts.
-// Doubles as a credential probe (a successful 200 proves the resolved creds
-// authenticate). See resolveWaffoPancakeAdminCreds for credential resolution.
+// Doubles as a credential probe. Errors retain the payment response shape
+// while explicitly marking failure for POST operation and PAT request audits.
+// See resolveWaffoPancakeAdminCreds for credential resolution.
 func ListWaffoPancakeCatalog(c *gin.Context) {
-	// Missing query creds mean "use persisted creds".
-	merchantID, privateKey := resolveWaffoPancakeAdminCreds(
-		strings.TrimSpace(c.Query("merchant_id")),
-		strings.TrimSpace(c.Query("private_key")),
-	)
+	// Credentials belong in the JSON body, never in URLs or access logs.
+	// Preserve credential-free GET for clients reading the saved binding, but
+	// reject legacy query credentials instead of silently using another account.
+	query, err := url.ParseQuery(c.Request.URL.RawQuery)
+	if err != nil || query.Has("merchant_id") || query.Has("private_key") {
+		message := common.NewMessage("Invalid parameters")
+		common.ApiErrorStatus(c, http.StatusOK, message, gin.H{"message": "error", "data": message.Error()})
+		return
+	}
+	var req struct {
+		MerchantID string `json:"merchant_id"`
+		PrivateKey string `json:"private_key"`
+	}
+	if c.Request.Method == http.MethodPost {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			message := common.NewMessage("Invalid parameters")
+			common.ApiErrorStatus(c, http.StatusOK, message, gin.H{"message": "error", "data": message.Error()})
+			return
+		}
+	}
+	merchantID, privateKey := resolveWaffoPancakeAdminCreds(req.MerchantID, req.PrivateKey)
 	if merchantID == "" || privateKey == "" {
-		paymentError(c, common.NewMessage("Waffo Pancake credentials are not configured"))
+		message := common.NewMessage("Waffo Pancake credentials are not configured")
+		common.ApiErrorStatus(c, http.StatusOK, message, gin.H{"message": "error", "data": message.Error()})
 		return
 	}
 	catalog, err := service.ListWaffoPancakeCatalog(c.Request.Context(), merchantID, privateKey)
@@ -246,7 +267,8 @@ func ListWaffoPancakeCatalog(c *gin.Context) {
 		logger.LogError(c.Request.Context(), common.LogText(
 			"Waffo Pancake failed to fetch store and product catalog error=%q", err.Error(),
 		))
-		paymentError(c, common.NewMessage("Failed to fetch the catalog"))
+		message := common.NewMessage("Failed to fetch the catalog")
+		common.ApiErrorStatus(c, http.StatusOK, message, gin.H{"message": "error", "data": message.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "success", "data": catalog})

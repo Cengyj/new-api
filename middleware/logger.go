@@ -35,7 +35,9 @@ func SetUpLogger(server *gin.Engine) {
 		}
 		// Payment and OAuth callbacks can carry usable signatures, one-time
 		// codes and state. Only redact the log; verification needs the full query.
-		sensitiveCallback := paymentCallback || strings.HasPrefix(requestPath, "/api/waffo-pancake/webhook/") ||
+		// Old catalog clients may still send the merchant private key in a
+		// query. Hide the entire query even when authentication rejects it.
+		sensitiveCallback := paymentCallback || strings.TrimSuffix(requestPath, "/") == "/api/option/waffo-pancake/catalog" || strings.HasPrefix(requestPath, "/api/waffo-pancake/webhook/") ||
 			strings.HasPrefix(requestPath, "/api/oauth/") || strings.HasPrefix(requestPath, "/oauth/")
 		if !sensitiveCallback && requestURL.RawQuery != "" {
 			query := requestURL.Query().Encode()

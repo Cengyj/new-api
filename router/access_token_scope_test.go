@@ -1231,3 +1231,171 @@ func TestRefreshRoutePreservesValidCredentialDuringSessionLookupOutage(t *testin
 		})
 	}
 }
+
+func TestPaymentCatalogCredentialsUseBodyAndNeverEnterLogs(t *testing.T) {
+	previousDB, previousLogDB, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+	previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	previousSecret, previousLimit := common.SessionSecret, common.GlobalApiRateLimitEnable
+	previousMerchant, previousKey := setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey
+	previousClient, previousWriter := http.DefaultClient, gin.DefaultWriter
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "catalog-credentials.db")), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	common.SetLogDatabaseType(common.DatabaseTypeSQLite)
+	common.SessionSecret, common.GlobalApiRateLimitEnable = "catalog-isolated-session-secret", false
+	t.Cleanup(func() {
+		sqlDB, err := db.DB()
+		if err == nil {
+			_ = sqlDB.Close()
+		}
+		model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+		common.SetMainDatabaseType(previousType)
+		common.SetLogDatabaseType(previousLogType)
+		common.SessionSecret, common.GlobalApiRateLimitEnable = previousSecret, previousLimit
+		setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey = previousMerchant, previousKey
+		http.DefaultClient, gin.DefaultWriter = previousClient, previousWriter
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.UserAccessToken{}, &model.AuditLog{}))
+	users := []model.User{
+		{Username: "catalog-root", AffCode: "catalog-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default"},
+		{Username: "catalog-admin", AffCode: "catalog-admin", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default"},
+	}
+	for i := range users {
+		require.NoError(t, db.Create(&users[i]).Error)
+	}
+	credentials := map[string]string{}
+	for _, tc := range []struct {
+		name, scope string
+		user        int
+	}{
+		{"root-read", "option:read", 0}, {"root-wallet", "wallet:read", 0}, {"admin-read", "option:read", 1},
+	} {
+		raw := model.AccessTokenPrefix + strings.Repeat("p", 32) + tc.name
+		token := model.UserAccessToken{Name: tc.name, TokenHash: model.AccessTokenFingerprint(raw), TokenHint: model.AccessTokenHint(raw)}
+		require.NoError(t, token.SetScopes([]string{tc.scope}))
+		require.NoError(t, model.CreateUserAccessToken(users[tc.user].Id, &token, service.AccessTokenMaxPerUser))
+		credentials[tc.name] = raw
+	}
+	bundle, err := service.CreateLoginSession(users[0].Id, "password", "127.0.0.1", "catalog-regression")
+	require.NoError(t, err)
+	credentials["root-session"] = bundle.AccessToken
+	savedKeys, err := waffoutils.GenerateKeyPair()
+	require.NoError(t, err)
+	typedKeys, err := waffoutils.GenerateKeyPair()
+	require.NoError(t, err)
+	setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey = "MER_AbCdEfGhIjKlMnOpQrStUv", savedKeys.PrivateKey
+	typedMerchant := "MER_ZyXwVuTsRqPoNmLkJiHgFe"
+	typedBody, err := common.Marshal(map[string]string{"merchant_id": typedMerchant, "private_key": typedKeys.PrivateKey})
+	require.NoError(t, err)
+	var accessLog bytes.Buffer
+	gin.DefaultWriter = &accessLog
+	engine := newAccessTokenScopeTestEngine(t, func(engine *gin.Engine) { engine.Use(middleware.RequestId()); middleware.SetUpLogger(engine) })
+	upstreamCalls := 0
+	expectedMerchant, expectedPublicKey := "", ""
+	http.DefaultClient = &http.Client{Transport: paymentRoutePancakeTransport(func(request *http.Request) (*http.Response, error) {
+		upstreamCalls++
+		require.Equal(t, "https://api.waffo.ai/v1/graphql", request.URL.String(), "the actual SDK must use its authenticated GraphQL endpoint")
+		require.Equal(t, http.MethodPost, request.Method)
+		assert.Equal(t, expectedMerchant, request.Header.Get("X-Merchant-Id"))
+		body, err := io.ReadAll(request.Body)
+		require.NoError(t, err)
+		hash := sha256.Sum256(body)
+		canonical := "POST\n/v1/graphql\n" + request.Header.Get("X-Timestamp") + "\n" + base64.StdEncoding.EncodeToString(hash[:])
+		assert.True(t, waffoutils.Verify(canonical, request.Header.Get("X-Signature"), expectedPublicKey), "server must use the supplied/saved private key without exposing it")
+		assert.NotContains(t, string(body), "PRIVATE KEY")
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"data":{"stores":[{"id":"store-fixture","name":"Fixture store","onetimeProducts":[{"id":"product-fixture","name":"Fixture product","status":"active"}]}]}}`))}, nil
+	})}
+	for _, tc := range []struct {
+		name, method, path, query, credential, body, errorMessage string
+		status                                                    int
+		wantCatalog, typed                                        bool
+	}{
+		{name: "root session submits typed credentials only in body", method: "POST", credential: "root-session", body: string(typedBody), status: 200, wantCatalog: true, typed: true},
+		{name: "root read token submits typed credentials", method: "POST", credential: "root-read", body: string(typedBody), status: 200, wantCatalog: true, typed: true},
+		{name: "post empty object uses saved credentials", method: "POST", credential: "root-read", body: `{}`, status: 200, wantCatalog: true},
+		{name: "legacy credential-free get uses saved credentials", method: "GET", credential: "root-read", status: 200, wantCatalog: true},
+		{name: "legacy query private key rejected and hidden", method: "GET", credential: "root-read", query: "?merchant_id=merchant-fixture&private_key=fixture-pancake-private-key-never-log", status: 200},
+		{name: "encoded query private key rejected and hidden", method: "GET", credential: "root-read", query: "?%70rivate_key=fixture-pancake-private-key-never-log", status: 200},
+		{name: "malformed query cannot fall back to saved credentials", method: "GET", credential: "root-read", query: "?private_key=fixture-pancake-private-key-never-log%ZZ", status: 200},
+		{name: "encoded path keeps legacy credentials hidden", method: "GET", path: "/%61pi/option/waffo-pancake/catalog", credential: "root-read", query: "?private_key=fixture-pancake-private-key-never-log", status: 200},
+		{name: "legacy slash redirect keeps credentials out of access log", method: "GET", path: "/api/option/waffo-pancake/catalog/", query: "?private_key=fixture-pancake-private-key-never-log", status: http.StatusMovedPermanently},
+		{name: "legacy merchant-only query cannot override stored identity", method: "GET", credential: "root-read", query: "?merchant_id=merchant-fixture", status: 200},
+		{name: "post query credentials rejected even with valid body", method: "POST", credential: "root-read", query: "?private_key=fixture-pancake-private-key-never-log", body: string(typedBody), status: 200},
+		{name: "malformed body rejected before provider", method: "POST", credential: "root-read", body: `{`, status: 200},
+		{name: "missing credentials are audited as failure", method: "POST", credential: "root-read", body: `{"merchant_id":"MER_AbCdEfGhIjKlMnOpQrStUv"}`, status: 200, errorMessage: "Waffo Pancake credentials are not configured"},
+		{name: "SDK failure is audited as failure", method: "POST", credential: "root-session", body: `{"merchant_id":"invalid-local-merchant","private_key":"invalid-local-fixture"}`, status: 200, errorMessage: "Failed to fetch the catalog"},
+		{name: "admin cannot probe merchant credentials", method: "POST", credential: "admin-read", body: string(typedBody), status: 403},
+		{name: "root token without option scope denied", method: "POST", credential: "root-wallet", body: string(typedBody), status: 403},
+		{name: "anonymous post denied", method: "POST", body: string(typedBody), status: 401},
+		{name: "anonymous legacy query cannot leak key", method: "GET", query: "?private_key=fixture-pancake-private-key-never-log", status: 401},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			expectedMerchant, expectedPublicKey = setting.WaffoPancakeMerchantID, savedKeys.PublicKey
+			if tc.typed {
+				expectedMerchant, expectedPublicKey = typedMerchant, typedKeys.PublicKey
+			}
+			beforeCalls := upstreamCalls
+			path := tc.path
+			if path == "" {
+				path = "/api/option/waffo-pancake/catalog"
+			}
+			request := httptest.NewRequest(tc.method, path+tc.query, strings.NewReader(tc.body))
+			request.Header.Set("Content-Type", "application/json")
+			if raw := credentials[tc.credential]; raw != "" {
+				request.Header.Set("Authorization", "Bearer "+raw)
+			}
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			require.Equal(t, tc.status, response.Code, response.Body.String())
+			if tc.wantCatalog {
+				assert.Equal(t, beforeCalls+1, upstreamCalls)
+				assert.Contains(t, response.Body.String(), `"message":"success"`)
+				assert.Contains(t, response.Body.String(), `"id":"product-fixture"`)
+			} else {
+				assert.Equal(t, beforeCalls, upstreamCalls, "rejected requests must not use saved or supplied merchant credentials")
+				if tc.status == 200 {
+					errorMessage := tc.errorMessage
+					if errorMessage == "" {
+						errorMessage = "Invalid parameters"
+					}
+					var result struct {
+						Success    *bool  `json:"success"`
+						Message    string `json:"message"`
+						MessageKey string `json:"message_key"`
+						Data       string `json:"data"`
+					}
+					require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+					if assert.NotNil(t, result.Success) {
+						assert.False(t, *result.Success, "HTTP 200 business failures must be explicit for request audit consumers")
+					}
+					assert.Equal(t, "error", result.Message)
+					assert.Equal(t, errorMessage, result.MessageKey)
+					assert.Equal(t, errorMessage, result.Data)
+				}
+			}
+			assert.NotContains(t, accessLog.String(), "fixture-pancake-private-key-never-log")
+			assert.NotContains(t, accessLog.String(), "private_key")
+			assert.NotContains(t, accessLog.String(), url.QueryEscape(typedKeys.PrivateKey))
+			assert.NotContains(t, response.Body.String(), typedKeys.PrivateKey)
+			var audits []model.AuditLog
+			require.NoError(t, db.Where("request_id = ?", response.Header().Get(common.RequestIdKey)).Find(&audits).Error)
+			if tc.method == "POST" && tc.status == 200 {
+				require.NotEmpty(t, audits, "root POST keeps existing request audit behavior")
+			}
+			for _, audit := range audits {
+				assert.Equal(t, tc.wantCatalog, audit.Success, "request audit must distinguish a successful catalog response from HTTP 200 business rejection")
+				if audit.Category == model.AuditCategoryOperation {
+					require.NotNil(t, audit.Other.AuditInfo)
+					assert.Equal(t, tc.wantCatalog, audit.Other.AuditInfo.Success, "operation audit must preserve the actual request result")
+				}
+			}
+			encodedAudit, err := common.Marshal(audits)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encodedAudit), "fixture-pancake-private-key-never-log")
+			assert.NotContains(t, string(encodedAudit), "PRIVATE KEY")
+			assert.NotContains(t, accessLog.String(), credentials["root-read"])
+		})
+	}
+	assert.Equal(t, 4, upstreamCalls, "only the four valid credential/body/fallback scenarios contact the SDK transport")
+}
