@@ -438,7 +438,11 @@ func RequestWaffoPancakePay(c *gin.Context) {
 		logger.LogError(c.Request.Context(), common.LogText("Waffo Pancake failed to create checkout session user_id=%d trade_no=%s error_type=%T", id, tradeNo, err))
 		// Only uncertain remote outcomes retain the frozen pending order for a
 		// later verified notification; local rejections were marked failed above.
-		paymentError(c, common.NewMessage("Failed to start payment"))
+		if errors.Is(err, service.ErrWaffoPancakeCheckoutNotStarted) {
+			paymentError(c, common.NewMessage("Failed to start payment"))
+		} else {
+			paymentCheckoutUnknown(c, tradeNo)
+		}
 		return
 	}
 	logger.LogInfo(c.Request.Context(), common.LogText("Waffo Pancake top-up order created user_id=%d trade_no=%s session_id=%s amount=%d money=%.2f", id, tradeNo, session.SessionID, req.Amount, payMoney))

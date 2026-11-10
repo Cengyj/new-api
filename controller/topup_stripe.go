@@ -157,10 +157,12 @@ func (*StripeAdaptor) RequestPay(c *gin.Context, req *StripePayRequest) {
 	}
 	payLink, err := genStripeLink(referenceId, user.StripeCustomer, user.Email, req.Amount, req.SuccessURL, req.CancelURL)
 	if err != nil {
+		knownRejection := false
 		var stripeErr *stripe.Error
 		if errors.As(err, &stripeErr) && stripeErr.Type == stripe.ErrorTypeInvalidRequest &&
 			(stripeErr.HTTPStatusCode == http.StatusBadRequest || stripeErr.HTTPStatusCode == http.StatusUnauthorized ||
 				stripeErr.HTTPStatusCode == http.StatusForbidden) {
+			knownRejection = true
 			// A structured parameter/authentication rejection did not create a
 			// checkout. Preserve the original manual-completion boundary. Network
 			// failures, conflicts and server errors remain indeterminate.
@@ -169,7 +171,11 @@ func (*StripeAdaptor) RequestPay(c *gin.Context, req *StripePayRequest) {
 			}
 		}
 		logger.LogError(c.Request.Context(), common.LogText("Stripe failed to create Checkout Session user_id=%d trade_no=%s amount=%d %s", id, referenceId, req.Amount, stripeCheckoutErrorSummary(err)))
-		paymentError(c, common.NewMessage("Failed to start payment"))
+		if knownRejection {
+			paymentError(c, common.NewMessage("Failed to start payment"))
+		} else {
+			paymentCheckoutUnknown(c, referenceId)
+		}
 		return
 	}
 

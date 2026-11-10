@@ -303,6 +303,15 @@ func paymentError(c *gin.Context, err error) {
 	c.JSON(http.StatusOK, body)
 }
 
+// A lost or incomplete checkout response cannot establish that no payment
+// session exists. Keep the original order available to history and callbacks.
+func paymentCheckoutUnknown(c *gin.Context, tradeNo string) {
+	message := common.NewMessage("Payment request result is unknown. Check Order History before trying again.")
+	body := gin.H{"message": "error", "data": message.Error(), "trade_no": tradeNo}
+	maps.Copy(body, message.Fields())
+	c.JSON(http.StatusOK, body)
+}
+
 func rejectInvalidCreditedQuota(c *gin.Context, userId int, quota decimal.Decimal) bool {
 	creditedQuota, err := validateCreditedQuota(quota)
 	if err == nil {

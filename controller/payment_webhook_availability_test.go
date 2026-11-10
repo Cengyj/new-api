@@ -1610,8 +1610,10 @@ func TestWalletCreemCheckoutHTTPPreservesFrozenOrderAndRecovery(t *testing.T) {
 			router.ServeHTTP(recorder, request)
 			require.Equal(t, http.StatusOK, recorder.Code)
 			var response struct {
-				Message string          `json:"message"`
-				Data    json.RawMessage `json:"data"`
+				Message    string          `json:"message"`
+				MessageKey string          `json:"message_key"`
+				TradeNo    string          `json:"trade_no"`
+				Data       json.RawMessage `json:"data"`
 			}
 			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 			var data map[string]string
@@ -1631,6 +1633,12 @@ func TestWalletCreemCheckoutHTTPPreservesFrozenOrderAndRecovery(t *testing.T) {
 			}
 			if response.Message == "success" {
 				assert.Equal(t, order.TradeNo, data["order_id"])
+			} else if scenario == "explicit_rejection" {
+				assert.Equal(t, "Failed to start payment", response.MessageKey)
+				assert.Empty(t, response.TradeNo)
+			} else {
+				assert.Equal(t, "Payment request result is unknown. Check Order History before trying again.", response.MessageKey)
+				assert.Equal(t, order.TradeNo, response.TradeNo)
 			}
 			require.NoError(t, model.DB.First(&order, order.Id).Error)
 			var invitee, inviter model.User
@@ -1840,6 +1848,18 @@ func TestWalletReferralStripeCheckoutRejectionPreservesCompletionPolicy(t *testi
 				t.Fatal("checkout did not reach the isolated Stripe HTTP fixture")
 			}
 			require.Equal(t, common.TopUpStatusPending, order.Status)
+			var response struct {
+				MessageKey string `json:"message_key"`
+				TradeNo    string `json:"trade_no"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+			if tc.wantStatus == common.TopUpStatusFailed {
+				assert.Equal(t, "Failed to start payment", response.MessageKey)
+				assert.Empty(t, response.TradeNo)
+			} else {
+				assert.Equal(t, "Payment request result is unknown. Check Order History before trying again.", response.MessageKey)
+				assert.Equal(t, order.TradeNo, response.TradeNo)
+			}
 			require.NotNil(t, order.CreditedQuota)
 			assert.Equal(t, 1000, *order.CreditedQuota)
 			require.NoError(t, model.DB.First(&order, order.Id).Error)
@@ -1949,6 +1969,8 @@ func TestWalletReferralCheckoutLocalFailurePreservesCompletionPolicy(t *testing.
 			router.ServeHTTP(recorder, request)
 			assert.Contains(t, recorder.Body.String(), `"message":"error"`)
 			assert.Zero(t, requests.Load(), "these failures must happen before any provider request")
+			assert.NotContains(t, recorder.Body.String(), "Payment request result is unknown")
+			assert.NotContains(t, recorder.Body.String(), `"trade_no"`)
 			var orders []model.TopUp
 			require.NoError(t, model.DB.Find(&orders).Error)
 			tradeNo := "no-checkout-created"
@@ -2147,6 +2169,15 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 			case order = <-observed:
 			default:
 				t.Fatal("checkout did not reach the isolated HTTP provider fixture")
+			}
+			if scenario != "successful_checkout" {
+				var response struct {
+					MessageKey string `json:"message_key"`
+					TradeNo    string `json:"trade_no"`
+				}
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+				assert.Equal(t, "Payment request result is unknown. Check Order History before trying again.", response.MessageKey)
+				assert.Equal(t, order.TradeNo, response.TradeNo)
 			}
 			require.NoError(t, model.DB.First(&order, order.Id).Error)
 			if scenario == "callback_before_response_loss" {
@@ -6476,6 +6507,7 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 			var decoded struct {
 				Message    string
 				MessageKey string `json:"message_key"`
+				TradeNo    string `json:"trade_no"`
 				Data       json.RawMessage
 			}
 			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &decoded))
@@ -6483,7 +6515,13 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 				assert.Equal(t, "success", decoded.Message)
 			} else {
 				assert.Equal(t, "error", decoded.Message)
-				assert.Equal(t, "Failed to start payment", decoded.MessageKey)
+				if tc.rejected {
+					assert.Equal(t, "Failed to start payment", decoded.MessageKey)
+					assert.Empty(t, decoded.TradeNo)
+				} else {
+					assert.Equal(t, "Payment request result is unknown. Check Order History before trying again.", decoded.MessageKey)
+					assert.Equal(t, outgoing.PaymentRequestID, decoded.TradeNo)
+				}
 				assert.NotContains(t, response.Body.String(), "audit-unverified")
 			}
 			stored, err := model.GetTopUpByTradeNoWithError(outgoing.PaymentRequestID)

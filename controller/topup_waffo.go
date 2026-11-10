@@ -351,7 +351,7 @@ func RequestWaffoPay(c *gin.Context) {
 		logger.LogError(c.Request.Context(), common.LogText("Waffo failed to create order user_id=%d trade_no=%s error_type=%T", id, merchantOrderId, err))
 		// The provider may have accepted an interrupted request. Keep the frozen
 		// pending order available for its eventual verified notification.
-		paymentError(c, common.NewMessage("Failed to start payment"))
+		paymentCheckoutUnknown(c, merchantOrderId)
 		return
 	}
 	paymentUrl, err := resolveWaffoCheckoutResponse(topUp, resp)
@@ -361,7 +361,11 @@ func RequestWaffoPay(c *gin.Context) {
 		} else {
 			logger.LogError(c.Request.Context(), common.LogText("Waffo failed to create order user_id=%d trade_no=%s error_type=%T", id, merchantOrderId, err))
 		}
-		paymentError(c, common.NewMessage("Failed to start payment"))
+		if resp != nil && strings.TrimSpace(resp.Code) != "" && !resp.IsSuccess() {
+			paymentError(c, common.NewMessage("Failed to start payment"))
+		} else {
+			paymentCheckoutUnknown(c, merchantOrderId)
+		}
 		return
 	}
 	logger.LogInfo(c.Request.Context(), common.LogText("Waffo top-up order created user_id=%d trade_no=%s amount=%d money=%.2f pay_method_type=%s pay_method_name=%q", id, merchantOrderId, req.Amount, payMoney, resolvedPayMethodType, resolvedPayMethodName))

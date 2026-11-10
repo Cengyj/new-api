@@ -26,6 +26,10 @@ const CreemSignatureHeader = "creem-signature"
 
 var creemAdaptor = &CreemAdaptor{}
 
+// Local construction failures and documented input/authentication refusals
+// establish that no checkout was created. Other failures leave the result open.
+var errCreemCheckoutNotCreated = errors.New("Creem checkout was not created")
+
 // 生成HMAC-SHA256签名
 func generateCreemSignature(payload string, secret string) string {
 	h := hmac.New(sha256.New, []byte(secret))
@@ -139,7 +143,11 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 	checkoutUrl, err := genCreemLink(c.Request.Context(), referenceId, selectedProduct, user.Email, user.Username)
 	if err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Creem failed to create payment link user_id=%d trade_no=%s product_id=%s error_type=%T", id, referenceId, selectedProduct.ProductId, err))
-		paymentError(c, common.NewMessage("Failed to start payment"))
+		if errors.Is(err, errCreemCheckoutNotCreated) {
+			paymentError(c, common.NewMessage("Failed to start payment"))
+		} else {
+			paymentCheckoutUnknown(c, referenceId)
+		}
 		return
 	}
 
@@ -381,7 +389,7 @@ func genCreemLink(ctx context.Context, referenceId string, product *CreemProduct
 	apiKey, testMode := setting.CreemApiKey, setting.CreemTestMode
 	common.OptionMapRWMutex.RUnlock()
 	if apiKey == "" {
-		return "", errors.New("Creem API key is not configured")
+		return "", fmt.Errorf("%w: API key is not configured", errCreemCheckoutNotCreated)
 	}
 
 	// 根据测试模式选择 API 端点
@@ -411,13 +419,13 @@ func genCreemLink(ctx context.Context, referenceId string, product *CreemProduct
 	// 序列化请求数据
 	jsonData, err := common.Marshal(requestData)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request data: %v", err)
+		return "", fmt.Errorf("%w: marshal request data: %w", errCreemCheckoutNotCreated, err)
 	}
 
 	// 创建 HTTP 请求
 	req, err := http.NewRequest("POST", apiUrl, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return "", fmt.Errorf("failed to create HTTP request: %v", err)
+		return "", fmt.Errorf("%w: create HTTP request: %w", errCreemCheckoutNotCreated, err)
 	}
 
 	// 设置请求头
@@ -444,13 +452,18 @@ func genCreemLink(ctx context.Context, referenceId string, product *CreemProduct
 
 	logger.LogInfo(ctx, common.LogText("Creem API response received trade_no=%s status_code=%d body_bytes=%d", referenceId, resp.StatusCode, len(body)))
 
-	// 检查响应状态
-	if resp.StatusCode/100 != 2 {
-		return "", fmt.Errorf("Creem API http status %d ", resp.StatusCode)
-	}
-	// 解析响应
 	var checkoutResp CreemCheckoutResponse
 	err = common.Unmarshal(body, &checkoutResp)
+	if resp.StatusCode/100 != 2 {
+		// Create Checkout documents 400/401/404 as input/auth/resource
+		// rejections. A contradictory checkout payload or unreadable body
+		// remains unknown; this does not change the local pending policy.
+		if (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusNotFound) &&
+			err == nil && checkoutResp.Id == "" && strings.TrimSpace(checkoutResp.CheckoutUrl) == "" {
+			return "", fmt.Errorf("%w: HTTP %d", errCreemCheckoutNotCreated, resp.StatusCode)
+		}
+		return "", fmt.Errorf("Creem API http status %d", resp.StatusCode)
+	}
 	if err != nil {
 		return "", fmt.Errorf("failed to parse response: %v", err)
 	}
