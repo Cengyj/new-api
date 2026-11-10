@@ -145,6 +145,7 @@ test.each([
       presetAmounts: [{ value: quantity }],
       loading: false,
       refetch: vi.fn(),
+      loadFailed: false,
     })
     vi.spyOn(api, 'get').mockResolvedValue({
       data: { success: true, data: {} },
@@ -252,6 +253,7 @@ test.each([
       presetAmounts: [],
       loading: false,
       refetch: vi.fn(),
+      loadFailed: false,
     })
     vi.spyOn(api, 'get').mockResolvedValue({
       data: { success: true, data: {} },
@@ -834,6 +836,7 @@ test('an already displayed confirmation cannot submit for a different payer befo
     presetAmounts: [],
     loading: false,
     refetch: vi.fn(),
+    loadFailed: false,
   })
   vi.spyOn(api, 'get').mockResolvedValue({ data: { success: true, data: {} } })
   const post = vi
@@ -1132,6 +1135,7 @@ test('changing the amount invalidates a pending method quote and keeps the new a
     presetAmounts: [],
     loading: false,
     refetch: vi.fn(),
+    loadFailed: false,
   })
   vi.spyOn(api, 'get').mockResolvedValue({ data: { success: true, data: {} } })
   let resolve!: (value: { data: { success: boolean; data: string } }) => void
@@ -1186,6 +1190,7 @@ test('a pending Creem order cannot be dismissed before checkout resolves', async
     presetAmounts: [],
     loading: false,
     refetch: vi.fn(),
+    loadFailed: false,
   })
   vi.spyOn(api, 'get').mockResolvedValue({ data: { success: true, data: {} } })
   let resolve!: (value: { data: unknown }) => void
@@ -1238,6 +1243,7 @@ test.each(['business', 'network'])(
       presetAmounts: [],
       loading: false,
       refetch: vi.fn(),
+      loadFailed: false,
     })
     let reads = 0
     const get = vi.spyOn(api, 'get').mockImplementation(async () => {
@@ -1288,6 +1294,7 @@ test('a late wallet read failure cannot replace the next account balance with an
     presetAmounts: [],
     loading: false,
     refetch: vi.fn(),
+    loadFailed: false,
   })
   let rejectOld!: (reason: Error) => void
   const previous = new Promise((_, reject) => {
@@ -1361,6 +1368,7 @@ test.each([
       presetAmounts: [],
       loading: false,
       refetch: vi.fn(),
+      loadFailed: false,
     })
     vi.spyOn(XMLHttpRequest.prototype, 'send').mockImplementation(function (
       this: XMLHttpRequest
@@ -1486,6 +1494,7 @@ test.each([
       presetAmounts: [],
       loading: false,
       refetch: vi.fn(),
+      loadFailed: false,
     })
     let finish!: (value: unknown) => void
     const nextRead = new Promise((resolve) => {
@@ -1542,6 +1551,7 @@ test('a confirmed reward transfer refreshes wallet data without reusing or resto
     presetAmounts: [],
     loading: false,
     refetch: vi.fn(),
+    loadFailed: false,
   })
   const originalAdapter = api.defaults.adapter
   let wallet = 0
@@ -1692,6 +1702,7 @@ test('an unknown checkout keeps its original order visible and searchable among 
     presetAmounts: [],
     loading: false,
     refetch: vi.fn(),
+    loadFailed: false,
   })
   const records = [original, previous].map((trade_no, index) => ({
     id: 2 - index,
@@ -1772,32 +1783,48 @@ test.each(['alipay', 'stripe', 'creem', 'waffo', 'waffo_pancake'])(
   '%s preserves a known unknown checkout reference without creating another payment',
   async (provider) => {
     const original = `original_${provider}_checkout`
-    const post = vi.spyOn(api, 'post').mockResolvedValue({
-      data: {
-        message: 'error',
-        trade_no: original,
-        message_key:
-          'Payment request result is unknown. Check Order History before trying again.',
-      },
-    })
-    const { result } = renderHook(() => ({
-      regular: usePayment(),
-      creem: useCreemPayment(),
-      waffo: useWaffoPayment(),
-      pancake: useWaffoPancakePayment(),
-    }))
-    render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
-    await act(async () => {
-      if (provider === 'creem') {
-        await result.current.creem.processCreemPayment('prod_reference')
-      } else if (provider === 'waffo') {
-        await result.current.waffo.processWaffoPayment(10, 0)
-      } else if (provider === 'waffo_pancake') {
-        await result.current.pancake.processWaffoPancakePayment(10)
-      } else await result.current.regular.processPayment(10, provider)
-    })
-    expect(screen.getByText(original)).toBeVisible()
-    expect(post).toHaveBeenCalledTimes(1)
+    const originalAdapter = api.defaults.adapter
+    const requests: InternalAxiosRequestConfig[] = []
+    api.defaults.adapter = async (config) => {
+      requests.push(config)
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: {
+          success: false,
+          message: 'error',
+          trade_no: original,
+          checkout_outcome: 'unknown',
+          message_key:
+            'Payment request result is unknown. Check Order History before trying again.',
+        },
+      }
+    }
+    try {
+      const { result } = renderHook(() => ({
+        regular: usePayment(),
+        creem: useCreemPayment(),
+        waffo: useWaffoPayment(),
+        pancake: useWaffoPancakePayment(),
+      }))
+      render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+      await act(async () => {
+        if (provider === 'creem') {
+          await result.current.creem.processCreemPayment('prod_reference')
+        } else if (provider === 'waffo') {
+          await result.current.waffo.processWaffoPayment(10, 0)
+        } else if (provider === 'waffo_pancake') {
+          await result.current.pancake.processWaffoPancakePayment(10)
+        } else await result.current.regular.processPayment(10, provider)
+      })
+      expect(screen.getByText(original)).toBeVisible()
+      expect(requests).toHaveLength(1)
+      expect(requests[0].method).toBe('post')
+    } finally {
+      api.defaults.adapter = originalAdapter
+    }
   }
 )
 

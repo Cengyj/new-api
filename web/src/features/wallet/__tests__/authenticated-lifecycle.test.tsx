@@ -35,6 +35,7 @@ import {
 import userEvent from '@testing-library/user-event'
 import {
   AxiosHeaders,
+  AxiosError,
   type AxiosResponse,
   type InternalAxiosRequestConfig,
 } from 'axios'
@@ -731,4 +732,112 @@ test('a new account payment-method read failure cannot expose the previous accou
   expect(
     screen.queryByRole('alertdialog', { name: 'Confirm Payment' })
   ).not.toBeInTheDocument()
+})
+
+test.each(['HTTP 503', 'business failure'])(
+  'current payment configuration %s keeps an actionable failure instead of a disabled-channel claim',
+  async (outcome) => {
+    let recovered = false
+    api.defaults.adapter = async (config) => {
+      requests.push(config)
+      if (config.url !== '/api/user/topup/info' || recovered) {
+        return readResponse(config)
+      }
+      const failure = {
+        ...response(config, null),
+        data: {
+          success: false,
+          message: 'Current payment configuration unavailable',
+        },
+      }
+      if (outcome === 'HTTP 503') {
+        throw new AxiosError(
+          'Service unavailable',
+          'ERR_BAD_RESPONSE',
+          config,
+          undefined,
+          { ...failure, status: 503, statusText: 'Service Unavailable' }
+        )
+      }
+      return failure
+    }
+    const errorToast = vi.spyOn(toast, 'error')
+    await mountWallet()
+    await waitFor(() => expect(errorToast).toHaveBeenCalled())
+    expect(
+      screen.queryByText(
+        'Online topup is not enabled. Please use redemption code or contact administrator.'
+      )
+    ).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Order History' }))
+    const history = await screen.findByRole('dialog', {
+      name: 'Billing History',
+    })
+    expect(
+      await within(history).findByText('original-pending-order')
+    ).toBeVisible()
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('dialog', { name: 'Billing History' })
+      ).not.toBeInTheDocument()
+    )
+    const retry = screen.getByRole('button', { name: 'Retry' })
+    expect(retry).toBeEnabled()
+    recovered = true
+    await userEvent.click(retry)
+    expect(await screen.findByRole('button', { name: 'Alipay' })).toBeEnabled()
+    expect(
+      screen.queryByRole('button', { name: 'Retry' })
+    ).not.toBeInTheDocument()
+    expect(
+      requests.filter((request) => request.url === '/api/user/topup/info')
+    ).toHaveLength(2)
+    expect(requests.some((request) => request.url === '/api/user/pay')).toBe(
+      false
+    )
+  }
+)
+
+test('successful disabled payment configuration still shows the legitimate disabled-channel state', async () => {
+  api.defaults.adapter = async (config) => {
+    requests.push(config)
+    if (config.url !== '/api/user/topup/info') return readResponse(config)
+    return response(config, {
+      ...topupInfo,
+      enable_online_topup: false,
+      pay_methods: [],
+    })
+  }
+  await mountWallet()
+  expect(
+    await screen.findByText(
+      'Online topup is not enabled. Please use redemption code or contact administrator.'
+    )
+  ).toBeVisible()
+  expect(
+    screen.queryByRole('button', { name: 'Retry' })
+  ).not.toBeInTheDocument()
+})
+
+test('a failed payment-configuration refresh marks retained methods as unavailable until Retry succeeds', async () => {
+  const { result } = renderHook(useTopupInfo)
+  await waitFor(() =>
+    expect(result.current.topupInfo?.pay_methods[0].name).toBe('Alipay')
+  )
+  api.defaults.adapter = async (config) => ({
+    ...response(config, null),
+    data: {
+      success: false,
+      message: 'Current payment configuration unavailable',
+    },
+  })
+  await act(() => result.current.refetch())
+  expect(result.current.loading).toBe(false)
+  expect(result.current.loadFailed).toBe(true)
+  expect(result.current.topupInfo?.pay_methods[0].name).toBe('Alipay')
+  api.defaults.adapter = async (config) => readResponse(config)
+  await act(() => result.current.refetch())
+  expect(result.current.loadFailed).toBe(false)
+  expect(result.current.topupInfo?.pay_methods[0].name).toBe('Alipay')
 })

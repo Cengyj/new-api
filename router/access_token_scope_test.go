@@ -14,14 +14,17 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/Calcium-Ion/go-epay/epay"
@@ -35,12 +38,15 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	sqlmysql "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stripe/stripe-go/v81/webhook"
 	waffonet "github.com/waffo-com/waffo-go/net"
 	"github.com/waffo-com/waffo-go/types/order"
 	waffoutils "github.com/waffo-com/waffo-go/utils"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
@@ -1398,4 +1404,277 @@ func TestPaymentCatalogCredentialsUseBodyAndNeverEnterLogs(t *testing.T) {
 		})
 	}
 	assert.Equal(t, 4, upstreamCalls, "only the four valid credential/body/fallback scenarios contact the SDK transport")
+}
+
+func TestPaymentFailureResponsesPreserveAuditOutcome(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			var dialector gorm.Dialector
+			var admin *gorm.DB
+			databaseName := "newapi_pay_audit_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+			if dialect == "sqlite" {
+				dialector = sqlite.Open(filepath.Join(t.TempDir(), "payment-outcome.db"))
+			} else {
+				dsn := os.Getenv("TEST_" + strings.ToUpper(dialect) + "_DSN")
+				if dsn == "" {
+					t.Skip("isolated database DSN is not configured")
+				}
+				var adminDialector gorm.Dialector
+				if dialect == "mysql" {
+					configuration, err := sqlmysql.ParseDSN(dsn)
+					require.NoError(t, err)
+					host, _, err := net.SplitHostPort(configuration.Addr)
+					require.NoError(t, err)
+					require.True(t, net.ParseIP(host).IsLoopback(), "only isolated loopback databases are accepted")
+					adminDialector = mysql.Open(dsn)
+					configuration.DBName, configuration.ParseTime = databaseName, true
+					dialector = mysql.Open(configuration.FormatDSN())
+				} else {
+					configuration, err := url.Parse(dsn)
+					require.NoError(t, err)
+					require.True(t, net.ParseIP(configuration.Hostname()).IsLoopback(), "only isolated loopback databases are accepted")
+					adminDialector = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+					configuration.Path = "/" + databaseName
+					dialector = postgres.New(postgres.Config{DSN: configuration.String(), PreferSimpleProtocol: true})
+				}
+				var err error
+				admin, err = gorm.Open(adminDialector, &gorm.Config{})
+				require.NoError(t, err)
+				require.NoError(t, admin.Exec("CREATE DATABASE "+databaseName).Error)
+			}
+			db, err := gorm.Open(dialector, &gorm.Config{})
+			require.NoError(t, err)
+			previousDB, previousLogDB, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+			previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+			previousSecret, previousLimit, previousCritical := common.SessionSecret, common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable
+			previousClient, previousTransport := http.DefaultClient, http.DefaultTransport
+			previousPayment, previousGeneral := *operation_setting.GetPaymentSetting(), *operation_setting.GetGeneralSetting()
+			previousUnit, previousPrice, previousMin := common.QuotaPerUnit, operation_setting.Price, operation_setting.MinTopUp
+			previousWaffo, previousCreemTest := setting.WaffoEnabled, setting.CreemTestMode
+			previousOptions := common.OptionMap
+			settingFields := []*string{&setting.CreemApiKey, &setting.CreemProducts, &setting.CreemWebhookSecret,
+				&setting.WaffoPancakeMerchantID, &setting.WaffoPancakePrivateKey, &setting.WaffoPancakeProductID, &setting.WaffoPancakeStoreID, &setting.WaffoPancakeReturnURL}
+			previousSettings := make([]string, len(settingFields))
+			for i, field := range settingFields {
+				previousSettings[i] = *field
+				*field = ""
+			}
+			model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
+			common.SetDatabaseTypes(common.DatabaseType(dialect), common.DatabaseType(dialect))
+			// Use normal startup initialization for reserved-column quoting,
+			// without opening another database or running startup migrations.
+			t.Setenv("LOG_SQL_DSN", "")
+			previousMaster := common.IsMasterNode
+			common.IsMasterNode = false
+			initErr := model.InitLogDB()
+			common.IsMasterNode = previousMaster
+			require.NoError(t, initErr)
+			common.SessionSecret, common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable = "payment-outcome-isolated-session", false, false
+			common.OptionMap = map[string]string{}
+			common.QuotaPerUnit, operation_setting.Price, operation_setting.MinTopUp = 1, 1, 1
+			operation_setting.GetGeneralSetting().QuotaDisplayType = operation_setting.QuotaDisplayTypeUSD
+			operation_setting.GetPaymentSetting().ComplianceConfirmed = true
+			operation_setting.GetPaymentSetting().ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+			operation_setting.GetPaymentSetting().AmountDiscount = map[int]float64{}
+			setting.WaffoEnabled, setting.CreemTestMode = false, false
+			setting.CreemApiKey, setting.CreemWebhookSecret = "creem-isolated-test-key", "creem-isolated-webhook-key"
+			setting.CreemProducts = `[{"productId":"prod-audit","name":"Audit fixture","price":10,"currency":"USD","quota":100}]`
+			models := []any{&model.User{}, &model.UserSession{}, &model.UserAccessToken{}, &model.AuditLog{}, &model.Option{}, &model.TopUp{}, &model.SubscriptionOrder{}, &model.ReferralRebate{}}
+			t.Cleanup(func() {
+				connection, err := db.DB()
+				if err == nil {
+					assert.NoError(t, connection.Close())
+				}
+				if admin != nil {
+					assert.NoError(t, admin.Exec("DROP DATABASE "+databaseName).Error, "only remove this run's isolated database")
+					connection, err := admin.DB()
+					if err == nil {
+						assert.NoError(t, connection.Close())
+					}
+				}
+				model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+				common.SetDatabaseTypes(previousType, previousLogType)
+				common.IsMasterNode = false
+				assert.NoError(t, model.InitLogDB())
+				common.IsMasterNode, model.LOG_DB = previousMaster, previousLogDB
+				common.SetLogDatabaseType(previousLogType)
+				common.SessionSecret, common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable = previousSecret, previousLimit, previousCritical
+				http.DefaultClient, http.DefaultTransport = previousClient, previousTransport
+				*operation_setting.GetPaymentSetting(), *operation_setting.GetGeneralSetting() = previousPayment, previousGeneral
+				common.QuotaPerUnit, operation_setting.Price, operation_setting.MinTopUp = previousUnit, previousPrice, previousMin
+				setting.WaffoEnabled, setting.CreemTestMode, common.OptionMap = previousWaffo, previousCreemTest, previousOptions
+				for i, field := range settingFields {
+					*field = previousSettings[i]
+				}
+			})
+			require.NoError(t, db.AutoMigrate(models...))
+			versionQuery := "SELECT version()"
+			if dialect == "sqlite" {
+				versionQuery = "SELECT sqlite_version()"
+			}
+			var version string
+			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+			t.Logf("actual main and audit database: %s %s; isolated database: %s", dialect, version, databaseName)
+			user := model.User{Username: "payment-audit-root", AffCode: "payment-audit-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default", Email: "audit@example.invalid"}
+			require.NoError(t, db.Create(&user).Error)
+			rawToken := model.AccessTokenPrefix + strings.Repeat("p", 32) + "payment-audit"
+			token := model.UserAccessToken{Name: "payment-audit", TokenHash: model.AccessTokenFingerprint(rawToken), TokenHint: model.AccessTokenHint(rawToken)}
+			require.NoError(t, token.SetScopes([]string{"wallet:read", "wallet:write", "option:write"}))
+			require.NoError(t, model.CreateUserAccessToken(user.Id, &token, service.AccessTokenMaxPerUser))
+			bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "payment-audit-test")
+			require.NoError(t, err)
+			keys, err := waffoutils.GenerateKeyPair()
+			require.NoError(t, err)
+			pairBody, err := common.Marshal(map[string]string{"merchant_id": "MER_AbCdEfGhIjKlMnOpQrStUv", "private_key": keys.PrivateKey})
+			require.NoError(t, err)
+			saveBody, err := common.Marshal(map[string]string{"merchant_id": "MER_AbCdEfGhIjKlMnOpQrStUv", "private_key": keys.PrivateKey, "store_id": "STO_AbCdEfGhIjKlMnOpQrStUv", "product_id": "OTP_AbCdEfGhIjKlMnOpQrStUv"})
+			require.NoError(t, err)
+			engine := newAccessTokenScopeTestEngine(t, func(engine *gin.Engine) { engine.Use(middleware.RequestId()) })
+			for _, tc := range []struct {
+				name, path, body, key, fault string
+				admin, success               bool
+			}{
+				{name: "quote rejects malformed amount", path: "/api/user/amount", body: `{`, key: "Invalid parameters"},
+				{name: "quote success remains audited success", path: "/api/user/amount", body: `{"amount":10}`, success: true},
+				{name: "Epay rejects before checkout", path: "/api/user/pay", body: `{`, key: "Invalid parameters"},
+				{name: "Stripe rejects foreign payment method", path: "/api/user/stripe/pay", body: `{"payment_method":"foreign"}`, key: "Unsupported payment channel"},
+				{name: "Creem rejects foreign payment method", path: "/api/user/creem/pay", body: `{"payment_method":"foreign"}`, key: "Unsupported payment channel"},
+				{name: "Waffo disabled rejects checkout", path: "/api/user/waffo/pay", body: `{}`, key: "Waffo payment is not enabled"},
+				{name: "Pancake incomplete rejects checkout", path: "/api/user/waffo-pancake/pay", body: `{}`, key: "Waffo Pancake configuration is incomplete"},
+				{name: "Save rejects incomplete binding", path: "/api/option/waffo-pancake/save", body: `{}`, key: "Failed to save configuration", admin: true},
+				{name: "Pair rejects missing credentials", path: "/api/option/waffo-pancake/pair", body: `{}`, key: "Waffo Pancake credentials are not configured", admin: true},
+				{name: "Pair reports local SDK failure", path: "/api/option/waffo-pancake/pair", body: `{"merchant_id":"invalid-local-merchant","private_key":"invalid-local-key"}`, fault: "pair-local", admin: true},
+				{name: "Pair preserves orphan store on product failure", path: "/api/option/waffo-pancake/pair", body: string(pairBody), fault: "pair-orphan", admin: true},
+				{name: "Creem disconnect preserves unknown original order", path: "/api/user/creem/pay", body: `{"payment_method":"creem","product_id":"prod-audit"}`, fault: "creem-disconnect", key: "Payment request result is unknown. Check Order History before trying again."},
+				{name: "shared subscription reader error is failure", path: "/api/subscription/creem/pay", fault: "body-reader"},
+				{name: "Save success remains audited success", path: "/api/option/waffo-pancake/save", body: string(saveBody), admin: true, success: true},
+			} {
+				authMethods := []string{"access_token"}
+				if tc.admin {
+					authMethods = append(authMethods, "session")
+				}
+				for _, authMethod := range authMethods {
+					t.Run(tc.name+"/"+authMethod, func(t *testing.T) {
+						upstreamCalls := 0
+						http.DefaultClient = &http.Client{Transport: paymentRoutePancakeTransport(func(request *http.Request) (*http.Response, error) {
+							upstreamCalls++
+							require.Equal(t, "pair-orphan", tc.fault, "only orphan fixture may contact the Pancake SDK transport")
+							require.Equal(t, "api.waffo.ai", request.URL.Host)
+							if upstreamCalls == 1 {
+								assert.Equal(t, "/v1/actions/store/create-store", request.URL.Path)
+								return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"data":{"store":{"id":"STO_AbCdEfGhIjKlMnOpQrStUv","name":"fixture"}}}`))}, nil
+							}
+							assert.Equal(t, "/v1/actions/onetime-product/create-product", request.URL.Path)
+							return &http.Response{StatusCode: 400, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"errors":[{"message":"isolated product rejection"}]}`))}, nil
+						})}
+						var receivedTrade string
+						if tc.fault == "creem-disconnect" {
+							// Read the real HTTP request, then close its socket before any
+							// response. This proves unknown checkout at the transport boundary.
+							received := make(chan string, 1)
+							server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+								var body struct {
+									RequestID string `json:"request_id"`
+								}
+								assert.NoError(t, common.DecodeJson(request.Body, &body))
+								received <- body.RequestID
+								connection, _, err := writer.(http.Hijacker).Hijack()
+								if assert.NoError(t, err) {
+									assert.NoError(t, connection.Close())
+								}
+							}))
+							t.Cleanup(server.Close)
+							localURL, err := url.Parse(server.URL)
+							require.NoError(t, err)
+							transport := &http.Transport{Proxy: nil}
+							t.Cleanup(transport.CloseIdleConnections)
+							http.DefaultTransport = paymentRoutePancakeTransport(func(request *http.Request) (*http.Response, error) {
+								require.Equal(t, "https://api.creem.io/v1/checkouts", request.URL.String())
+								clone := request.Clone(request.Context())
+								clone.URL.Scheme, clone.URL.Host = localURL.Scheme, localURL.Host
+								response, err := transport.RoundTrip(clone)
+								receivedTrade = <-received
+								return response, err
+							})
+							t.Cleanup(func() { http.DefaultTransport = previousTransport })
+						}
+						var reader io.Reader = strings.NewReader(tc.body)
+						if tc.fault == "body-reader" {
+							reader = iotest.ErrReader(errors.New("isolated synthetic body read error"))
+						}
+						request := httptest.NewRequest(http.MethodPost, tc.path, reader)
+						request.Header.Set("Content-Type", "application/json")
+						credential := rawToken
+						if authMethod == "session" {
+							credential = bundle.AccessToken
+						}
+						request.Header.Set("Authorization", "Bearer "+credential)
+						response := httptest.NewRecorder()
+						engine.ServeHTTP(response, request)
+						require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+						var result map[string]any
+						require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+						if tc.success {
+							assert.Equal(t, "success", result["message"])
+						} else {
+							assert.Equal(t, false, result["success"], "HTTP 200 failure must explicitly inform response and audit consumers")
+							assert.Equal(t, "error", result["message"])
+							if tc.key != "" {
+								assert.Equal(t, tc.key, result["message_key"])
+								assert.NotEmpty(t, result["data"])
+							}
+						}
+						if tc.fault == "pair-orphan" {
+							require.Equal(t, 2, upstreamCalls, "real SDK completed Store and reached Product create")
+							data, ok := result["data"].(map[string]any)
+							require.True(t, ok)
+							assert.Equal(t, true, data["orphan_store"])
+							assert.Equal(t, "STO_AbCdEfGhIjKlMnOpQrStUv", data["store_id"])
+							assert.NotEmpty(t, data["error"])
+						} else {
+							assert.Zero(t, upstreamCalls)
+						}
+						if tc.fault == "creem-disconnect" {
+							require.NotEmpty(t, receivedTrade)
+							assert.Equal(t, receivedTrade, result["trade_no"], "unknown outcome retains the original provider-bound identity")
+							var order model.TopUp
+							require.NoError(t, db.Where("trade_no = ?", receivedTrade).First(&order).Error)
+							assert.Equal(t, common.TopUpStatusPending, order.Status)
+							assert.Equal(t, model.PaymentProviderCreem, order.PaymentProvider)
+							require.NotNil(t, order.CreditedQuota)
+							assert.Equal(t, 100, *order.CreditedQuota)
+							assert.Nil(t, order.SettlementAudit)
+						}
+						requestID := response.Header().Get(common.RequestIdKey)
+						require.NotEmpty(t, requestID)
+						var audits []model.AuditLog
+						require.NoError(t, db.Where("request_id = ?", requestID).Find(&audits).Error)
+						require.NotEmpty(t, audits, "authenticated request must reach the actual persisted audit path")
+						for _, audit := range audits {
+							assert.Equal(t, tc.success, audit.Success, audit.Category)
+							assert.Equal(t, user.Id, audit.UserId)
+							assert.Equal(t, authMethod, audit.AuthMethod)
+							if audit.Category == model.AuditCategoryOperation {
+								require.NotNil(t, audit.Other.AuditInfo)
+								require.NotNil(t, audit.Other.AdminInfo)
+								assert.Equal(t, tc.success, audit.Other.AuditInfo.Success)
+								assert.Equal(t, authMethod, audit.Other.AdminInfo.AuthMethod)
+								assert.Equal(t, user.Id, audit.Other.AdminInfo.AdminID)
+							}
+						}
+						encoded, err := common.Marshal(audits)
+						require.NoError(t, err)
+						assert.NotContains(t, string(encoded), credential)
+						assert.NotContains(t, string(encoded), keys.PrivateKey)
+						require.NoError(t, db.First(&user, user.Id).Error)
+						assert.Zero(t, user.Quota)
+						assert.Zero(t, user.AffQuota)
+						var rebates int64
+						require.NoError(t, db.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+						assert.Zero(t, rebates)
+					})
+				}
+			}
+		})
+	}
 }

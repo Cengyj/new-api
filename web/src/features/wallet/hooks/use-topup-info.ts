@@ -183,6 +183,7 @@ export function useTopupInfo() {
   } | null>(null)
   const [presetAmounts, setPresetAmounts] = useState<PresetAmount[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadFailed, setLoadFailed] = useState(false)
 
   const fetchTopupInfo = useCallback(async () => {
     request.current?.abort()
@@ -190,11 +191,13 @@ export function useTopupInfo() {
     request.current = controller
     try {
       setLoading(true)
+      setLoadFailed(false)
 
       const response = await getTopupInfo(controller.signal)
       if (controller.signal.aborted || referralIdentity() !== identity) return
 
       if (!response.success || !response.data) {
+        setLoadFailed(true)
         handleServerError(response)
         return
       }
@@ -228,6 +231,7 @@ export function useTopupInfo() {
       }
     } catch (err) {
       if (!controller.signal.aborted && referralIdentity() === identity) {
+        setLoadFailed(true)
         handleServerError(err)
       }
     } finally {
@@ -254,6 +258,7 @@ export function useTopupInfo() {
     topupInfo: snapshot?.identity === identity ? snapshot.data : null,
     presetAmounts: snapshot?.identity === identity ? presetAmounts : [],
     loading,
+    loadFailed,
     refetch: fetchTopupInfo,
   }
 }

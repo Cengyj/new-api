@@ -217,7 +217,7 @@ func CreateWaffoPancakePair(c *gin.Context) {
 			data["store_name"] = result.StoreName
 			data["orphan_store"] = true
 		}
-		c.JSON(http.StatusOK, gin.H{"message": "error", "data": data})
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "error", "data": data})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{

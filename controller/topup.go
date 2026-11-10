@@ -296,7 +296,8 @@ func validateTopUpPaymentAmount(amount float64) error {
 // "data": text} shape. When err is or wraps a *common.Message, the response
 // also carries message_key and message_params for the web console.
 func paymentError(c *gin.Context, err error) {
-	body := gin.H{"message": "error", "data": err.Error()}
+	// Request audits must not infer business success from the legacy HTTP 200.
+	body := gin.H{"success": false, "message": "error", "data": err.Error()}
 	var message *common.Message
 	if errors.As(err, &message) {
 		maps.Copy(body, message.Fields())
@@ -308,7 +309,9 @@ func paymentError(c *gin.Context, err error) {
 // session exists. Keep the original order available to history and callbacks.
 func paymentCheckoutUnknown(c *gin.Context, tradeNo string) {
 	message := common.NewMessage("Payment request result is unknown. Check Order History before trying again.")
-	body := gin.H{"message": "error", "data": message.Error(), "trade_no": tradeNo}
+	// Failure to complete the request does not mean the remote checkout or
+	// local order was rolled back. Keep its original identity for recovery.
+	body := gin.H{"success": false, "message": "error", "data": message.Error(), "trade_no": tradeNo}
 	maps.Copy(body, message.Fields())
 	c.JSON(http.StatusOK, body)
 }
