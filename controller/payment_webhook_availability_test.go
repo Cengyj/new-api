@@ -5458,6 +5458,94 @@ func TestWalletDisplayOptionFailedSavePreservesCheckoutUnits(t *testing.T) {
 	}
 }
 
+func TestWalletPaymentMethodRejectedSavePreservesPendingOrder(t *testing.T) {
+	for _, scenario := range []struct {
+		name, value string
+		valid       bool
+	}{
+		{"invalid_json", `[`, false},
+		{"wrong_value_type", `{"type":"alipay"}`, false},
+		{"explicit_empty", `[]`, true},
+		{"explicit_null", `null`, true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			router, keys := walletCheckoutFixture(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.UserAccessToken{}))
+			oldOptions := common.OptionMap
+			common.OptionMap = make(map[string]string)
+			t.Cleanup(func() { common.OptionMap = oldOptions })
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 901).Updates(map[string]any{"role": common.RoleRootUser, "auth_version": 1, "group": "default"}).Error)
+			_, rootToken := createAccessTokenTestSession(t, 901, "payment-method-root")
+			router.PUT("/api/option/", middleware.RootAuth(), UpdateOption)
+			initialMethods := `[{"type":"alipay"}]`
+			initialBody, err := common.Marshal(map[string]string{"key": "PayMethods", "value": initialMethods})
+			require.NoError(t, err)
+			initial := accessTokenRequest(router, http.MethodPut, "/api/option/", rootToken, "", string(initialBody))
+			require.Contains(t, initial.Body.String(), `"success":true`)
+			original := walletWebhookOrder(t, model.PaymentProviderEpay, "payment-method-original")
+			body, err := common.Marshal(map[string]string{"key": "PayMethods", "value": scenario.value})
+			require.NoError(t, err)
+			response := accessTokenRequest(router, http.MethodPut, "/api/option/", rootToken, "", string(body))
+			assert.Contains(t, response.Body.String(), fmt.Sprintf(`"success":%t`, scenario.valid))
+			var stored model.Option
+			require.NoError(t, model.DB.Where(&model.Option{Key: "PayMethods"}).First(&stored).Error)
+			wantedMethods, wantedACK := initialMethods, "success"
+			if scenario.valid {
+				wantedMethods, wantedACK = scenario.value, "fail"
+			}
+			t.Logf("attempt=%s durable=%q effective=%s", scenario.name, stored.Value, operation_setting.PayMethods2JsonString())
+			assert.Equal(t, wantedMethods, stored.Value)
+			assert.Equal(t, wantedMethods, common.OptionMap["PayMethods"])
+			assert.JSONEq(t, wantedMethods, operation_setting.PayMethods2JsonString())
+			for range 2 {
+				notification := httptest.NewRecorder()
+				router.ServeHTTP(notification, walletWebhookRequest(t, keys, model.PaymentProviderEpay, original.TradeNo, "100.00", true))
+				assert.Equal(t, wantedACK, notification.Body.String())
+			}
+			var buyer, inviter model.User
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			if scenario.valid {
+				assert.Equal(t, -10, buyer.Quota, "an explicit disable retains the existing webhook gate")
+				assert.Equal(t, 7, inviter.AffQuota)
+				assert.Equal(t, 11, inviter.AffHistoryQuota)
+				storedOrder, err := model.GetTopUpByTradeNoWithError(original.TradeNo)
+				require.NoError(t, err)
+				assert.Equal(t, common.TopUpStatusPending, storedOrder.Status)
+			} else {
+				assert.Equal(t, 990, buyer.Quota)
+				assert.Equal(t, 107, inviter.AffQuota)
+				assert.Equal(t, 111, inviter.AffHistoryQuota)
+			}
+			// Restore an explicitly disabled channel, or repeat the unchanged
+			// valid configuration after a rejected save, then replay the same order.
+			restored := accessTokenRequest(router, http.MethodPut, "/api/option/", rootToken, "", string(initialBody))
+			require.Contains(t, restored.Body.String(), `"success":true`)
+			for range 2 {
+				notification := httptest.NewRecorder()
+				router.ServeHTTP(notification, walletWebhookRequest(t, keys, model.PaymentProviderEpay, original.TradeNo, "100.00", true))
+				assert.Equal(t, "success", notification.Body.String())
+			}
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			assert.Equal(t, 990, buyer.Quota)
+			assert.Equal(t, 107, inviter.AffQuota)
+			assert.Equal(t, 111, inviter.AffHistoryQuota)
+			var orders []model.TopUp
+			require.NoError(t, model.DB.Find(&orders).Error)
+			require.Len(t, orders, 1)
+			assert.Equal(t, original.TradeNo, orders[0].TradeNo)
+			assert.Equal(t, common.TopUpStatusSuccess, orders[0].Status)
+			assert.NotZero(t, orders[0].CompleteTime)
+			require.NotNil(t, orders[0].CreditedQuota)
+			assert.Equal(t, 1000, *orders[0].CreditedQuota)
+			var rebates int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+			assert.EqualValues(t, 1, rebates)
+		})
+	}
+}
+
 func TestWalletPricingFailedSaveRetainsLastValidPrice(t *testing.T) {
 	for _, scenario := range []struct {
 		name, key, initial, value string

@@ -265,6 +265,9 @@ func validateOptionValue(key string, value string) error {
 	case "TopupGroupRatio":
 		var ratios map[string]float64
 		return common.UnmarshalJsonStr(value, &ratios)
+	case "PayMethods":
+		var methods []map[string]string
+		return common.UnmarshalJsonStr(value, &methods)
 	case "payment_setting.amount_discount":
 		// The generic config loader ignores decoding failures. Reject those
 		// before persistence, using the exact existing discount value type.
