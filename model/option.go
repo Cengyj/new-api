@@ -78,7 +78,7 @@ func InitOptionMap() {
 	common.OptionMap["AutomaticDisableChannelEnabled"] = strconv.FormatBool(common.AutomaticDisableChannelEnabled)
 	common.OptionMap["AutomaticEnableChannelEnabled"] = strconv.FormatBool(common.AutomaticEnableChannelEnabled)
 	common.OptionMap["LogConsumeEnabled"] = strconv.FormatBool(common.LogConsumeEnabled)
-	common.OptionMap["DisplayInCurrencyEnabled"] = strconv.FormatBool(common.DisplayInCurrencyEnabled)
+	common.OptionMap["DisplayInCurrencyEnabled"] = strconv.FormatBool(operation_setting.IsCurrencyDisplay())
 	common.OptionMap["DisplayTokenStatEnabled"] = strconv.FormatBool(common.DisplayTokenStatEnabled)
 	common.OptionMap["DrawingEnabled"] = strconv.FormatBool(common.DrawingEnabled)
 	common.OptionMap["TaskEnabled"] = strconv.FormatBool(common.TaskEnabled)
@@ -239,7 +239,12 @@ func loadOptionsFromDatabase() {
 	defer walletPaymentOptionMutex.Unlock()
 	options, _ := AllOption()
 	passkeyOptions := make(map[string]string)
+	displayOptions := make(map[string]string)
 	for _, option := range options {
+		if option.Key == "general_setting.quota_display_type" || option.Key == "DisplayInCurrencyEnabled" {
+			displayOptions[option.Key] = option.Value
+			continue
+		}
 		if IsPasskeyDomainOption(option.Key) {
 			passkeyOptions[option.Key] = option.Value
 			continue
@@ -248,6 +253,21 @@ func loadOptionsFromDatabase() {
 		if err != nil {
 			common.SysLog(common.LogText("failed to update option map: %s", err.Error()))
 		}
+	}
+	// Only persisted canonical values take precedence. An exported default in
+	// OptionMap must not hide a legacy-only database's selected input unit.
+	displayType, hasDisplayType := displayOptions["general_setting.quota_display_type"]
+	if !hasDisplayType {
+		if legacy, exists := displayOptions["DisplayInCurrencyEnabled"]; exists {
+			hasDisplayType = true
+			displayType = operation_setting.QuotaDisplayTypeTokens
+			if legacy == "true" {
+				displayType = operation_setting.QuotaDisplayTypeUSD
+			}
+		}
+	}
+	if hasDisplayType {
+		_ = updateOptionMap("general_setting.quota_display_type", displayType)
 	}
 	applyPasskeyDomainOptions(passkeyOptions)
 }
@@ -408,6 +428,21 @@ func UpdateOptionsBulk(values map[string]string) error {
 	if err := rejectWalletPaymentOptionAliases(keys); err != nil {
 		return err
 	}
+	displayType, hasDisplayType := values["general_setting.quota_display_type"]
+	legacyDisplay, hasLegacyDisplay := values["DisplayInCurrencyEnabled"]
+	if hasDisplayType || hasLegacyDisplay {
+		values = maps.Clone(values)
+		if !hasDisplayType {
+			displayType = operation_setting.QuotaDisplayTypeTokens
+			if legacyDisplay == "true" {
+				displayType = operation_setting.QuotaDisplayTypeUSD
+			}
+		}
+		// Store both representations in the same transaction. A canonical
+		// value supplied in the same save preserves CNY and CUSTOM as well.
+		values["general_setting.quota_display_type"] = displayType
+		values["DisplayInCurrencyEnabled"] = strconv.FormatBool(displayType != operation_setting.QuotaDisplayTypeTokens)
+	}
 	for key := range values {
 		if IsPasskeyDomainOption(key) {
 			_, err := UpdatePasskeyDomainOptions(values, false, "")
@@ -493,10 +528,18 @@ func updateOptionMap(key string, value string) (err error) {
 	}
 	common.OptionMapRWMutex.Lock()
 	defer common.OptionMapRWMutex.Unlock()
+	if key == "DisplayInCurrencyEnabled" {
+		// The legacy key is a projection; saves and historical loads select
+		// the canonical type before publishing it through this function.
+		value = strconv.FormatBool(operation_setting.IsCurrencyDisplay())
+	}
 	common.OptionMap[key] = value
 
 	// 检查是否是模型配置 - 使用更规范的方式处理
 	if handleConfigUpdate(key, value) {
+		if key == "general_setting.quota_display_type" {
+			common.OptionMap["DisplayInCurrencyEnabled"] = strconv.FormatBool(operation_setting.IsCurrencyDisplay())
+		}
 		return nil // 已由配置系统处理
 	}
 
@@ -547,16 +590,6 @@ func updateOptionMap(key string, value string) (err error) {
 			common.QuotaRemindEnabled = boolValue
 		case "LogConsumeEnabled":
 			common.LogConsumeEnabled = boolValue
-		case "DisplayInCurrencyEnabled":
-			// 兼容旧字段：同步到新配置 general_setting.quota_display_type（运行时生效）
-			// true -> USD, false -> TOKENS
-			newVal := "USD"
-			if !boolValue {
-				newVal = "TOKENS"
-			}
-			if cfg := config.GlobalConfig.Get("general_setting"); cfg != nil {
-				_ = config.UpdateConfigFromMap(cfg, map[string]string{"quota_display_type": newVal})
-			}
 		case "DisplayTokenStatEnabled":
 			common.DisplayTokenStatEnabled = boolValue
 		case "DrawingEnabled":

@@ -51,6 +51,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 func confirmPaymentComplianceForTest(t *testing.T) {
@@ -5422,6 +5423,42 @@ func TestWalletDisplayOptionFailedSavePreservesCheckoutUnits(t *testing.T) {
 			assert.Equal(t, 100.0, original.Money)
 			assert.Equal(t, 1000, *original.CreditedQuota)
 
+			// A second-row SQL failure must also roll back the first display
+			// representation. Both statements run against the real database.
+			updates, completedWrites := 0, 0
+			require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("fixture:second_display_write", func(tx *gorm.DB) {
+				if tx.Statement.Table == "options" {
+					updates++
+					if updates == 2 {
+						row, ok := tx.Statement.Dest.(*model.Option)
+						require.True(t, ok)
+						tx.Statement.AddClause(clause.Where{Exprs: []clause.Expression{clause.Eq{Column: clause.Column{Name: "key"}, Value: row.Key}}})
+						tx.Statement.AddClause(clause.Set{{Column: clause.Column{Name: "fixture_missing_display_column"}, Value: "fail"}})
+					}
+				}
+			}))
+			require.NoError(t, model.DB.Callback().Update().After("gorm:update").Register("fixture:display_completed_write", func(tx *gorm.DB) {
+				if tx.Statement.Table == "options" && tx.Error == nil && tx.RowsAffected == 1 {
+					completedWrites++
+				}
+			}))
+			secondFailed := accessTokenRequest(router, http.MethodPut, "/api/option/", rootToken, "", string(replacementBody))
+			require.NoError(t, model.DB.Callback().Update().Remove("fixture:second_display_write"))
+			require.NoError(t, model.DB.Callback().Update().Remove("fixture:display_completed_write"))
+			assert.Equal(t, 2, updates)
+			assert.Equal(t, 1, completedWrites, "the first actual SQL write must finish before the second SQL failure")
+			assert.Contains(t, secondFailed.Body.String(), `"success":false`)
+			assert.Contains(t, secondFailed.Body.String(), "fixture_missing_display_column")
+			for key, want := range map[string]string{"general_setting.quota_display_type": "USD", "DisplayInCurrencyEnabled": "true"} {
+				var durable model.Option
+				require.NoError(t, model.DB.Where(&model.Option{Key: key}).First(&durable).Error)
+				assert.Equal(t, want, durable.Value)
+				assert.Equal(t, want, common.OptionMap[key])
+			}
+			quote = accessTokenRequest(router, http.MethodPost, "/api/user/amount", userToken, "", `{"amount":100}`)
+			assert.Contains(t, quote.Body.String(), `"data":"100.00"`)
+			assert.Equal(t, operation_setting.QuotaDisplayTypeUSD, operation_setting.GetQuotaDisplayType())
+
 			// The same intended save is safe to retry after SQL recovers. Its
 			// changed input unit applies to new orders, never the frozen original.
 			retried := accessTokenRequest(router, http.MethodPut, "/api/option/", rootToken, "", string(replacementBody))
@@ -7151,5 +7188,137 @@ func TestWalletManualPanicAuditMatchesFinalResponse(t *testing.T) {
 
 			})
 		}
+	}
+}
+
+// Successful saves must keep the same input unit after loading the same SQL
+// rows in either order. Legacy-only rows are a supported historical format;
+// when both formats exist, the canonical display type is authoritative.
+func TestWalletDisplayOptionsRemainStableAcrossDatabaseReload(t *testing.T) {
+	const canonical = "general_setting.quota_display_type"
+	const legacy = "DisplayInCurrencyEnabled"
+	for _, tc := range []struct {
+		name, wantType, wantQuote string
+		wantMoney                 float64
+		wantQuota                 int
+		saves                     [][2]string
+		bulk                      map[string]string
+		history                   []model.Option
+	}{
+		{name: "legacy_save_after_canonical", wantType: "TOKENS", wantQuote: "10.00", wantMoney: 10, wantQuota: 100, saves: [][2]string{{canonical, "USD"}, {legacy, "false"}}},
+		{name: "canonical_cny_after_legacy", wantType: "CNY", wantQuote: "100.00", wantMoney: 100, wantQuota: 1000, saves: [][2]string{{legacy, "false"}, {canonical, "CNY"}}},
+		{name: "canonical_custom_after_legacy", wantType: "CUSTOM", wantQuote: "100.00", wantMoney: 100, wantQuota: 1000, saves: [][2]string{{legacy, "false"}, {canonical, "CUSTOM"}}},
+		{name: "canonical_wins_in_bulk", wantType: "CUSTOM", wantQuote: "100.00", wantMoney: 100, wantQuota: 1000, bulk: map[string]string{canonical: "CUSTOM", legacy: "false"}},
+		{name: "legacy_only_tokens", wantType: "TOKENS", wantQuote: "10.00", wantMoney: 10, wantQuota: 100, history: []model.Option{{Key: legacy, Value: "false"}}},
+		{name: "legacy_only_currency", wantType: "USD", wantQuote: "100.00", wantMoney: 100, wantQuota: 1000, history: []model.Option{{Key: legacy, Value: "true"}}},
+		{name: "historical_conflict", wantType: "CUSTOM", wantQuote: "100.00", wantMoney: 100, wantQuota: 1000, history: []model.Option{{Key: canonical, Value: "CUSTOM"}, {Key: legacy, Value: "false"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, _ := walletCheckoutFixture(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.UserAccessToken{}))
+			oldOptions := common.OptionMap
+			common.OptionMap = make(map[string]string)
+			t.Cleanup(func() { common.OptionMap = oldOptions })
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 901).Updates(map[string]any{"role": common.RoleRootUser, "auth_version": 1, "group": "default"}).Error)
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 902).Updates(map[string]any{"role": common.RoleCommonUser, "auth_version": 1, "group": "default"}).Error)
+			_, rootToken := createAccessTokenTestSession(t, 901, "display-reload-root")
+			_, userToken := createAccessTokenTestSession(t, 902, "display-reload-user")
+			router.PUT("/api/option/", middleware.RootAuth(), UpdateOption)
+			router.POST("/api/user/amount", middleware.DisableCache(), middleware.UserAuth(), RequestAmount)
+			router.POST("/api/user/pay", middleware.DisableCache(), middleware.UserAuth(), RequestEpay)
+			// These persisted test merchant values permit local Epay signing after
+			// startup initialization; no request is sent to a payment platform.
+			require.NoError(t, model.UpdateOptionsBulk(map[string]string{
+				"PayAddress": operation_setting.PayAddress,
+				"EpayId":     operation_setting.EpayId,
+				"EpayKey":    operation_setting.EpayKey,
+			}))
+			originalResponse := accessTokenRequest(router, http.MethodPost, "/api/user/pay", userToken, "", `{"amount":100,"payment_method":"alipay"}`)
+			require.Contains(t, originalResponse.Body.String(), `"message":"success"`)
+			var original model.TopUp
+			require.NoError(t, model.DB.First(&original).Error)
+			require.NotNil(t, original.CreditedQuota)
+			require.Equal(t, 100.0, original.Money)
+			require.Equal(t, 1000, *original.CreditedQuota)
+
+			for _, save := range tc.saves {
+				body, err := common.Marshal(map[string]string{"key": save[0], "value": save[1]})
+				require.NoError(t, err)
+				response := accessTokenRequest(router, http.MethodPut, "/api/option/", rootToken, "", string(body))
+				require.Equal(t, http.StatusOK, response.Code)
+				require.Contains(t, response.Body.String(), `"success":true`)
+			}
+			if tc.bulk != nil {
+				require.NoError(t, model.UpdateOptionsBulk(tc.bulk))
+				assert.Equal(t, map[string]string{canonical: "CUSTOM", legacy: "false"}, tc.bulk, "normalization must not change the caller's map")
+			}
+			if len(tc.history) != 0 {
+				require.NoError(t, model.DB.Create(&tc.history).Error)
+			}
+			wantLegacy := strconv.FormatBool(tc.wantType != "TOKENS")
+			stages := []string{"database_ascending", "database_descending"}
+			if len(tc.history) == 0 {
+				stages = append([]string{"after_save"}, stages...)
+				var canonicalRow, legacyRow model.Option
+				require.NoError(t, model.DB.Where(&model.Option{Key: canonical}).First(&canonicalRow).Error)
+				require.NoError(t, model.DB.Where(&model.Option{Key: legacy}).First(&legacyRow).Error)
+				assert.Equal(t, tc.wantType, canonicalRow.Value)
+				assert.Equal(t, wantLegacy, legacyRow.Value)
+			}
+			for _, stage := range stages {
+				if stage != "after_save" {
+					queries := 0
+					require.NoError(t, model.DB.Callback().Query().Before("gorm:query").Register("fixture:display_load_order", func(tx *gorm.DB) {
+						if tx.Statement.Table == "options" {
+							queries++
+							tx.Statement.AddClause(clause.OrderBy{Columns: []clause.OrderByColumn{{Column: clause.Column{Name: "key"}, Desc: stage == "database_descending"}}})
+						}
+					}))
+					// Exercise startup's actual database loader, not a replacement
+					// loader or a mock query. Root acceptance separately restarts main.
+					operation_setting.GetGeneralSetting().QuotaDisplayType = "USD"
+					model.InitOptionMap()
+					require.NoError(t, model.DB.Callback().Query().Remove("fixture:display_load_order"))
+					require.Positive(t, queries, "the configured database query order must be exercised")
+				}
+				assert.Equal(t, tc.wantType, operation_setting.GetQuotaDisplayType(), stage)
+				assert.Equal(t, tc.wantType, common.OptionMap[canonical], stage)
+				assert.Equal(t, wantLegacy, common.OptionMap[legacy], stage)
+				quote := accessTokenRequest(router, http.MethodPost, "/api/user/amount", userToken, "", `{"amount":100}`)
+				assert.Contains(t, quote.Body.String(), `"data":"`+tc.wantQuote+`"`, stage)
+				checkout := accessTokenRequest(router, http.MethodPost, "/api/user/pay", userToken, "", `{"amount":100,"payment_method":"alipay"}`)
+				require.Contains(t, checkout.Body.String(), `"message":"success"`, stage)
+				var latest model.TopUp
+				require.NoError(t, model.DB.Last(&latest).Error)
+				require.NotNil(t, latest.CreditedQuota)
+				assert.Equal(t, tc.wantMoney, latest.Money, stage)
+				assert.Equal(t, tc.wantQuota, *latest.CreditedQuota, stage)
+				t.Logf("dialect=%s stage=%s effective=%s quote=%s new_money=%v new_quota=%d", common.MainDatabaseType(), stage, operation_setting.GetQuotaDisplayType(), quote.Body.String(), latest.Money, *latest.CreditedQuota)
+			}
+			if len(tc.history) != 0 {
+				var stored []model.Option
+				require.NoError(t, model.DB.Where(clause.IN{Column: clause.Column{Name: "key"}, Values: []any{canonical, legacy}}).Find(&stored).Error)
+				assert.ElementsMatch(t, tc.history, stored, "loading historical options must not rewrite SQL")
+			}
+			var orders []model.TopUp
+			require.NoError(t, model.DB.Order("id").Find(&orders).Error)
+			require.Len(t, orders, len(stages)+1)
+			assert.Equal(t, original.TradeNo, orders[0].TradeNo)
+			assert.Equal(t, 100.0, orders[0].Money)
+			assert.Equal(t, 1000, *orders[0].CreditedQuota)
+			for _, order := range orders {
+				assert.Equal(t, common.TopUpStatusPending, order.Status)
+				assert.Zero(t, order.CompleteTime)
+			}
+			var buyer, inviter model.User
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			assert.Equal(t, -10, buyer.Quota)
+			assert.Equal(t, 7, inviter.AffQuota)
+			assert.Equal(t, 11, inviter.AffHistoryQuota)
+			var rebates int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+			assert.Zero(t, rebates)
+		})
 	}
 }
