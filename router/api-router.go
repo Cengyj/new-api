@@ -19,6 +19,9 @@ func SetApiRouter(router *gin.Engine) {
 	apiRouter.Use(middleware.RouteTag("api"))
 	apiRouter.Use(gzip.Gzip(gzip.DefaultCompression))
 	apiRouter.Use(middleware.AccessTokenAudit())
+	// Recover before gzip closes its writer and before token audit records the
+	// response; otherwise an unwritten panic can become an empty HTTP 200.
+	apiRouter.Use(middleware.PanicRecover())
 	apiRouter.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	apiRouter.Use(middleware.GlobalAPIRateLimit())
 	anonymousRequestBodyLimit := middleware.AnonymousRequestBodyLimit()

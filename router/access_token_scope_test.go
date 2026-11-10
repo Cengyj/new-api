@@ -2,6 +2,7 @@ package router
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -421,6 +422,118 @@ func TestReferralRoutesEnforceIdentityRolesAndTokenScopes(t *testing.T) {
 			assert.Equal(t, http.StatusUnauthorized, revokedResponse.Code, revokedResponse.Body.String())
 		}
 	})
+}
+
+func TestWalletHistoryPanicPreservesFailureThroughAPICompression(t *testing.T) {
+	previousDB, previousLogDB, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+	previousType, previousLimit := common.MainDatabaseType(), common.GlobalApiRateLimitEnable
+	previousLog, previousErrorLog := common.LogWriter, common.ErrorLogWriter
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "history-compression.db")), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	common.GlobalApiRateLimitEnable = false
+	var output bytes.Buffer
+	common.LogWriter, common.ErrorLogWriter = &output, &output
+	t.Cleanup(func() {
+		assert.NoError(t, sqlDB.Close())
+		model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+		common.SetMainDatabaseType(previousType)
+		common.GlobalApiRateLimitEnable = previousLimit
+		common.LogWriter, common.ErrorLogWriter = previousLog, previousErrorLog
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserAccessToken{}, &model.AuditLog{}, &model.TopUp{}, &model.ReferralRebate{}, &model.AffiliateTransfer{}))
+	user := model.User{Username: "history-compression", AffCode: "history-compression", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Quota: 123, AffQuota: 45, AffHistoryQuota: 67, Group: "default"}
+	require.NoError(t, db.Create(&user).Error)
+	rawToken := model.AccessTokenPrefix + strings.Repeat("h", 32)
+	accessToken := model.UserAccessToken{Name: "history-compression", TokenHash: model.AccessTokenFingerprint(rawToken), TokenHint: model.AccessTokenHint(rawToken)}
+	require.NoError(t, accessToken.SetScopes([]string{"wallet:read", "billing:read"}))
+	require.NoError(t, model.CreateUserAccessToken(user.Id, &accessToken, service.AccessTokenMaxPerUser))
+	credit := 1000
+	order := model.TopUp{UserId: user.Id, TradeNo: "history-compression-original", Amount: 100, Money: 90, PaymentProvider: model.PaymentProviderEpay, Status: common.TopUpStatusPending, CreateTime: common.GetTimestamp(), CreditedQuota: &credit}
+	require.NoError(t, db.Create(&order).Error)
+	engine := newAccessTokenScopeTestEngine(t, func(engine *gin.Engine) {
+		engine.Use(middleware.PanicRecover(), middleware.RequestId())
+		middleware.SetUpLogger(engine)
+	})
+	for _, path := range []string{"/api/user/topup/self", "/api/user/topup"} {
+		for _, encoding := range []string{"identity", "gzip"} {
+			t.Run(path+"/"+encoding, func(t *testing.T) {
+				output.Reset()
+				injected := false
+				require.NoError(t, db.Callback().Query().After("gorm:query").Register("test:history_compression_panic", func(tx *gorm.DB) {
+					if !injected && tx.Statement.Table == "top_ups" && strings.Contains(strings.ToLower(tx.Statement.SQL.String()), "count(") {
+						injected = true
+						panic("history-query-private-panic-value")
+					}
+				}))
+				t.Cleanup(func() { assert.NoError(t, db.Callback().Query().Remove("test:history_compression_panic")) })
+				for attempt := range 2 {
+					request := httptest.NewRequest(http.MethodGet, path+"?keyword="+order.TradeNo, nil)
+					request.Header.Set("Authorization", "Bearer "+rawToken)
+					request.Header.Set("Accept-Encoding", encoding)
+					response := httptest.NewRecorder()
+					engine.ServeHTTP(response, request)
+					require.True(t, injected, "the actual SQL count must reach the panic boundary")
+					var requestAudits []model.AuditLog
+					require.NoError(t, db.Where("request_id = ? AND category = ?", response.Header().Get(common.RequestIdKey), model.AuditCategoryAccessToken).Find(&requestAudits).Error)
+					require.Len(t, requestAudits, 1)
+					assert.Equal(t, "access_token", requestAudits[0].AuthMethod)
+					body := response.Body.Bytes()
+					if encoding == "gzip" {
+						require.Equal(t, "gzip", response.Header().Get("Content-Encoding"))
+						reader, err := gzip.NewReader(bytes.NewReader(body))
+						require.NoError(t, err)
+						body, err = io.ReadAll(reader)
+						require.NoError(t, err)
+						require.NoError(t, reader.Close())
+					}
+					if attempt == 0 {
+						assert.Equal(t, http.StatusInternalServerError, response.Code)
+						assert.Equal(t, http.StatusInternalServerError, requestAudits[0].Status)
+						assert.False(t, requestAudits[0].Success)
+						assert.Contains(t, string(body), `"type":"new_api_panic"`)
+						assert.NotContains(t, string(body), order.TradeNo)
+						requestID := response.Header().Get(common.RequestIdKey)
+						require.NotEmpty(t, requestID)
+						assert.Contains(t, output.String(), requestID)
+						assert.Contains(t, output.String(), "panic_type=string")
+						assert.NotContains(t, output.String(), "history-query-private-panic-value")
+						assert.NotContains(t, string(body), "history-query-private-panic-value")
+						continue
+					}
+					require.Equal(t, http.StatusOK, response.Code)
+					assert.Equal(t, http.StatusOK, requestAudits[0].Status)
+					assert.True(t, requestAudits[0].Success)
+					var history struct {
+						Success bool
+						Data    struct {
+							Total int
+							Items []model.TopUp
+						}
+					}
+					require.NoError(t, common.Unmarshal(body, &history))
+					require.True(t, history.Success)
+					require.Equal(t, 1, history.Data.Total)
+					require.Len(t, history.Data.Items, 1)
+					assert.Equal(t, order.TradeNo, history.Data.Items[0].TradeNo)
+					assert.Equal(t, common.TopUpStatusPending, history.Data.Items[0].Status)
+					assert.Equal(t, credit, *history.Data.Items[0].CreditedQuota)
+				}
+			})
+		}
+	}
+	var unchanged model.User
+	require.NoError(t, db.First(&unchanged, user.Id).Error)
+	assert.Equal(t, []int{123, 45, 67}, []int{unchanged.Quota, unchanged.AffQuota, unchanged.AffHistoryQuota})
+	var rebates, transfers int64
+	require.NoError(t, db.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+	require.NoError(t, db.Model(&model.AffiliateTransfer{}).Count(&transfers).Error)
+	assert.Zero(t, rebates)
+	assert.Zero(t, transfers)
 }
 
 // Exercise the real public routing/middleware chain, rather than mounting a
