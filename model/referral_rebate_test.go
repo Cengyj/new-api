@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strconv"
 	"sync"
@@ -1239,6 +1240,221 @@ func TestReferralRegistrationRewardsKeepConfigSnapshotAcrossDatabases(t *testing
 					}
 				})
 			}
+		})
+	}
+}
+
+// paymentOptionFaultPool fails only after generic-key checks reached the funds
+// configuration transaction; successful operations use the real SQL connection.
+type paymentOptionFaultPool struct {
+	gorm.ConnPool
+	beginError error
+	readError  error
+	begins     *int
+	reads      *int
+}
+
+func (pool paymentOptionFaultPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
+	*pool.begins++
+	if pool.beginError != nil {
+		return nil, pool.beginError
+	}
+	tx, err := pool.ConnPool.(gorm.TxBeginner).BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &paymentOptionFaultTx{Tx: tx, readError: pool.readError, reads: pool.reads}, nil
+}
+
+type paymentOptionFaultTx struct {
+	*sql.Tx
+	readError error
+	reads     *int
+}
+
+func (tx paymentOptionFaultTx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	*tx.reads++
+	if tx.readError != nil {
+		return nil, tx.readError
+	}
+	return tx.Tx.QueryContext(ctx, query, args...)
+}
+
+func TestPaymentOptionPersistenceAcrossDatabases(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			db, _ := newReferralIntegrationDatabase(t, dialect)
+			connection, err := db.DB()
+			require.NoError(t, err)
+			previousDB := DB
+			previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+			previousID, previousPayment := operation_setting.EpayId, *operation_setting.GetPaymentSetting()
+			common.OptionMapRWMutex.Lock()
+			previousOptions := common.OptionMap
+			common.OptionMap = map[string]string{}
+			common.OptionMapRWMutex.Unlock()
+			DB = db
+			common.SetDatabaseTypes(common.DatabaseType(dialect), common.DatabaseType(dialect))
+			t.Cleanup(func() {
+				DB = previousDB
+				common.SetDatabaseTypes(previousMain, previousLog)
+				operation_setting.EpayId = previousID
+				*operation_setting.GetPaymentSetting() = previousPayment
+				common.OptionMapRWMutex.Lock()
+				common.OptionMap = previousOptions
+				common.OptionMapRWMutex.Unlock()
+			})
+			require.NoError(t, db.AutoMigrate(&Option{}))
+			var version string
+			versionQuery := "SELECT version()"
+			if dialect == "sqlite" {
+				versionQuery = "SELECT sqlite_version()"
+			}
+			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+			t.Logf("payment option persistence uses real %s: %s", dialect, version)
+			for _, boundary := range []string{"begin", "read", "create", "save", "first_save", "commit_reply_lost"} {
+				t.Run(boundary, func(t *testing.T) {
+					require.NoError(t, db.Where("1 = 1").Delete(&Option{}).Error)
+					missing := boundary == "create" || boundary == "first_save"
+					if !missing {
+						require.NoError(t, db.Create(&Option{Key: "EpayId", Value: "original-merchant"}).Error)
+					}
+					require.NoError(t, updateOptionMap("EpayId", "original-merchant"))
+					fault := errors.New("payment option transaction interrupted")
+					begins, reads, commits := 0, 0, 0
+					switch boundary {
+					case "begin", "read":
+						pool := paymentOptionFaultPool{ConnPool: connection, begins: &begins, reads: &reads}
+						if boundary == "begin" {
+							pool.beginError = fault
+						} else {
+							pool.readError = fault
+						}
+						DB = db.Session(&gorm.Session{Context: t.Context()})
+						DB.Statement.ConnPool = pool
+					case "commit_reply_lost":
+						DB = db.Session(&gorm.Session{Context: t.Context()})
+						DB.Statement.ConnPool = creditCommitPool{ConnPool: connection, afterCommit: func() error { commits++; return fault }}
+					case "create", "save", "first_save":
+						event := "UPDATE"
+						if boundary == "create" {
+							event = "INSERT"
+						}
+						switch dialect {
+						case "sqlite":
+							require.NoError(t, db.Exec("CREATE TRIGGER payment_option_failure BEFORE "+event+" ON options BEGIN SELECT RAISE(FAIL, 'payment option write rejected'); END").Error)
+						case "mysql":
+							require.NoError(t, db.Exec("CREATE TRIGGER payment_option_failure BEFORE "+event+" ON options FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'payment option write rejected'").Error)
+						case "postgres":
+							require.NoError(t, db.Exec("CREATE OR REPLACE FUNCTION payment_option_failure() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'payment option write rejected'; END; $$ LANGUAGE plpgsql").Error)
+							require.NoError(t, db.Exec("CREATE TRIGGER payment_option_failure BEFORE "+event+" ON options FOR EACH ROW EXECUTE PROCEDURE payment_option_failure()").Error)
+						}
+					}
+					t.Cleanup(func() { DB = db })
+					err := UpdateOption("EpayId", "replacement-merchant")
+					DB = db
+					require.Error(t, err)
+					if boundary == "begin" || boundary == "read" {
+						assert.ErrorIs(t, err, fault)
+						assert.Equal(t, 1, begins, "the failure must reach the payment transaction")
+						if boundary == "read" {
+							assert.Equal(t, 1, reads)
+						} else {
+							assert.Zero(t, reads)
+						}
+					}
+					if boundary == "create" || boundary == "save" || boundary == "first_save" {
+						if dialect != "sqlite" {
+							assert.ErrorContains(t, err, "payment option write rejected")
+						}
+						statement := "DROP TRIGGER payment_option_failure"
+						if dialect == "postgres" {
+							statement += " ON options"
+						}
+						require.NoError(t, db.Exec(statement).Error)
+					}
+					var stored Option
+					lookupErr := db.Where(&Option{Key: "EpayId"}).First(&stored).Error
+					switch {
+					case boundary == "commit_reply_lost":
+						assert.Equal(t, 1, commits, "the real SQL transaction committed before its response was lost")
+						require.NoError(t, lookupErr)
+						assert.Equal(t, "replacement-merchant", stored.Value)
+					case missing:
+						assert.ErrorIs(t, lookupErr, gorm.ErrRecordNotFound, "a failed first save must roll back the placeholder too")
+					default:
+						require.NoError(t, lookupErr)
+						assert.Equal(t, "original-merchant", stored.Value)
+					}
+					assert.Equal(t, "original-merchant", operation_setting.EpayId)
+					common.OptionMapRWMutex.RLock()
+					published := common.OptionMap["EpayId"]
+					common.OptionMapRWMutex.RUnlock()
+					assert.Equal(t, "original-merchant", published)
+					// No new identity is needed: retry the intended setting after the
+					// failure is cleared, including an already committed SQL value.
+					require.NoError(t, UpdateOption("EpayId", "replacement-merchant"))
+					require.NoError(t, db.Where(&Option{Key: "EpayId"}).First(&stored).Error)
+					assert.Equal(t, "replacement-merchant", stored.Value)
+					assert.Equal(t, "replacement-merchant", operation_setting.EpayId)
+				})
+			}
+			t.Run("compliance_group_rolls_back", func(t *testing.T) {
+				require.NoError(t, db.Where("1 = 1").Delete(&Option{}).Error)
+				before := map[string]string{
+					"payment_setting.compliance_confirmed":     "false",
+					"payment_setting.compliance_terms_version": "",
+					"payment_setting.compliance_confirmed_at":  "0",
+					"payment_setting.compliance_confirmed_by":  "0",
+					"payment_setting.compliance_confirmed_ip":  "",
+				}
+				after := map[string]string{
+					"payment_setting.compliance_confirmed":     "true",
+					"payment_setting.compliance_terms_version": operation_setting.CurrentComplianceTermsVersion,
+					"payment_setting.compliance_confirmed_at":  "1234567890",
+					"payment_setting.compliance_confirmed_by":  "7",
+					"payment_setting.compliance_confirmed_ip":  "192.0.2.7",
+				}
+				for key, value := range before {
+					require.NoError(t, db.Create(&Option{Key: key, Value: value}).Error)
+					require.NoError(t, updateOptionMap(key, value))
+				}
+				original := *operation_setting.GetPaymentSetting()
+				writes := 0
+				fault := errors.New("payment compliance second write failed")
+				require.NoError(t, db.Callback().Update().After("gorm:update").Register("test:payment_compliance_write", func(tx *gorm.DB) {
+					if tx.Statement.Table != "options" || tx.Error != nil {
+						return
+					}
+					writes++
+					if writes == 2 {
+						tx.AddError(fault)
+					}
+				}))
+				err := UpdateOptionsBulk(after)
+				require.NoError(t, db.Callback().Update().Remove("test:payment_compliance_write"))
+				require.ErrorIs(t, err, fault)
+				require.Equal(t, 2, writes, "two real SQL writes must precede the injected failure")
+				for key, value := range before {
+					var stored Option
+					require.NoError(t, db.Where(&Option{Key: key}).First(&stored).Error)
+					assert.Equal(t, value, stored.Value)
+					common.OptionMapRWMutex.RLock()
+					published := common.OptionMap[key]
+					common.OptionMapRWMutex.RUnlock()
+					assert.Equal(t, value, published)
+				}
+				assert.Equal(t, original, *operation_setting.GetPaymentSetting())
+				require.NoError(t, UpdateOptionsBulk(after))
+				assert.True(t, operation_setting.IsPaymentComplianceConfirmed())
+				assert.EqualValues(t, 7, operation_setting.GetPaymentSetting().ComplianceConfirmedBy)
+				assert.EqualValues(t, 1234567890, operation_setting.GetPaymentSetting().ComplianceConfirmedAt)
+				for key, value := range after {
+					var stored Option
+					require.NoError(t, db.Where(&Option{Key: key}).First(&stored).Error)
+					assert.Equal(t, value, stored.Value)
+				}
+			})
 		})
 	}
 }

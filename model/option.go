@@ -27,14 +27,26 @@ type Option struct {
 	Value string `json:"value"`
 }
 
-// Keep this process's recharge pricing in the same order as its durable saves
-// and option reloads. Other instances retain the existing periodic sync policy.
-var walletPricingOptionMutex sync.Mutex
+// Keep this process's payment configuration in the same order as its durable
+// saves and reloads. Other instances retain the existing periodic sync policy.
+var walletPaymentOptionMutex sync.Mutex
 
-var walletPricingOptionKeys = []string{
+var walletPaymentOptionKeys = []string{
 	"TopupGroupRatio", "Price", "StripeUnitPrice", "WaffoUnitPrice",
 	"WaffoPancakeUnitPrice", "CreemProducts", "payment_setting.amount_discount",
-	"QuotaPerUnit",
+	"QuotaPerUnit", "QuotaForInviter", "QuotaForInvitee",
+	"PayAddress", "CustomCallbackAddress", "EpayId", "EpayKey", "MinTopUp", "PayMethods", "USDExchangeRate",
+	"StripeApiSecret", "StripeWebhookSecret", "StripePriceId", "StripeMinTopUp", "StripePromotionCodesEnabled",
+	"CreemApiKey", "CreemWebhookSecret", "CreemTestMode",
+	"WaffoEnabled", "WaffoApiKey", "WaffoPrivateKey", "WaffoPublicCert",
+	"WaffoSandbox", "WaffoSandboxApiKey", "WaffoSandboxPrivateKey", "WaffoSandboxPublicCert",
+	"WaffoMerchantId", "WaffoNotifyUrl", "WaffoReturnUrl", "WaffoSubscriptionReturnUrl",
+	"WaffoCurrency", "WaffoMinTopUp", "WaffoPayMethods",
+	"WaffoPancakeMerchantID", "WaffoPancakePrivateKey", "WaffoPancakeReturnURL",
+	"WaffoPancakeStoreID", "WaffoPancakeProductID", "WaffoPancakeMinTopUp",
+	"payment_setting.amount_options", "payment_setting.compliance_confirmed",
+	"payment_setting.compliance_terms_version", "payment_setting.compliance_confirmed_at",
+	"payment_setting.compliance_confirmed_by", "payment_setting.compliance_confirmed_ip",
 }
 
 func AllOption() ([]*Option, error) {
@@ -222,8 +234,8 @@ func loadOptionsFromDatabase() {
 	}()
 	passkeyOptionMutex.Lock()
 	defer passkeyOptionMutex.Unlock()
-	walletPricingOptionMutex.Lock()
-	defer walletPricingOptionMutex.Unlock()
+	walletPaymentOptionMutex.Lock()
+	defer walletPaymentOptionMutex.Unlock()
 	options, _ := AllOption()
 	passkeyOptions := make(map[string]string)
 	for _, option := range options {
@@ -305,12 +317,12 @@ func validateOptionValue(key string, value string) error {
 	return nil
 }
 
-// Compare recharge keys using the real column collation, even before their
+// Compare payment keys using the real column collation, even before their
 // first save. Let GORM resolve the table so custom naming strategies still work.
-func rejectWalletPricingOptionAliases(keys []string) error {
+func rejectWalletPaymentOptionAliases(keys []string) error {
 	aliases := make([]string, 0, len(keys))
 	for _, key := range keys {
-		if !slices.Contains(walletPricingOptionKeys, key) {
+		if !slices.Contains(walletPaymentOptionKeys, key) {
 			aliases = append(aliases, key)
 		}
 	}
@@ -320,12 +332,12 @@ func rejectWalletPricingOptionAliases(keys []string) error {
 	var query strings.Builder
 	query.WriteString("?")
 	arguments := []any{DB.Model(&Option{}).Select("?", clause.Column{Name: "key"}).Where("1 = 0")}
-	for _, key := range walletPricingOptionKeys {
+	for _, key := range walletPaymentOptionKeys {
 		query.WriteString(" UNION ALL SELECT ?")
 		arguments = append(arguments, key)
 	}
 	var matches int64
-	if err := DB.Table("(?) AS wallet_pricing_option_key", DB.Raw(query.String(), arguments...)).
+	if err := DB.Table("(?) AS wallet_payment_option_key", DB.Raw(query.String(), arguments...)).
 		Where(map[string]any{"key": aliases}).Count(&matches).Error; err != nil {
 		return err
 	}
@@ -339,10 +351,10 @@ func UpdateOption(key string, value string) error {
 	if err := rejectGenericReferralRuleUpdates([]string{key}); err != nil {
 		return err
 	}
-	if slices.Contains(walletPricingOptionKeys, key) {
+	if slices.Contains(walletPaymentOptionKeys, key) {
 		return UpdateOptionsBulk(map[string]string{key: value})
 	}
-	if err := rejectWalletPricingOptionAliases([]string{key}); err != nil {
+	if err := rejectWalletPaymentOptionAliases([]string{key}); err != nil {
 		return err
 	}
 	if IsRequestPolicyOption(key) {
@@ -389,7 +401,7 @@ func UpdateOptionsBulk(values map[string]string) error {
 	if err := rejectGenericReferralRuleUpdates(keys); err != nil {
 		return err
 	}
-	if err := rejectWalletPricingOptionAliases(keys); err != nil {
+	if err := rejectWalletPaymentOptionAliases(keys); err != nil {
 		return err
 	}
 	for key := range values {
@@ -423,11 +435,11 @@ func UpdateOptionsBulk(values map[string]string) error {
 		}
 	}
 	for key := range values {
-		if slices.Contains(walletPricingOptionKeys, key) {
-			// Match reload's request-policy -> passkey -> recharge lock order.
+		if slices.Contains(walletPaymentOptionKeys, key) {
+			// Match reload's request-policy -> passkey -> payment lock order.
 			// Checkout readers need neither this lock nor a database round trip.
-			walletPricingOptionMutex.Lock()
-			defer walletPricingOptionMutex.Unlock()
+			walletPaymentOptionMutex.Lock()
+			defer walletPaymentOptionMutex.Unlock()
 			break
 		}
 	}
@@ -438,7 +450,7 @@ func UpdateOptionsBulk(values map[string]string) error {
 			if err := tx.FirstOrCreate(&option, Option{Key: k}).Error; err != nil {
 				return err
 			}
-			if slices.Contains(walletPricingOptionKeys, k) && option.Key != k {
+			if slices.Contains(walletPaymentOptionKeys, k) && option.Key != k {
 				// A historical alias can compare equal in MySQL. Save alone
 				// preserves that primary key, which startup would not recognize.
 				if err := tx.Model(&Option{}).Where(&Option{Key: option.Key}).
