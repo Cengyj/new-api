@@ -32,6 +32,7 @@ import { AffiliateRewardsCard } from './components/affiliate-rewards-card'
 import { BillingHistoryDialog } from './components/dialogs/billing-history-dialog'
 import { CreemConfirmDialog } from './components/dialogs/creem-confirm-dialog'
 import { PaymentConfirmDialog } from './components/dialogs/payment-confirm-dialog'
+import { PaymentRecoveryNotice } from './components/payment-recovery-notice'
 import { RechargeFormCard } from './components/recharge-form-card'
 import { SubscriptionPlansCard } from './components/subscription-plans-card'
 import { WalletStatsCard } from './components/wallet-stats-card'
@@ -94,6 +95,7 @@ export function Wallet(props: WalletProps) {
   const [paymentLoading, setPaymentLoading] = useState<string | null>(null)
   const [confirmDialogOpen, setConfirmDialogOpen] = useState(false)
   const [billingDialogOpen, setBillingDialogOpen] = useState(false)
+  const [billingTradeNo, setBillingTradeNo] = useState('')
   const [redemptionCode, setRedemptionCode] = useState('')
   const [creemDialogOpen, setCreemDialogOpen] = useState(false)
   const [selectedCreemProduct, setSelectedCreemProduct] =
@@ -109,18 +111,26 @@ export function Wallet(props: WalletProps) {
   const { meta: currencyDisplay } = getCurrencyDisplay()
   const effectiveUsdExchangeRate =
     currencyDisplay.kind === 'tokens' ? 1 : currencyDisplay.exchangeRate
+  const handleUnknownCheckout = useCallback(() => {
+    setConfirmDialogOpen(false)
+    setCreemDialogOpen(false)
+  }, [])
   const {
     amount: paymentAmount,
     calculating,
     processing,
     calculatePaymentAmount,
     processPayment,
-  } = usePayment()
+  } = usePayment(handleUnknownCheckout)
   const { redeeming, redeemCode } = useRedemption()
-  const { processing: creemProcessing, processCreemPayment } = useCreemPayment()
-  const { processing: waffoProcessing, processWaffoPayment } = useWaffoPayment()
+  const { processing: creemProcessing, processCreemPayment } = useCreemPayment(
+    handleUnknownCheckout
+  )
+  const { processing: waffoProcessing, processWaffoPayment } = useWaffoPayment(
+    handleUnknownCheckout
+  )
   const { processing: pancakeProcessing, processWaffoPancakePayment } =
-    useWaffoPancakePayment()
+    useWaffoPancakePayment(handleUnknownCheckout)
 
   useEffect(() => {
     let identity = referralIdentity()
@@ -140,6 +150,7 @@ export function Wallet(props: WalletProps) {
       setConfirmDialogOpen(false)
       setCreemDialogOpen(false)
       setPaymentLoading(null)
+      setBillingTradeNo('')
     })
     return () => {
       userRequestVersion.current += 1
@@ -428,6 +439,13 @@ export function Wallet(props: WalletProps) {
               <WalletStatsCard user={user} loading={userLoading} />
             )}
 
+            <PaymentRecoveryNotice
+              onViewOrder={(tradeNo) => {
+                setBillingTradeNo(tradeNo)
+                setBillingDialogOpen(true)
+              }}
+            />
+
             <div
               className={
                 showSubscriptionPanel
@@ -456,7 +474,10 @@ export function Wallet(props: WalletProps) {
                   loading={topupLoading}
                   priceRatio={(status?.price as number) || 1}
                   usdExchangeRate={effectiveUsdExchangeRate}
-                  onOpenBilling={() => setBillingDialogOpen(true)}
+                  onOpenBilling={() => {
+                    setBillingTradeNo('')
+                    setBillingDialogOpen(true)
+                  }}
                   creemProducts={topupInfo?.creem_products}
                   enableCreemTopup={topupInfo?.enable_creem_topup}
                   onCreemProductSelect={handleCreemProductSelect}
@@ -500,6 +521,7 @@ export function Wallet(props: WalletProps) {
       />
 
       <BillingHistoryDialog
+        initialKeyword={billingTradeNo}
         open={billingDialogOpen}
         onOpenChange={setBillingDialogOpen}
       />

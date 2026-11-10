@@ -28,8 +28,8 @@ import { isSafePaymentUrl, isValidTopupAmount } from '../lib/payment'
 import type { WaffoPayMethod } from '../types'
 import { usePaymentOperation } from './use-payment-operation'
 
-export function useWaffoPayment() {
-  const { processing, runPayment } = usePaymentOperation()
+export function useWaffoPayment(onUnknownCheckout?: () => void) {
+  const { processing, runPayment } = usePaymentOperation(onUnknownCheckout)
   const processWaffoPayment = useCallback(
     async (
       topupAmount: number,

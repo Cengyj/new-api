@@ -25,6 +25,7 @@ import { useIsAdmin } from '@/hooks/use-admin'
 import { useDebounce } from '@/hooks/use-debounce'
 import { handleServerError } from '@/lib/handle-server-error'
 import { useAuthStore } from '@/stores/auth-store'
+import { usePaymentRecoveryStore } from '@/stores/payment-recovery-store'
 
 import {
   getUserBillingHistory,
@@ -43,6 +44,8 @@ interface UseBillingHistoryOptions {
   initialPage?: number
   /** Initial page size */
   initialPageSize?: number
+  initialKeyword?: string
+  enabled?: boolean
 }
 
 export function billingHistoryIdentity(): string {
@@ -51,7 +54,12 @@ export function billingHistoryIdentity(): string {
 }
 
 export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
-  const { initialPage = 1, initialPageSize = 10 } = options
+  const {
+    initialPage = 1,
+    initialPageSize = 10,
+    initialKeyword = '',
+    enabled = true,
+  } = options
   const isAdmin = useIsAdmin()
   const identity = useAuthStore(billingHistoryIdentity)
   const abort = useRef(new AbortController())
@@ -72,7 +80,7 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(initialPage)
   const [pageSize, setPageSize] = useState(initialPageSize)
-  const [keyword, setKeyword] = useState('')
+  const [keyword, setKeyword] = useState(initialKeyword)
   const debouncedKeyword = useDebounce(keyword)
   const requestIdRef = useRef(0)
   const [loading, setLoading] = useState(false)
@@ -97,6 +105,21 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
       if (requestId !== requestIdRef.current || signal.aborted) return
 
       if (isApiSuccess(response) && response.data) {
+        const userId = useAuthStore.getState().auth.user?.id
+        if (userId) {
+          // Only a successful authoritative read of this user's terminal order
+          // can retire a local reference. Empty/error/pending results retain it.
+          const terminalOrders = (response.data.items ?? [])
+            .filter(
+              (record) =>
+                record.user_id === userId &&
+                ['success', 'failed', 'expired'].includes(record.status)
+            )
+            .map((record) => record.trade_no)
+          if (terminalOrders.length) {
+            usePaymentRecoveryStore.getState().resolve(userId, terminalOrders)
+          }
+        }
         setRecords(response.data.items || [])
         setTotal(response.data.total || 0)
       } else {
@@ -196,10 +219,10 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
 
   // Fetch data after the search draft has settled.
   useEffect(() => {
-    if (keyword !== debouncedKeyword) return
+    if (!enabled || keyword !== debouncedKeyword) return
 
     fetchBillingHistory()
-  }, [debouncedKeyword, fetchBillingHistory, keyword, refreshVersion])
+  }, [debouncedKeyword, enabled, fetchBillingHistory, keyword, refreshVersion])
 
   return {
     records,

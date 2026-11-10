@@ -38,6 +38,7 @@ import { beforeEach, expect, test, vi } from 'vitest'
 import * as systemConfigHooks from '@/hooks/use-system-config'
 import { api, applyAuthBundle, clearAuthentication } from '@/lib/api'
 import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
+import { usePaymentRecoveryStore } from '@/stores/payment-recovery-store'
 import {
   DEFAULT_CURRENCY_CONFIG,
   useSystemConfigStore,
@@ -45,9 +46,12 @@ import {
 
 import * as paymentApi from '../api'
 import * as affiliateRewards from '../components/affiliate-rewards-card'
+import * as billingHistory from '../components/dialogs/billing-history-dialog'
 import { PaymentConfirmDialog } from '../components/dialogs/payment-confirm-dialog'
+import { PaymentRecoveryNotice } from '../components/payment-recovery-notice'
 import { RechargeFormCard } from '../components/recharge-form-card'
 import * as walletStats from '../components/wallet-stats-card'
+import { useBillingHistory } from '../hooks/use-billing-history'
 import { useCreemPayment } from '../hooks/use-creem-payment'
 import { requestPaymentAmount, usePayment } from '../hooks/use-payment'
 import * as topupInfoHooks from '../hooks/use-topup-info'
@@ -77,6 +81,8 @@ vi.mock('../components/dialogs/billing-history-dialog', () => ({
 }))
 
 beforeEach(() => {
+  localStorage.clear()
+  usePaymentRecoveryStore.setState({ orders: {}, storageErrors: {} })
   useAuthStore.getState().auth.reset()
   useAuthStore.getState().auth.setUser({ id: 1, username: 'payer', role: 1 })
   useSystemConfigStore.getState().setConfig({
@@ -1657,4 +1663,361 @@ test('a confirmed reward transfer refreshes wallet data without reusing or resto
     localStorage.clear()
     sessionStorage.clear()
   }
+})
+
+test('an unknown checkout keeps its original order visible and searchable among matching pending orders', async () => {
+  localStorage.clear()
+  const original = 'ref_unknown_original_checkout'
+  const previous = 'ref_nearby_same_amount_checkout'
+  const { BillingHistoryDialog } = await vi.importActual<
+    typeof import('../components/dialogs/billing-history-dialog')
+  >('../components/dialogs/billing-history-dialog')
+  vi.spyOn(billingHistory, 'BillingHistoryDialog').mockImplementation(
+    BillingHistoryDialog
+  )
+  vi.spyOn(topupInfoHooks, 'useTopupInfo').mockReturnValue({
+    topupInfo: {
+      ...topupInfo,
+      enable_creem_topup: true,
+      creem_products: [
+        {
+          name: 'Recovery pack',
+          productId: 'prod_recovery',
+          price: 10,
+          quota: 100,
+          currency: 'USD',
+        },
+      ],
+    },
+    presetAmounts: [],
+    loading: false,
+    refetch: vi.fn(),
+  })
+  const records = [original, previous].map((trade_no, index) => ({
+    id: 2 - index,
+    user_id: 1,
+    amount: 100,
+    credited_quota: 100,
+    money: 10,
+    trade_no,
+    payment_method: 'creem',
+    payment_provider: 'creem',
+    create_time: 1794297600,
+    status: 'pending',
+  }))
+  const get = vi.spyOn(api, 'get').mockImplementation(async (url) => {
+    if (url.includes('/topup')) {
+      const keyword = new URL(url, 'https://wallet.test').searchParams.get(
+        'keyword'
+      )
+      const items = keyword
+        ? records.filter((record) => record.trade_no === keyword)
+        : records
+      return { data: { success: true, data: { items, total: items.length } } }
+    }
+    return { data: { success: true, data: {} } }
+  })
+  const post = vi.spyOn(api, 'post').mockImplementation(async (url) => ({
+    data:
+      url === '/api/user/creem/pay'
+        ? {
+            message: 'error',
+            message_key:
+              'Payment request result is unknown. Check Order History before trying again.',
+            data: 'Payment request result is unknown. Check Order History before trying again.',
+            trade_no: original,
+          }
+        : { success: true, data: '10' },
+  }))
+  const page = render(<Wallet />)
+  await userEvent.click(screen.getByText('Recovery pack'))
+  const confirm = await screen.findByRole('dialog', {
+    name: 'Confirm Creem Purchase',
+  })
+  await userEvent.click(
+    within(confirm).getByRole('button', { name: 'Confirm Payment' })
+  )
+  await waitFor(() =>
+    expect(
+      post.mock.calls.filter(([url]) => url === '/api/user/creem/pay')
+    ).toHaveLength(1)
+  )
+  // The user gets the exact ID from the application, without inspecting HTTP.
+  const reference = await screen.findByText(original)
+  expect(reference).toBeVisible()
+  expect(screen.queryByText(previous)).not.toBeInTheDocument()
+  expect(
+    screen.getByRole('button', { name: 'Copy order number' })
+  ).toBeVisible()
+  await userEvent.click(screen.getByRole('button', { name: 'View order' }))
+  const history = await screen.findByRole('dialog', { name: 'Billing History' })
+  expect(
+    within(history).getByPlaceholderText('Search by order number...')
+  ).toHaveValue(original)
+  expect(await within(history).findByText(original)).toBeVisible()
+  expect(within(history).queryByText(previous)).not.toBeInTheDocument()
+  expect(
+    get.mock.calls.some(([url]) => String(url).includes(`keyword=${original}`))
+  ).toBe(true)
+  page.unmount()
+  // Reopening the wallet does not create another checkout.
+  render(<Wallet />)
+  expect(await screen.findByText(original)).toBeVisible()
+  expect(
+    post.mock.calls.filter(([url]) => url === '/api/user/creem/pay')
+  ).toHaveLength(1)
+})
+
+test.each(['alipay', 'stripe', 'creem', 'waffo', 'waffo_pancake'])(
+  '%s preserves a known unknown checkout reference without creating another payment',
+  async (provider) => {
+    const original = `original_${provider}_checkout`
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        message: 'error',
+        trade_no: original,
+        message_key:
+          'Payment request result is unknown. Check Order History before trying again.',
+      },
+    })
+    const { result } = renderHook(() => ({
+      regular: usePayment(),
+      creem: useCreemPayment(),
+      waffo: useWaffoPayment(),
+      pancake: useWaffoPancakePayment(),
+    }))
+    render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+    await act(async () => {
+      if (provider === 'creem') {
+        await result.current.creem.processCreemPayment('prod_reference')
+      } else if (provider === 'waffo') {
+        await result.current.waffo.processWaffoPayment(10, 0)
+      } else if (provider === 'waffo_pancake') {
+        await result.current.pancake.processWaffoPancakePayment(10)
+      } else await result.current.regular.processPayment(10, provider)
+    })
+    expect(screen.getByText(original)).toBeVisible()
+    expect(post).toHaveBeenCalledTimes(1)
+  }
+)
+
+test('a saved checkout reference survives logout and a new session only for its original account', async () => {
+  vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      message: 'error',
+      trade_no: 'original_session_checkout',
+      message_key:
+        'Payment request result is unknown. Check Order History before trying again.',
+    },
+  })
+  const hook = renderHook(() => useCreemPayment())
+  await act(async () => {
+    await hook.result.current.processCreemPayment('prod_reference')
+  })
+  hook.unmount()
+  usePaymentRecoveryStore.setState({ orders: {}, storageErrors: {} })
+  useAuthStore.getState().auth.reset()
+  const page = render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+  expect(
+    screen.queryByText('original_session_checkout')
+  ).not.toBeInTheDocument()
+  act(() =>
+    useAuthStore.getState().auth.setUser({ id: 2, username: 'other', role: 1 })
+  )
+  expect(
+    screen.queryByText('original_session_checkout')
+  ).not.toBeInTheDocument()
+  act(() =>
+    useAuthStore.setState((state) => ({
+      auth: {
+        ...state.auth,
+        user: { id: 1, username: 'payer', role: 1 },
+        session: {
+          ...state.auth.session,
+          sid: 'new-login-session',
+        } as AuthBundle['session'],
+      },
+    }))
+  )
+  expect(await screen.findByText('original_session_checkout')).toBeVisible()
+  page.unmount()
+})
+
+test('a late unknown checkout cannot add an order reference after the payer changes', async () => {
+  let finish!: (value: { data: unknown }) => void
+  vi.spyOn(api, 'post').mockReturnValue(
+    new Promise((resolve) => {
+      finish = resolve
+    })
+  )
+  const { result } = renderHook(() => useCreemPayment())
+  render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+  let operation!: Promise<boolean>
+  act(() => {
+    operation = result.current.processCreemPayment('prod_reference')
+  })
+  act(() =>
+    useAuthStore.getState().auth.setUser({ id: 2, username: 'other', role: 1 })
+  )
+  await act(async () => {
+    finish({
+      data: {
+        message: 'error',
+        trade_no: 'late_previous_checkout',
+        message_key:
+          'Payment request result is unknown. Check Order History before trying again.',
+      },
+    })
+    expect(await operation).toBe(false)
+  })
+  expect(screen.queryByText('late_previous_checkout')).not.toBeInTheDocument()
+  act(() =>
+    useAuthStore.getState().auth.setUser({ id: 1, username: 'payer', role: 1 })
+  )
+  expect(screen.queryByText('late_previous_checkout')).not.toBeInTheDocument()
+})
+
+test('failed browser storage keeps the known order copyable and warns before leaving', async () => {
+  vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+    throw new Error('storage blocked')
+  })
+  vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      message: 'error',
+      trade_no: 'unsaved_checkout',
+      message_key:
+        'Payment request result is unknown. Check Order History before trying again.',
+    },
+  })
+  const { result } = renderHook(() => useCreemPayment())
+  render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+  await act(async () => {
+    await result.current.processCreemPayment('prod_reference')
+  })
+  expect(screen.getByText('unsaved_checkout')).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'Copy order number' })
+  ).toBeVisible()
+  expect(
+    screen.getByText(
+      'Order references could not be saved in this browser. Copy the order number before leaving this page.'
+    )
+  ).toBeVisible()
+})
+
+test('another tab order reference does not replace the current unknown checkout', async () => {
+  vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      message: 'error',
+      trade_no: 'current_tab_checkout',
+      message_key:
+        'Payment request result is unknown. Check Order History before trying again.',
+    },
+  })
+  const { result } = renderHook(() => useCreemPayment())
+  render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+  await act(async () => {
+    await result.current.processCreemPayment('prod_reference')
+  })
+  const key = 'new-api:payment-recovery:v1:1:other_tab_checkout'
+  localStorage.setItem(key, 'other_tab_checkout')
+  act(() => window.dispatchEvent(new StorageEvent('storage', { key })))
+  expect(screen.getByText('current_tab_checkout')).toBeVisible()
+  expect(screen.getByText('other_tab_checkout')).toBeVisible()
+  localStorage.removeItem('new-api:payment-recovery:v1:1:current_tab_checkout')
+  act(() => window.dispatchEvent(new StorageEvent('storage', { key: null })))
+  expect(screen.getByText('current_tab_checkout')).toBeVisible()
+  expect(
+    localStorage.getItem('new-api:payment-recovery:v1:1:current_tab_checkout')
+  ).toBeNull()
+})
+
+test('only a successful current-user terminal order read retires a saved checkout reference', async () => {
+  const storage = vi
+    .spyOn(Storage.prototype, 'setItem')
+    .mockImplementation(() => {
+      throw new Error('storage blocked')
+    })
+  vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      message: 'error',
+      trade_no: 'query_original_checkout',
+      message_key:
+        'Payment request result is unknown. Check Order History before trying again.',
+    },
+  })
+  const payment = renderHook(() => useCreemPayment())
+  const notice = render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+  await act(async () => {
+    await payment.result.current.processCreemPayment('prod_reference')
+  })
+  storage.mockRestore()
+  const get = vi
+    .spyOn(api, 'get')
+    .mockRejectedValue(new AxiosError('Database unavailable', 'ERR_NETWORK'))
+  const history = renderHook(() =>
+    useBillingHistory({ initialKeyword: 'query_original_checkout' })
+  )
+  await waitFor(() => expect(history.result.current.loadFailed).toBe(true))
+  expect(screen.getByText('query_original_checkout')).toBeVisible()
+  get.mockResolvedValue({
+    data: { success: true, data: { items: [], total: 0 } },
+  })
+  await act(async () => {
+    await history.result.current.refresh()
+  })
+  expect(screen.getByText('query_original_checkout')).toBeVisible()
+  const record = {
+    id: 4,
+    user_id: 1,
+    trade_no: 'query_original_checkout',
+    status: 'pending',
+    money: 10,
+    amount: 100,
+    create_time: 1794297600,
+    payment_method: 'creem',
+  }
+  get.mockResolvedValue({
+    data: { success: true, data: { items: [record], total: 1 } },
+  })
+  await act(async () => {
+    await history.result.current.refresh()
+  })
+  expect(screen.getByText('query_original_checkout')).toBeVisible()
+  get.mockResolvedValue({
+    data: {
+      success: true,
+      data: { items: [{ ...record, user_id: 2, status: 'success' }], total: 1 },
+    },
+  })
+  await act(async () => {
+    await history.result.current.refresh()
+  })
+  expect(screen.getByText('query_original_checkout')).toBeVisible()
+  get.mockResolvedValue({
+    data: {
+      success: true,
+      data: { items: [{ ...record, status: 'success' }], total: 1 },
+    },
+  })
+  await act(async () => {
+    await history.result.current.refresh()
+  })
+  expect(screen.queryByText('query_original_checkout')).not.toBeInTheDocument()
+  expect(
+    screen.queryByText('Payment requests to check')
+  ).not.toBeInTheDocument()
+  notice.unmount()
+  usePaymentRecoveryStore.setState({ orders: {}, storageErrors: {} })
+  render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+  expect(screen.queryByText('query_original_checkout')).not.toBeInTheDocument()
+  vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
+    throw new Error('storage blocked')
+  })
+  await act(async () => {
+    await history.result.current.refresh()
+  })
+  expect(
+    screen.queryByText('Payment requests to check')
+  ).not.toBeInTheDocument()
 })

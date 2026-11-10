@@ -55,17 +55,24 @@ import {
 
 interface BillingHistoryDialogProps {
   open: boolean
+  initialKeyword?: string
   onOpenChange: (open: boolean) => void
 }
 
 export function BillingHistoryDialog(props: BillingHistoryDialogProps) {
   const identity = useAuthStore(billingHistoryIdentity)
-  return <BillingHistoryContent key={identity} {...props} />
+  return (
+    <BillingHistoryContent
+      key={`${identity}:${props.initialKeyword ?? ''}:${props.open}`}
+      {...props}
+    />
+  )
 }
 
 function BillingHistoryContent({
   open,
   onOpenChange,
+  initialKeyword,
 }: BillingHistoryDialogProps) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
@@ -85,7 +92,7 @@ function BillingHistoryContent({
     handleSearch,
     handleCompleteOrder,
     refresh,
-  } = useBillingHistory()
+  } = useBillingHistory({ initialKeyword, enabled: open })
 
   const [confirmTradeNo, setConfirmTradeNo] = useState<string | null>(null)
   const { copyToClipboard, copiedText } = useCopyToClipboard({ notify: false })

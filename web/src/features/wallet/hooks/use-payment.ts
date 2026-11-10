@@ -73,10 +73,10 @@ export async function requestPaymentAmount(
   return Number.isFinite(amount) && amount > 0 ? amount : 0
 }
 
-export function usePayment() {
+export function usePayment(onUnknownCheckout?: () => void) {
   const [amount, setAmount] = useState(0)
   const [calculating, setCalculating] = useState(false)
-  const { processing, runPayment } = usePaymentOperation()
+  const { processing, runPayment } = usePaymentOperation(onUnknownCheckout)
   const quoteVersion = useRef(0)
   useEffect(() => {
     let auth = useAuthStore.getState().auth

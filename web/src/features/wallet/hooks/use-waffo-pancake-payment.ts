@@ -27,8 +27,8 @@ import { getPaymentErrorTranslation } from '../lib'
 import { isSafePaymentUrl, isValidTopupAmount } from '../lib/payment'
 import { usePaymentOperation } from './use-payment-operation'
 
-export function useWaffoPancakePayment() {
-  const { processing, runPayment } = usePaymentOperation()
+export function useWaffoPancakePayment(onUnknownCheckout?: () => void) {
+  const { processing, runPayment } = usePaymentOperation(onUnknownCheckout)
   const processWaffoPancakePayment = useCallback(
     async (topupAmount: number) => {
       if (!isValidTopupAmount(topupAmount)) {

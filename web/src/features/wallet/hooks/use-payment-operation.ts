@@ -21,11 +21,13 @@ import i18next from 'i18next'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { handleServerError } from '@/lib/handle-server-error'
+import { getServerErrorSources } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
+import { usePaymentRecoveryStore } from '@/stores/payment-recovery-store'
 
 // A lost response does not cancel an order already created by the server.
 // Prevent concurrent submissions and discard delivery after payer changes.
-export function usePaymentOperation() {
+export function usePaymentOperation(onUnknownCheckout?: () => void) {
   const [processing, setProcessing] = useState(false)
   const pending = useRef(false)
   const mounted = useRef(true)
@@ -66,6 +68,19 @@ export function usePaymentOperation() {
         if (!mounted.current || changed) return false
         // Keep delivery synchronous with the identity check: an await between
         // checking the payer and opening checkout allows another account to win.
+        const unknownOrder = getServerErrorSources(response).find(
+          (source) =>
+            source.message_key ===
+              'Payment request result is unknown. Check Order History before trying again.' &&
+            typeof source.trade_no === 'string' &&
+            /^[a-zA-Z0-9_-]{1,128}$/.test(source.trade_no)
+        )
+        if (unknownOrder && auth.user?.id) {
+          usePaymentRecoveryStore
+            .getState()
+            .remember(auth.user.id, unknownOrder.trade_no as string)
+          onUnknownCheckout?.()
+        }
         return handleResponse(response)
       } catch (error) {
         if (!mounted.current || changed) return false
@@ -87,7 +102,7 @@ export function usePaymentOperation() {
         if (mounted.current) setProcessing(false)
       }
     },
-    []
+    [onUnknownCheckout]
   )
 
   return { processing, runPayment }
