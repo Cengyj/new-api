@@ -35,6 +35,7 @@ var walletPaymentOptionKeys = []string{
 	"TopupGroupRatio", "Price", "StripeUnitPrice", "WaffoUnitPrice",
 	"WaffoPancakeUnitPrice", "CreemProducts", "payment_setting.amount_discount",
 	"QuotaPerUnit", "QuotaForInviter", "QuotaForInvitee",
+	"general_setting.quota_display_type", "DisplayInCurrencyEnabled",
 	"PayAddress", "CustomCallbackAddress", "EpayId", "EpayKey", "MinTopUp", "PayMethods", "USDExchangeRate",
 	"StripeApiSecret", "StripeWebhookSecret", "StripePriceId", "StripeMinTopUp", "StripePromotionCodesEnabled",
 	"CreemApiKey", "CreemWebhookSecret", "CreemTestMode",

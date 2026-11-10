@@ -5348,6 +5348,116 @@ func TestWalletCreemOptionalPaidAmountPreservesDocumentedCheckout(t *testing.T) 
 	})
 }
 
+func TestWalletDisplayOptionFailedSavePreservesCheckoutUnits(t *testing.T) {
+	for _, option := range []struct{ key, initial, replacement string }{
+		{"general_setting.quota_display_type", "USD", "TOKENS"},
+		{"DisplayInCurrencyEnabled", "true", "false"},
+	} {
+		t.Run(option.key, func(t *testing.T) {
+			router, _ := walletCheckoutFixture(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.UserAccessToken{}))
+			oldOptions := common.OptionMap
+			common.OptionMap = make(map[string]string)
+			t.Cleanup(func() { common.OptionMap = oldOptions })
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 901).Updates(map[string]any{"role": common.RoleRootUser, "auth_version": 1, "group": "default"}).Error)
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 902).Updates(map[string]any{"role": common.RoleCommonUser, "auth_version": 1, "group": "default"}).Error)
+			_, rootToken := createAccessTokenTestSession(t, 901, "display-units-root")
+			_, userToken := createAccessTokenTestSession(t, 902, "display-units-user")
+			router.PUT("/api/option/", middleware.RootAuth(), UpdateOption)
+			router.POST("/api/user/amount", middleware.DisableCache(), middleware.UserAuth(), RequestAmount)
+			router.POST("/api/user/pay", middleware.DisableCache(), middleware.UserAuth(), RequestEpay)
+			initialBody, err := common.Marshal(map[string]string{"key": option.key, "value": option.initial})
+			require.NoError(t, err)
+			initial := accessTokenRequest(router, http.MethodPut, "/api/option/", rootToken, "", string(initialBody))
+			require.Contains(t, initial.Body.String(), `"success":true`)
+			before := accessTokenRequest(router, http.MethodPost, "/api/user/amount", userToken, "", `{"amount":100}`)
+			require.Contains(t, before.Body.String(), `"data":"100.00"`)
+
+			switch common.MainDatabaseType() {
+			case common.DatabaseTypeSQLite:
+				require.NoError(t, model.DB.Exec("CREATE TRIGGER wallet_display_failure BEFORE UPDATE ON options BEGIN SELECT RAISE(FAIL, 'wallet display write rejected'); END").Error)
+			case common.DatabaseTypeMySQL:
+				require.NoError(t, model.DB.Exec("CREATE TRIGGER wallet_display_failure BEFORE UPDATE ON options FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'wallet display write rejected'").Error)
+			case common.DatabaseTypePostgreSQL:
+				require.NoError(t, model.DB.Exec("CREATE FUNCTION wallet_display_failure() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'wallet display write rejected'; END; $$ LANGUAGE plpgsql").Error)
+				require.NoError(t, model.DB.Exec("CREATE TRIGGER wallet_display_failure BEFORE UPDATE ON options FOR EACH ROW EXECUTE PROCEDURE wallet_display_failure()").Error)
+			default:
+				require.FailNow(t, "wallet display test requires SQLite, MySQL, or PostgreSQL")
+			}
+			failures := 0
+			require.NoError(t, model.DB.Callback().Update().After("gorm:update").Register("fixture:wallet_display_failed_write", func(tx *gorm.DB) {
+				if tx.Statement.Table == "options" && tx.Error != nil {
+					failures++
+					assert.ErrorContains(t, tx.Error, "wallet display write rejected")
+				}
+			}))
+			t.Cleanup(func() { _ = model.DB.Callback().Update().Remove("fixture:wallet_display_failed_write") })
+			replacementBody, err := common.Marshal(map[string]string{"key": option.key, "value": option.replacement})
+			require.NoError(t, err)
+			failed := accessTokenRequest(router, http.MethodPut, "/api/option/", rootToken, "", string(replacementBody))
+			require.Equal(t, 1, failures, "the authenticated save must reach the real failing SQL trigger")
+			require.NoError(t, model.DB.Callback().Update().Remove("fixture:wallet_display_failed_write"))
+			dropTrigger := "DROP TRIGGER wallet_display_failure"
+			if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
+				dropTrigger += " ON options"
+			}
+			require.NoError(t, model.DB.Exec(dropTrigger).Error)
+
+			var stored model.Option
+			require.NoError(t, model.DB.Where(&model.Option{Key: option.key}).First(&stored).Error)
+			quote := accessTokenRequest(router, http.MethodPost, "/api/user/amount", userToken, "", `{"amount":100}`)
+			checkout := accessTokenRequest(router, http.MethodPost, "/api/user/pay", userToken, "", `{"amount":100,"payment_method":"alipay"}`)
+			require.Contains(t, checkout.Body.String(), `"message":"success"`)
+			var original model.TopUp
+			require.NoError(t, model.DB.First(&original).Error)
+			require.NotNil(t, original.CreditedQuota)
+			t.Logf("failed save success=%t durable=%q effective=%q quote=%s frozen_money=%v frozen_quota=%d", strings.Contains(failed.Body.String(), `"success":true`), stored.Value, operation_setting.GetQuotaDisplayType(), quote.Body.String(), original.Money, *original.CreditedQuota)
+			assert.Contains(t, failed.Body.String(), `"success":false`)
+			assert.Equal(t, option.initial, stored.Value)
+			assert.Equal(t, option.initial, common.OptionMap[option.key])
+			assert.Equal(t, operation_setting.QuotaDisplayTypeUSD, operation_setting.GetQuotaDisplayType())
+			assert.Contains(t, quote.Body.String(), `"data":"100.00"`)
+			assert.Equal(t, 100.0, original.Money)
+			assert.Equal(t, 1000, *original.CreditedQuota)
+
+			// The same intended save is safe to retry after SQL recovers. Its
+			// changed input unit applies to new orders, never the frozen original.
+			retried := accessTokenRequest(router, http.MethodPut, "/api/option/", rootToken, "", string(replacementBody))
+			require.Contains(t, retried.Body.String(), `"success":true`)
+			require.NoError(t, model.DB.Where(&model.Option{Key: option.key}).First(&stored).Error)
+			assert.Equal(t, option.replacement, stored.Value)
+			assert.Equal(t, operation_setting.QuotaDisplayTypeTokens, operation_setting.GetQuotaDisplayType())
+			quote = accessTokenRequest(router, http.MethodPost, "/api/user/amount", userToken, "", `{"amount":100}`)
+			assert.Contains(t, quote.Body.String(), `"data":"10.00"`)
+			checkout = accessTokenRequest(router, http.MethodPost, "/api/user/pay", userToken, "", `{"amount":100,"payment_method":"alipay"}`)
+			require.Contains(t, checkout.Body.String(), `"message":"success"`)
+			var orders []model.TopUp
+			require.NoError(t, model.DB.Order("id").Find(&orders).Error)
+			require.Len(t, orders, 2)
+			assert.Equal(t, original.TradeNo, orders[0].TradeNo)
+			assert.Equal(t, original.Money, orders[0].Money)
+			assert.Equal(t, *original.CreditedQuota, *orders[0].CreditedQuota)
+			assert.NotEqual(t, original.TradeNo, orders[1].TradeNo)
+			assert.Equal(t, 10.0, orders[1].Money)
+			require.NotNil(t, orders[1].CreditedQuota)
+			assert.Equal(t, 100, *orders[1].CreditedQuota)
+			for _, order := range orders {
+				assert.Equal(t, common.TopUpStatusPending, order.Status)
+				assert.Zero(t, order.CompleteTime)
+			}
+			var buyer, inviter model.User
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			assert.Equal(t, -10, buyer.Quota)
+			assert.Equal(t, 7, inviter.AffQuota)
+			assert.Equal(t, 11, inviter.AffHistoryQuota)
+			var rebates int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+			assert.Zero(t, rebates)
+		})
+	}
+}
+
 func TestWalletPricingFailedSaveRetainsLastValidPrice(t *testing.T) {
 	for _, scenario := range []struct {
 		name, key, initial, value string
