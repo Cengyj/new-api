@@ -6647,14 +6647,19 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 
 func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		status    int
-		signature string
-		code      string
-		accepted  bool
-		rejected  bool
+		name           string
+		status         int
+		signature      string
+		code           string
+		accepted       bool
+		rejected       bool
+		customCallback string
+		notifyOverride string
+		wantNotify     string
 	}{
 		{name: "valid_signed", status: 200, signature: "valid", code: "0", accepted: true},
+		{name: "default_callback_trailing_slash", status: 200, signature: "valid", code: "0", accepted: true, customCallback: "https://callback.example.invalid/", wantNotify: "https://callback.example.invalid/api/waffo/webhook"},
+		{name: "explicit_callback_override", status: 200, signature: "valid", code: "0", accepted: true, customCallback: "https://callback.example.invalid/", notifyOverride: "https://waffo.example.invalid/explicit-webhook/", wantNotify: "https://waffo.example.invalid/explicit-webhook/"},
 		{name: "lowercase_signature", status: 200, signature: "lowercase", code: "0", accepted: true},
 		{name: "mixed_case_signature", status: 200, signature: "mixed_case", code: "0", accepted: true},
 		{name: "other_payment_request", status: 200, signature: "valid", code: "0"},
@@ -6678,12 +6683,17 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 			router, keys := walletCheckoutFixture(t)
 			oldPrice, oldMin := setting.WaffoUnitPrice, setting.WaffoMinTopUp
 			oldMerchant, oldCurrency := setting.WaffoMerchantId, setting.WaffoCurrency
+			oldCustom, oldNotify := operation_setting.CustomCallbackAddress, setting.WaffoNotifyUrl
 			t.Cleanup(func() {
 				setting.WaffoUnitPrice, setting.WaffoMinTopUp = oldPrice, oldMin
 				setting.WaffoMerchantId, setting.WaffoCurrency = oldMerchant, oldCurrency
+				operation_setting.CustomCallbackAddress, setting.WaffoNotifyUrl = oldCustom, oldNotify
 			})
 			setting.WaffoUnitPrice, setting.WaffoMinTopUp = 1, 1
 			setting.WaffoMerchantId, setting.WaffoCurrency = "merchant_checkout", "USD"
+			if tc.wantNotify != "" {
+				operation_setting.CustomCallbackAddress, setting.WaffoNotifyUrl = tc.customCallback, tc.notifyOverride
+			}
 			inquiryTransport := service.WaffoHTTPTransport
 			var outgoing order.CreateOrderParams
 			service.WaffoHTTPTransport = walletWaffoSDKTransport(func(_ context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
@@ -6741,6 +6751,9 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
 			require.NotEmpty(t, outgoing.PaymentRequestID)
+			if tc.wantNotify != "" {
+				assert.Equal(t, tc.wantNotify, outgoing.NotifyURL)
+			}
 			var decoded struct {
 				Message    string
 				MessageKey string `json:"message_key"`
@@ -7319,6 +7332,71 @@ func TestWalletDisplayOptionsRemainStableAcrossDatabaseReload(t *testing.T) {
 			var rebates int64
 			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebates).Error)
 			assert.Zero(t, rebates)
+		})
+	}
+}
+
+// Checkout parameters are the gateway's durable callback destination. A valid
+// base URL ending in a slash must not turn either Epay consumer's API path into
+// a double-slash path that the gateway cannot acknowledge.
+func TestEpayCheckoutCallbackBasePreservesReachablePaths(t *testing.T) {
+	for _, tc := range []struct {
+		name, custom, server, base string
+	}{
+		{"custom_normal", "https://callback.example.invalid", "https://dashboard.example.invalid", "https://callback.example.invalid"},
+		{"custom_slashes", "https://callback.example.invalid///", "https://dashboard.example.invalid", "https://callback.example.invalid"},
+		{"fallback_normal", "", "https://dashboard.example.invalid", "https://dashboard.example.invalid"},
+		{"fallback_slash", "", "https://dashboard.example.invalid/", "https://dashboard.example.invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, _ := walletCheckoutFixture(t)
+			oldCustom, oldServer := operation_setting.CustomCallbackAddress, system_setting.ServerAddress
+			t.Cleanup(func() {
+				operation_setting.CustomCallbackAddress, system_setting.ServerAddress = oldCustom, oldServer
+			})
+			operation_setting.CustomCallbackAddress, system_setting.ServerAddress = tc.custom, tc.server
+			require.NoError(t, model.DB.AutoMigrate(&model.SubscriptionPlan{}))
+			plan := model.SubscriptionPlan{Id: 99031, Title: "Callback base fixture", PriceAmount: 100, Enabled: true}
+			require.NoError(t, model.DB.Create(&plan).Error)
+			model.InvalidateSubscriptionPlanCache(plan.Id)
+			t.Cleanup(func() { model.InvalidateSubscriptionPlanCache(plan.Id) })
+			router.POST("/wallet-checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestEpay)
+			router.POST("/subscription-checkout", func(c *gin.Context) { c.Set("id", 902) }, SubscriptionRequestEpay)
+			for _, endpoint := range []struct {
+				path, body, notifyPath, returnURL string
+			}{
+				{"/wallet-checkout", `{"amount":100,"payment_method":"alipay"}`, "/api/user/epay/notify", "https://dashboard.example.invalid/usage-logs"},
+				{"/subscription-checkout", `{"plan_id":99031,"payment_method":"alipay"}`, "/api/subscription/epay/notify", tc.base + "/api/subscription/epay/return"},
+			} {
+				request := httptest.NewRequest(http.MethodPost, endpoint.path, strings.NewReader(endpoint.body))
+				request.Header.Set("Content-Type", "application/json")
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+				var checkout struct {
+					Message string            `json:"message"`
+					Data    map[string]string `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &checkout))
+				require.Equal(t, "success", checkout.Message, response.Body.String())
+				assert.Equal(t, tc.base+endpoint.notifyPath, checkout.Data["notify_url"], endpoint.path)
+				assert.Equal(t, endpoint.returnURL, checkout.Data["return_url"], endpoint.path)
+				verified, err := GetEpayClient().Verify(checkout.Data)
+				require.NoError(t, err)
+				assert.True(t, verified.VerifyStatus, "normalized URLs must be signed exactly as sent")
+			}
+			var wallet model.TopUp
+			require.NoError(t, model.DB.First(&wallet).Error)
+			assert.Equal(t, common.TopUpStatusPending, wallet.Status)
+			assert.Equal(t, model.PaymentProviderEpay, wallet.PaymentProvider)
+			require.NotNil(t, wallet.CreditedQuota)
+			assert.Equal(t, 1000, *wallet.CreditedQuota)
+			var subscription model.SubscriptionOrder
+			require.NoError(t, model.DB.First(&subscription).Error)
+			assert.Equal(t, common.TopUpStatusPending, subscription.Status)
+			assert.NotEqual(t, wallet.TradeNo, subscription.TradeNo)
+			var rebates int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+			assert.Zero(t, rebates, "checkout alone must not award a wallet rebate")
 		})
 	}
 }
