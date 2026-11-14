@@ -2,6 +2,13 @@
 
 DO NOT send optional commentary
 
+## Custom Repository and Current Version
+
+- Custom repository: [Cengyj/new-api](https://github.com/Cengyj/new-api); upstream: [QuantumNous/new-api](https://github.com/QuantumNous/new-api).
+- Current source version: the custom build with official `v1.0.0-rc.51` merged, at upstream commit `c9c6da2786b6a0912215127e78e28fbc6650c85f`, retaining invitation recharge rebates and subsequent local improvements.
+- Always state the currently merged upstream release and custom-build status in delivery summaries and release descriptions. Keep this section, `VERSION`, and the custom-version notes in `README.md` and `README.zh_CN.md` synchronized on future upgrades; preserve the build's custom suffix and source-commit provenance.
+- Source integration does not imply that an image has been published or deployed. Record those states separately, and preserve the upstream new-api and QuantumNous identity and attribution.
+
 ## Overview
 
 This is an AI API gateway/proxy built with Go. It aggregates 40+ upstream AI providers (OpenAI, Claude, Gemini, Azure, AWS Bedrock, etc.) behind a unified API, with user management, billing, rate limiting, and an admin dashboard.
