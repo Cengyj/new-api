@@ -156,6 +156,10 @@ func CompleteLoginVerification(token string, verification *LoginVerification, me
 		return nil, nil, err
 	}
 	var migration *LegacyGitHubMigration
+	identityColumn := ""
+	if verification.payload.PendingGitHubID != "" {
+		identityColumn = "github_id"
+	}
 	if err := model.CreateUserSessionFromLoginFlow(token, session, func(tx *gorm.DB, flow *model.AuthFlow, state *model.UserVerificationState) error {
 		var payload loginFlowPayload
 		if flow.Id != verification.Flow.Id || common.UnmarshalJsonStr(flow.Payload, &payload) != nil || payload != verification.payload {
@@ -177,7 +181,7 @@ func CompleteLoginVerification(token string, verification *LoginVerification, me
 			migration = &LegacyGitHubMigration{GitHubID: payload.PendingGitHubID, LegacyID: payload.PendingGitHubLegacyID}
 		}
 		return nil
-	}); err != nil {
+	}, model.OAuthIdentityTransactionOptions(identityColumn)); err != nil {
 		return nil, nil, err
 	}
 	bundle, err := issueAuthBundle(session, session.SID+"."+refreshSecret, true)

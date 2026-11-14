@@ -46,6 +46,110 @@ import { AuditLogViewer } from '../components/audit-log-viewer'
 
 it.each([
   [
+    'successful',
+    'en',
+    en,
+    true,
+    'manual-order-1',
+    'Manual top-up completion request',
+    'Success',
+  ],
+  [
+    'failed',
+    'en',
+    en,
+    false,
+    'manual-order-1',
+    'Manual top-up completion request',
+    'Failed',
+  ],
+  [
+    'failed in Chinese',
+    'zh',
+    zh,
+    false,
+    'manual-order-1',
+    '人工补单请求',
+    '失败',
+  ],
+  [
+    'legacy without order metadata',
+    'en',
+    en,
+    true,
+    undefined,
+    'Manual top-up completion request',
+    'Success',
+  ],
+] as const)(
+  'shows a neutral manual top-up summary and separate request result for %s records',
+  async (_name, lng, resources, success, tradeNo, summary, result) => {
+    const i18n = createInstance()
+    await i18n.init({ lng, resources: { [lng]: resources } })
+    vi.spyOn(api, 'get').mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          total: 1,
+          items: [
+            {
+              event_id: 'manual-topup-event',
+              created_at: 1788600600,
+              username: 'root',
+              actor_role: 100,
+              category: 'operation',
+              action: 'user.topup_complete',
+              content: 'POST /api/user/topup/complete',
+              method: 'POST',
+              route: '/api/user/topup/complete',
+              status: 200,
+              success,
+              other: {
+                op: {
+                  action: 'user.topup_complete',
+                  params: tradeNo ? { trade_no: tradeNo } : {},
+                },
+              },
+            },
+          ],
+        },
+      },
+    })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <I18nextProvider i18n={i18n}>
+          <AuditLogViewer scope='self' />
+        </I18nextProvider>
+      </QueryClientProvider>
+    )
+    const cell = await screen.findByRole('cell', { name: summary })
+    expect(cell).toBeVisible()
+    const row = screen.getByRole('row', { name: new RegExp(summary) })
+    expect(within(row).getByText(result)).toBeVisible()
+    await userEvent.click(
+      screen.getByRole('button', { name: i18n.t('Details') })
+    )
+    const dialog = await screen.findByRole('dialog', {
+      name: i18n.t('Log Details'),
+    })
+    expect(within(dialog).getByText(summary)).toBeVisible()
+    expect(within(dialog).getByText(result)).toBeVisible()
+    if (tradeNo) {
+      expect(within(dialog).getByText(i18n.t('Order number'))).toBeVisible()
+      expect(within(dialog).getByText(tradeNo)).toBeVisible()
+    } else {
+      expect(
+        within(dialog).queryByText(i18n.t('Order number'))
+      ).not.toBeInTheDocument()
+    }
+  }
+)
+
+it.each([
+  [
     'generic',
     {
       action: 'add_quota',

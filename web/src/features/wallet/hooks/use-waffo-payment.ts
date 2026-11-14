@@ -17,78 +17,78 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import i18next from 'i18next'
-import { useState, useCallback } from 'react'
+import { useCallback } from 'react'
 import { toast } from 'sonner'
 
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { requestWaffoPayment, isApiSuccess } from '../api'
 import { getPaymentErrorTranslation } from '../lib'
+import { isSafePaymentUrl, isValidTopupAmount } from '../lib/payment'
+import type { WaffoPayMethod } from '../types'
+import { usePaymentOperation } from './use-payment-operation'
 
-function getPaymentUrl(data: unknown): string | null {
-  if (!data || typeof data !== 'object') {
-    return null
-  }
-
-  if ('payment_url' in data && typeof data.payment_url === 'string') {
-    return data.payment_url
-  }
-
-  return null
-}
-
-function getErrorMessage(message: string | undefined, data: unknown): string {
-  if (typeof data === 'string' && data.trim()) {
-    return data
-  }
-
-  return (
-    (message && message !== 'success' ? message : undefined) ||
-    i18next.t('Payment request failed')
-  )
-}
-
-/**
- * Hook for handling Waffo payment processing
- */
-export function useWaffoPayment() {
-  const [processing, setProcessing] = useState(false)
-
+export function useWaffoPayment(onUnknownCheckout?: () => void) {
+  const { processing, runPayment } = usePaymentOperation(onUnknownCheckout)
   const processWaffoPayment = useCallback(
-    async (topupAmount: number, payMethodIndex?: number) => {
-      setProcessing(true)
-
-      try {
-        const response = await requestWaffoPayment({
-          amount: Math.floor(topupAmount),
-          pay_method_index: payMethodIndex,
-        })
-
-        if (isApiSuccess(response)) {
-          const paymentUrl = getPaymentUrl(response.data)
-
-          if (paymentUrl) {
-            window.open(paymentUrl, '_blank')
-            toast.success(i18next.t('Redirecting to payment page...'))
-            return true
-          }
-        }
-
-        handleServerError(response, undefined, {
-          title:
-            getPaymentErrorTranslation(response) ??
-            getErrorMessage(response.message, response.data),
-        })
+    async (
+      topupAmount: number,
+      payMethodIndex?: number,
+      payMethod?: Pick<WaffoPayMethod, 'payMethodType' | 'payMethodName'>
+    ) => {
+      if (!isValidTopupAmount(topupAmount)) {
+        toast.error(i18next.t('Invalid top-up amount'))
         return false
-      } catch (error) {
-        handleServerError(error, i18next.t('Payment request failed'))
-        return false
-      } finally {
-        setProcessing(false)
       }
+      if (
+        payMethodIndex !== undefined &&
+        (!Number.isSafeInteger(payMethodIndex) || payMethodIndex < 0)
+      ) {
+        return false
+      }
+      return runPayment(
+        (signal) =>
+          requestWaffoPayment(
+            {
+              amount: topupAmount,
+              pay_method_index: payMethodIndex,
+              ...(payMethod && {
+                pay_method_type: payMethod.payMethodType ?? '',
+                pay_method_name: payMethod.payMethodName ?? '',
+              }),
+            },
+            signal
+          ),
+        (response) => {
+          if (!isApiSuccess(response)) {
+            const message =
+              typeof response.data === 'string' && response.data.trim()
+                ? response.data
+                : response.message
+            handleServerError(response, undefined, {
+              title:
+                getPaymentErrorTranslation(response) ??
+                (message && message !== 'success'
+                  ? message
+                  : i18next.t('Payment request failed')),
+            })
+            return false
+          }
+          const url =
+            response.data && typeof response.data === 'object'
+              ? response.data.payment_url
+              : undefined
+          if (!isSafePaymentUrl(url, true)) {
+            toast.error(i18next.t('Invalid payment redirect URL'))
+            return false
+          }
+          window.open(url, '_blank', 'noopener,noreferrer')
+          toast.success(i18next.t('Redirecting to payment page...'))
+          return true
+        }
+      )
     },
-    []
+    [runPayment]
   )
-
   return { processing, processWaffoPayment }
 }

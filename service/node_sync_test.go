@@ -1,20 +1,31 @@
 package service
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/request_plugin_setting"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 // useNodeSync installs a database with the sync tables (TEST_TASK_DB_DIALECT
@@ -309,6 +320,39 @@ func TestNodeSyncReloadsATopicWhoseStartupLoadFailed(t *testing.T) {
 	assert.Empty(t, recovered.Error)
 }
 
+func TestNodeSyncRetriesOptionsAfterStartupReadFailure(t *testing.T) {
+	database := useNodeSync(t)
+	previousOptions := common.OptionMap
+	t.Cleanup(func() { common.OptionMap = previousOptions })
+	require.NoError(t, database.Create(&model.Option{Key: "Notice", Value: "persisted startup notice"}).Error)
+	model.BumpSyncTopic(model.SyncTopicOptions)
+	ReadStartupSyncRevisions()
+	failure := errors.New("isolated startup options read failed")
+	callbackName := "test:startup_options_read"
+	require.NoError(t, database.Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Schema != nil && tx.Statement.Schema.Name == "Option" {
+			tx.AddError(failure)
+		}
+	}))
+	t.Cleanup(func() { _ = database.Callback().Query().Remove(callbackName) })
+	err := model.InitOptionMap()
+	require.ErrorIs(t, err, failure)
+	SyncTopicLoadFailed(model.SyncTopicOptions, err)
+	require.NoError(t, database.Callback().Query().Remove(callbackName))
+	RegisterSyncTopic(model.SyncTopicOptions, func(context.Context) error { return model.LoadOptionsFromDatabase() })
+	applyStartupSyncRevisions()
+	failed := NodeSyncStates()[model.SyncTopicOptions]
+	assert.Zero(t, failed.AppliedAt, "a failed initial read must not claim this revision was loaded")
+	assert.NotEmpty(t, failed.Error)
+	assert.Empty(t, common.OptionMap["Notice"])
+	require.True(t, syncNodeTopics(context.Background()), "the first tick must retry without another write")
+	assert.Equal(t, "persisted startup notice", common.OptionMap["Notice"])
+	recovered := NodeSyncStates()[model.SyncTopicOptions]
+	assert.Equal(t, storedSyncTopics(t)[model.SyncTopicOptions], recovered.Revision)
+	assert.NotZero(t, recovered.AppliedAt)
+	assert.Empty(t, recovered.Error)
+}
+
 // Without the startup revisions every registered topic stays unapplied, and
 // the node reports each one as not synced until the first tick loads it.
 func TestNodeSyncWithoutStartupRevisionsReportsEveryTopicUnapplied(t *testing.T) {
@@ -387,5 +431,231 @@ func TestNodeSyncCapsWhatTheRegistryRowCarries(t *testing.T) {
 	assert.NotContains(t, state.Errors, "plugin-50")
 	for _, message := range state.Errors {
 		assert.Equal(t, 300, utf8.RuneCountInString(message))
+	}
+}
+
+// The worker runs the production sync tick in a separate address space. Its
+// pipe protocol makes failure/retry ordering deterministic without timers.
+func TestNodeSyncProcessWorker(t *testing.T) {
+	if os.Getenv("NEW_API_CONFIG_PROCESS_WORKER") != "1" {
+		return
+	}
+	dialect := os.Getenv("NEW_API_CONFIG_PROCESS_DIALECT")
+	dsn := os.Getenv("NEW_API_CONFIG_PROCESS_DSN")
+	var driver gorm.Dialector
+	switch dialect {
+	case "sqlite":
+		driver = sqlite.Open(dsn)
+	case "mysql":
+		driver = mysql.Open(dsn)
+	case "postgres":
+		driver = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+	default:
+		t.Fatalf("unexpected isolated dialect %q", dialect)
+	}
+	database, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: os.Getenv("NEW_API_CONFIG_PROCESS_PREFIX")}})
+	require.NoError(t, err)
+	model.DB, model.LOG_DB = database, database
+	common.SetDatabaseTypes(common.DatabaseType(dialect), common.DatabaseType(dialect))
+	common.MemoryCacheEnabled, common.RedisEnabled = false, false
+	common.NodeName = os.Getenv("NEW_API_CONFIG_PROCESS_NAME")
+	nodeSync = newNodeSyncRegistry()
+	RegisterSyncTopic(model.SyncTopicOptions, func(context.Context) error { return model.LoadOptionsFromDatabase() })
+	ReadStartupSyncRevisions()
+	if err := model.InitOptionMap(); err != nil {
+		SyncTopicLoadFailed(model.SyncTopicOptions, err)
+	}
+	applyStartupSyncRevisions()
+	failLoad, failSave, failBump := false, false, false
+	require.NoError(t, database.Callback().Query().Before("gorm:query").Register("isolated_config_read_failure", func(tx *gorm.DB) {
+		if failLoad && tx.Statement.Schema != nil && tx.Statement.Schema.Name == "Option" {
+			tx.AddError(errors.New("isolated configuration read unavailable"))
+		}
+	}))
+	require.NoError(t, database.Callback().Update().Before("gorm:update").Register("isolated_config_save_failure", func(tx *gorm.DB) {
+		if failSave && tx.Statement.Schema != nil && tx.Statement.Schema.Name == "Option" {
+			tx.AddError(errors.New("isolated configuration save unavailable"))
+		}
+	}))
+	require.NoError(t, database.Callback().Create().Before("gorm:create").Register("isolated_config_bump_failure", func(tx *gorm.DB) {
+		if failBump && tx.Statement.Schema != nil && tx.Statement.Schema.Name == "SystemTask" {
+			tx.AddError(errors.New("isolated sync publication unavailable"))
+		}
+	}))
+	fmt.Println("CONFIG_PROCESS_READY")
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		var command configProcessCommand
+		require.NoError(t, common.Unmarshal(scanner.Bytes(), &command))
+		var commandError error
+		switch command.Action {
+		case "save", "save-failure", "bump-failure":
+			failSave, failBump = command.Action == "save-failure", command.Action == "bump-failure"
+			commandError = model.UpdateOptionsBulk(command.Values)
+			failSave, failBump = false, false
+		case "read-failure":
+			failLoad = true
+			syncNodeTopics(context.Background())
+		case "tick":
+			failLoad = false
+			syncNodeTopics(context.Background())
+		case "periodic-reload":
+			commandError = model.LoadOptionsFromDatabase()
+		default:
+			t.Fatalf("unknown config command %q", command.Action)
+		}
+		response := configProcessResponse{State: NodeSyncStates()[model.SyncTopicOptions], Values: map[string]string{}}
+		if commandError != nil {
+			response.Error = commandError.Error()
+		}
+		common.OptionMapRWMutex.RLock()
+		for _, key := range []string{"EpayId", "Price", "general_setting.quota_display_type", "DisplayInCurrencyEnabled"} {
+			response.Values[key] = common.OptionMap[key]
+		}
+		common.OptionMapRWMutex.RUnlock()
+		encoded, err := common.Marshal(response)
+		require.NoError(t, err)
+		fmt.Println("CONFIG_PROCESS_RESULT " + string(encoded))
+	}
+	require.NoError(t, scanner.Err())
+}
+
+type configProcessCommand struct {
+	Action string            `json:"action"`
+	Values map[string]string `json:"values,omitempty"`
+}
+
+type configProcessResponse struct {
+	State  NodeSyncTopicState `json:"state"`
+	Values map[string]string  `json:"values"`
+	Error  string             `json:"error"`
+}
+
+type configProcess struct {
+	command *exec.Cmd
+	input   io.WriteCloser
+	output  *bufio.Scanner
+	stderr  bytes.Buffer
+}
+
+func startConfigProcess(t *testing.T, dialect, dsn, prefix, name string) *configProcess {
+	t.Helper()
+	process := &configProcess{command: exec.Command(os.Args[0], "-test.run=^TestNodeSyncProcessWorker$", "-test.timeout=90s")}
+	process.command.Env = append(os.Environ(), "NEW_API_CONFIG_PROCESS_WORKER=1", "NEW_API_CONFIG_PROCESS_DIALECT="+dialect, "NEW_API_CONFIG_PROCESS_DSN="+dsn, "NEW_API_CONFIG_PROCESS_PREFIX="+prefix, "NEW_API_CONFIG_PROCESS_NAME="+name)
+	var err error
+	process.input, err = process.command.StdinPipe()
+	require.NoError(t, err)
+	output, err := process.command.StdoutPipe()
+	require.NoError(t, err)
+	process.output = bufio.NewScanner(output)
+	process.command.Stderr = &process.stderr
+	require.NoError(t, process.command.Start())
+	t.Cleanup(func() {
+		_ = process.input.Close()
+		for process.output.Scan() {
+		}
+		assert.NoError(t, process.command.Wait(), process.stderr.String())
+	})
+	for process.output.Scan() {
+		if process.output.Text() == "CONFIG_PROCESS_READY" {
+			return process
+		}
+	}
+	t.Fatalf("config worker did not start: %s", process.stderr.String())
+	return nil
+}
+
+func (process *configProcess) request(t *testing.T, action string, values map[string]string) configProcessResponse {
+	t.Helper()
+	data, err := common.Marshal(configProcessCommand{Action: action, Values: values})
+	require.NoError(t, err)
+	_, err = fmt.Fprintln(process.input, string(data))
+	require.NoError(t, err)
+	for process.output.Scan() {
+		if data, ok := strings.CutPrefix(process.output.Text(), "CONFIG_PROCESS_RESULT "); ok {
+			var response configProcessResponse
+			require.NoError(t, common.UnmarshalJsonStr(data, &response))
+			return response
+		}
+	}
+	t.Fatalf("config worker exited before responding: %s", process.stderr.String())
+	return configProcessResponse{}
+}
+
+func TestNodeSyncConfigurationAcrossProcesses(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			dsn := os.Getenv("TEST_" + strings.ToUpper(dialect) + "_DSN")
+			var driver gorm.Dialector
+			switch dialect {
+			case "sqlite":
+				dsn = filepath.Join(t.TempDir(), "configuration.db")
+				driver = sqlite.Open(dsn)
+			case "mysql":
+				if dsn == "" {
+					t.Skip("isolated MySQL DSN is not configured")
+				}
+				driver = mysql.Open(dsn)
+			case "postgres":
+				if dsn == "" {
+					t.Skip("isolated PostgreSQL DSN is not configured")
+				}
+				driver = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+			}
+			prefix := fmt.Sprintf("config_process_%d_", time.Now().UnixNano())
+			database, err := gorm.Open(driver, &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: prefix}})
+			require.NoError(t, err)
+			tables := []any{&model.Option{}, &model.SystemTask{}}
+			require.NoError(t, database.AutoMigrate(tables...))
+			t.Cleanup(func() {
+				assert.NoError(t, database.Migrator().DropTable(tables...))
+				connection, err := database.DB()
+				require.NoError(t, err)
+				assert.NoError(t, connection.Close())
+			})
+			var version string
+			query := "SELECT version()"
+			if dialect == "sqlite" {
+				query = "SELECT sqlite_version()"
+			}
+			require.NoError(t, database.Raw(query).Scan(&version).Error)
+			t.Logf("independent configuration nodes use %s %s", dialect, version)
+			nodeA := startConfigProcess(t, dialect, dsn, prefix, "configuration-a")
+			nodeB := startConfigProcess(t, dialect, dsn, prefix, "configuration-b")
+			initial := map[string]string{"EpayId": "merchant-before", "Price": "7.5", "DisplayInCurrencyEnabled": "false"}
+			require.Empty(t, nodeA.request(t, "save", initial).Error)
+			applied := nodeB.request(t, "tick", nil)
+			require.Empty(t, applied.State.Error)
+			assert.Equal(t, "merchant-before", applied.Values["EpayId"])
+			assert.Equal(t, "TOKENS", applied.Values["general_setting.quota_display_type"])
+			before := applied.State.Revision
+			require.Positive(t, before)
+
+			failed := nodeA.request(t, "save-failure", map[string]string{"EpayId": "must-not-save", "Price": "99"})
+			require.NotEmpty(t, failed.Error)
+			assert.Equal(t, "merchant-before", failed.Values["EpayId"])
+			unchanged := nodeB.request(t, "tick", nil)
+			assert.Equal(t, before, unchanged.State.Revision)
+			assert.Equal(t, "7.5", unchanged.Values["Price"])
+
+			require.Empty(t, nodeA.request(t, "save", map[string]string{"EpayId": "merchant-after", "Price": "8.5"}).Error)
+			failedRead := nodeB.request(t, "read-failure", nil)
+			require.Contains(t, failedRead.State.Error, "isolated configuration read unavailable")
+			assert.Equal(t, before, failedRead.State.Revision)
+			assert.Equal(t, "merchant-before", failedRead.Values["EpayId"])
+			recovered := nodeB.request(t, "tick", nil)
+			require.Empty(t, recovered.State.Error)
+			assert.Greater(t, recovered.State.Revision, before)
+			assert.Equal(t, "merchant-after", recovered.Values["EpayId"])
+			assert.Equal(t, "8.5", recovered.Values["Price"])
+
+			// Failed task publication is not a failed save. The existing full
+			// reload remains the compensation path; no second synchronizer exists.
+			require.Empty(t, nodeA.request(t, "bump-failure", map[string]string{"Price": "9.5"}).Error)
+			assert.Equal(t, "8.5", nodeB.request(t, "tick", nil).Values["Price"])
+			compensated := nodeB.request(t, "periodic-reload", nil)
+			require.Empty(t, compensated.Error)
+			assert.Equal(t, "9.5", compensated.Values["Price"])
+		})
 	}
 }

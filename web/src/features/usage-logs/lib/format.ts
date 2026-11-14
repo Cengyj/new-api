@@ -486,7 +486,7 @@ const AUDIT_TEMPLATES: Record<string, string> = {
   'user.2fa_disable': 'Force-disabled two-factor authentication for the user',
   'user.passkey_register': 'Registered a passkey',
   'user.passkey_delete': 'Deleted a passkey',
-  'user.topup_complete': 'Completed top-up order for the user',
+  'user.topup_complete': 'Manual top-up completion request',
   'user.reset_passkey': 'Reset the user passkey',
   'user.oauth_unbind': 'Removed an OAuth binding for the user',
   // System settings

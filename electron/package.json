@@ -4,6 +4,7 @@
   "description": "New API - AI Model Gateway Desktop Application",
   "main": "main.js",
   "scripts": {
+    "postinstall": "install-electron",
     "start-app": "electron .",
     "dev-app": "cross-env NODE_ENV=development electron .",
     "build": "electron-builder",

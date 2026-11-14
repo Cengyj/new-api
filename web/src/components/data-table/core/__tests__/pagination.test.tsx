@@ -30,15 +30,28 @@ import { DataTablePagination } from '../pagination'
 const rows = [{ id: 1 }, { id: 2 }, { id: 3 }]
 const emptyRows: { id: number }[] = []
 
-function Fixture(props: { empty?: boolean; compact?: boolean }) {
+function Fixture(props: {
+  empty?: boolean
+  compact?: boolean
+  disabled?: boolean
+  pageCount?: number
+}) {
   const table = useReactTable({
     data: props.empty ? emptyRows : rows,
     columns: [{ accessorKey: 'id' }],
     getCoreRowModel: getCoreRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
+    pageCount: props.pageCount,
+    manualPagination: props.pageCount !== undefined,
     initialState: { pagination: { pageIndex: 0, pageSize: 2 } },
   })
-  return <DataTablePagination table={table} compact={props.compact} />
+  return (
+    <DataTablePagination
+      table={table}
+      compact={props.compact}
+      disabled={props.disabled}
+    />
+  )
 }
 it('moves between pages in compact mode and disables the boundary actions', async () => {
   const user = userEvent.setup()
@@ -64,4 +77,45 @@ it('shows a valid empty page with navigation disabled', () => {
 it('keeps page size selection available in the default layout', () => {
   render(<Fixture />)
   expect(screen.getByRole('combobox')).toBeVisible()
+})
+
+it('navigates directly with the log-style numbered buttons and keeps page size selection', async () => {
+  const user = userEvent.setup()
+  render(<Fixture pageCount={10} />)
+  await user.click(screen.getByRole('button', { name: /Go to page 2/ }))
+  expect(screen.getByRole('button', { name: /Go to page 2/ })).toHaveAttribute(
+    'aria-current',
+    'page'
+  )
+  expect(
+    screen.queryByRole('textbox', { name: 'Page' })
+  ).not.toBeInTheDocument()
+  expect(screen.getByRole('combobox')).toBeEnabled()
+  await user.click(screen.getByRole('button', { name: 'Go to last page' }))
+  expect(screen.getByRole('button', { name: /Go to page 10/ })).toHaveAttribute(
+    'aria-current',
+    'page'
+  )
+  expect(screen.getByRole('button', { name: 'Go to next page' })).toBeDisabled()
+})
+
+it.each([true, false])(
+  'disables all compact=%s pagination controls while loading',
+  (compact) => {
+    render(<Fixture compact={compact} disabled pageCount={10} />)
+    for (const button of screen.getAllByRole('button')) {
+      expect(button).toBeDisabled()
+    }
+    if (!compact) expect(screen.getByRole('combobox')).toBeDisabled()
+  }
+)
+
+it('keeps next-page navigation but disables last-page navigation when the total is unknown', async () => {
+  const user = userEvent.setup()
+  render(<Fixture pageCount={-1} />)
+  expect(screen.getByRole('button', { name: 'Go to last page' })).toBeDisabled()
+  await user.click(screen.getByRole('button', { name: 'Go to next page' }))
+  expect(
+    screen.getByRole('button', { name: 'Go to previous page' })
+  ).toBeEnabled()
 })

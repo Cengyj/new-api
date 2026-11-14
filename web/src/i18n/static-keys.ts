@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 // Static translation keys that don't get picked up by the t('...') regex.
 // These cover dynamic labels (e.g. constants, configs) that are passed into t at runtime.
 export const STATIC_I18N_KEYS = [
+  'Manual top-up completion request',
   'The adjusted price is outside the supported range.',
   'This expression cannot be adjusted automatically. Keep the source price or edit it manually.',
   'Task usage metadata is unavailable. Pricing details cannot be displayed.',
@@ -854,6 +855,8 @@ export const STATIC_I18N_KEYS = [
   'Usage',
   'View your usage logs, statistics, tasks, and audit logs.',
   'Wallet',
+  'Enter a percentage from 0.01 to 100 with at most two decimal places',
+  'Enter a positive whole number of days within the supported range',
   'View balance, top-up records, subscriptions, and referral information.',
   'Top up, pay for subscriptions, check in, and transfer referral rewards.',
   'Account security',

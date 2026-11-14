@@ -81,7 +81,7 @@ func SubscriptionRequestStripePay(c *gin.Context) {
 
 	payLink, err := genStripeSubscriptionLink(referenceId, user.StripeCustomer, user.Email, plan.StripePriceId)
 	if err != nil {
-		logger.LogError(c.Request.Context(), common.LogText("Stripe failed to create subscription payment link trade_no=%s plan_id=%d error=%q", referenceId, plan.Id, err.Error()))
+		logger.LogError(c.Request.Context(), common.LogText("Stripe failed to create subscription payment link trade_no=%s plan_id=%d %s", referenceId, plan.Id, stripeCheckoutErrorSummary(err)))
 		paymentError(c, common.NewMessage("Failed to start payment"))
 		return
 	}
@@ -134,7 +134,8 @@ func genStripeSubscriptionLink(referenceId string, customerId string, email stri
 		params.Customer = stripe.String(customerId)
 	}
 
-	result, err := session.New(params)
+	client := session.Client{B: stripeCheckoutBackend(), Key: stripe.Key}
+	result, err := client.New(params)
 	if err != nil {
 		return "", err
 	}

@@ -103,9 +103,12 @@ func BuildTaskArtifactContentURL(taskID, artifactKey string) (string, error) {
 		return "", ErrTaskArtifactAccessInvalid
 	}
 
-	baseAddress := strings.TrimSpace(system_setting.TaskPublicAddress)
+	common.OptionMapRWMutex.RLock()
+	publicAddress, serverAddress := system_setting.TaskPublicAddress, system_setting.ServerAddress
+	common.OptionMapRWMutex.RUnlock()
+	baseAddress := strings.TrimSpace(publicAddress)
 	if baseAddress == "" {
-		baseAddress = strings.TrimSpace(system_setting.ServerAddress)
+		baseAddress = strings.TrimSpace(serverAddress)
 	}
 	if err := ValidateTaskArtifactBaseURL(baseAddress); err != nil {
 		return "", err

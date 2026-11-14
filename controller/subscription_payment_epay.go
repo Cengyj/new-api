@@ -1,7 +1,9 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -14,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/samber/lo"
+	"github.com/shopspring/decimal"
 )
 
 type SubscriptionEpayPayRequest struct {
@@ -147,7 +150,7 @@ func SubscriptionEpayNotify(c *gin.Context) {
 		return
 	}
 	verifyInfo, err := client.Verify(params)
-	if err != nil || !verifyInfo.VerifyStatus {
+	if err != nil || !verifyInfo.VerifyStatus || params["pid"] == "" || params["pid"] != client.Config.PartnerID {
 		_, _ = c.Writer.Write([]byte("fail"))
 		return
 	}
@@ -157,10 +160,7 @@ func SubscriptionEpayNotify(c *gin.Context) {
 		return
 	}
 
-	LockOrder(verifyInfo.ServiceTradeNo)
-	defer UnlockOrder(verifyInfo.ServiceTradeNo)
-
-	if err := model.CompleteSubscriptionOrder(verifyInfo.ServiceTradeNo, common.GetJsonString(verifyInfo), model.PaymentProviderEpay, verifyInfo.Type); err != nil {
+	if err := completeSubscriptionEpayOrder(verifyInfo); err != nil {
 		_, _ = c.Writer.Write([]byte("fail"))
 		return
 	}
@@ -202,14 +202,12 @@ func SubscriptionEpayReturn(c *gin.Context) {
 		return
 	}
 	verifyInfo, err := client.Verify(params)
-	if err != nil || !verifyInfo.VerifyStatus {
+	if err != nil || !verifyInfo.VerifyStatus || params["pid"] == "" || params["pid"] != client.Config.PartnerID {
 		c.Redirect(http.StatusFound, paymentReturnPath("/wallet?pay=fail"))
 		return
 	}
 	if verifyInfo.TradeStatus == epay.StatusTradeSuccess {
-		LockOrder(verifyInfo.ServiceTradeNo)
-		defer UnlockOrder(verifyInfo.ServiceTradeNo)
-		if err := model.CompleteSubscriptionOrder(verifyInfo.ServiceTradeNo, common.GetJsonString(verifyInfo), model.PaymentProviderEpay, verifyInfo.Type); err != nil {
+		if err := completeSubscriptionEpayOrder(verifyInfo); err != nil {
 			c.Redirect(http.StatusFound, paymentReturnPath("/wallet?pay=fail"))
 			return
 		}
@@ -217,4 +215,29 @@ func SubscriptionEpayReturn(c *gin.Context) {
 		return
 	}
 	c.Redirect(http.StatusFound, paymentReturnPath("/wallet?pay=pending"))
+}
+
+// Both Epay callbacks must bind the signed amount to the original checkout,
+// including on replay. The SDK validates the signature, not the order price.
+func completeSubscriptionEpayOrder(verified *epay.VerifyRes) error {
+	paid, err := decimal.NewFromString(verified.Money)
+	if err != nil || !paid.IsPositive() {
+		return errors.New("invalid subscription payment amount")
+	}
+	LockOrder(verified.ServiceTradeNo)
+	defer UnlockOrder(verified.ServiceTradeNo)
+	order, err := model.GetSubscriptionOrderByTradeNoWithError(verified.ServiceTradeNo)
+	if err != nil {
+		return err
+	}
+	if math.IsNaN(order.Money) || math.IsInf(order.Money, 0) {
+		return errors.New("invalid subscription order amount")
+	}
+	// Purchase signs the stored price formatted to two decimals. A plan edit
+	// after checkout must not change the amount required for this order.
+	quoted, err := decimal.NewFromString(strconv.FormatFloat(order.Money, 'f', 2, 64))
+	if err != nil || !paid.Equal(quoted) {
+		return errors.New("subscription payment amount mismatch")
+	}
+	return model.CompleteSubscriptionOrder(verified.ServiceTradeNo, common.GetJsonString(verified), model.PaymentProviderEpay, verified.Type)
 }

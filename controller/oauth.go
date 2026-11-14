@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -30,11 +31,31 @@ type oauthStateRequest struct {
 }
 
 type oauthFlowPayload struct {
+	BrowserBinding  string                         `json:"browser_binding,omitempty"`
 	AffiliateCode   string                         `json:"affiliate_code,omitempty"`
 	Verification    *service.OAuthVerificationFlow `json:"verification,omitempty"`
 	Telegram        *oauth.TelegramOAuthFlow       `json:"telegram,omitempty"`
 	SessionIdentity *service.AuthIdentity          `json:"session_identity,omitempty"`
 	Authorization   *model.AuthFlowAuthorization   `json:"authorization,omitempty"`
+}
+
+// OAuth login state must belong to the browser that started it, including
+// anonymous sign-ins. Keep the raw nonce only in an HttpOnly, host-only cookie;
+// the flow carries its domain-separated HMAC. Reuse it for concurrent tabs.
+func oauthLoginBrowserCookieName() string {
+	if common.SessionCookieSecure {
+		return "__Host-new_api_oauth_login"
+	}
+	return "new_api_oauth_login"
+}
+
+func oauthLoginBrowserBinding(nonce string) string {
+	if len(nonce) != 64 || strings.ContainsFunc(nonce, func(r rune) bool {
+		return !(r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z')
+	}) {
+		return ""
+	}
+	return common.GenerateHMACWithKey([]byte("oauth-login-browser-v1:"+common.SessionSecret), nonce)
 }
 
 // providerParams returns the params of messages that name the OAuth provider.
@@ -111,6 +132,23 @@ func GenerateOAuthCode(c *gin.Context) {
 			flowPayload.Verification = verification
 		}
 	}
+	var browserCookie *http.Cookie
+	if request.Intent == model.AuthFlowIntentLogin {
+		nonce := ""
+		if existing, err := c.Request.Cookie(oauthLoginBrowserCookieName()); err == nil {
+			nonce = existing.Value
+		}
+		if oauthLoginBrowserBinding(nonce) == "" {
+			var err error
+			nonce, err = common.GenerateRandomCharsKey(64)
+			if err != nil {
+				writeSecurityOperationError(c, err)
+				return
+			}
+		}
+		flowPayload.BrowserBinding = oauthLoginBrowserBinding(nonce)
+		browserCookie = &http.Cookie{Name: oauthLoginBrowserCookieName(), Value: nonce, Path: "/", MaxAge: int(oauthAuthFlowTTL / time.Second), HttpOnly: true, Secure: common.SessionCookieSecure, SameSite: http.SameSiteLaxMode}
+	}
 	payload, err := common.Marshal(flowPayload)
 	if err != nil {
 		writeSecurityOperationError(c, err)
@@ -129,6 +167,10 @@ func GenerateOAuthCode(c *gin.Context) {
 	if err != nil {
 		writeSecurityOperationError(c, err)
 		return
+	}
+	if browserCookie != nil {
+		browserCookie.Expires = expiresAt
+		http.SetCookie(c.Writer, browserCookie)
 	}
 	bindingStarted = request.Intent == model.AuthFlowIntentBind
 	data := gin.H{"flow_token": state, "expires_at": expiresAt.Unix()}
@@ -160,6 +202,20 @@ func HandleOAuth(c *gin.Context) {
 	if err != nil {
 		writeAccountStatusError(c, http.StatusForbidden, "State parameter is empty or mismatched")
 		return
+	}
+
+	if pendingFlow.Intent == model.AuthFlowIntentLogin {
+		var payload oauthFlowPayload
+		cookie, cookieErr := c.Request.Cookie(oauthLoginBrowserCookieName())
+		binding := ""
+		if cookieErr == nil {
+			binding = oauthLoginBrowserBinding(cookie.Value)
+		}
+		if common.UnmarshalJsonStr(pendingFlow.Payload, &payload) != nil || binding == "" ||
+			subtle.ConstantTimeCompare([]byte(binding), []byte(payload.BrowserBinding)) != 1 {
+			writeAccountStatusError(c, http.StatusForbidden, "State parameter is empty or mismatched")
+			return
+		}
 	}
 
 	consumeMatch := model.AuthFlowMatch{
@@ -378,7 +434,7 @@ func handleOAuthBind(c *gin.Context, providerName string, provider oauth.Provide
 			return model.UpdateUserOAuthBindingForSessionWithTx(tx, identity, custom.GetProviderId(), oauthUser.ProviderUserID)
 		}
 		return model.UpdateUserBindColumnForSessionWithTx(tx, identity, provider.ProviderUserIDColumn(), oauthUser.ProviderUserID)
-	})
+	}, model.OAuthIdentityTransactionOptions(provider.ProviderUserIDColumn()))
 	if err != nil {
 		writeSecurityOperationError(c, err)
 		return false, false
@@ -391,6 +447,42 @@ func handleOAuthBind(c *gin.Context, providerName string, provider oauth.Provide
 	notificationFailed := service.NotifyAccountSecurityChange(service.AccountMailLanguage(c, user.Id), user.Email, i18n.MsgSecurityEventLoginLinked, map[string]any{"Provider": provider.GetName()}) != nil
 	common.ApiSuccessT(c, "Binding successful", gin.H{"action": "bind", "notification_warning": notificationFailed})
 	return true, notificationFailed
+}
+
+// findOAuthUser distinguishes a missing identity from a failed database read.
+// Registration must never turn a lookup failure into another account and award.
+func findOAuthUser(provider oauth.Provider, subject string) (*model.User, error) {
+	query := model.DB.Unscoped()
+	if custom, ok := provider.(*oauth.GenericOAuthProvider); ok {
+		var binding model.UserOAuthBinding
+		err := model.DB.Where("provider_id = ? AND provider_user_id = ?", custom.GetProviderId(), subject).First(&binding).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		query = query.Where("id = ?", binding.UserId)
+	} else {
+		column := provider.ProviderUserIDColumn()
+		if column == "" {
+			return nil, common.NewMessage("Unknown OAuth provider")
+		}
+		if column == "oidc_id" {
+			// Keep the existing OIDC account lookup's soft-delete scope.
+			query = model.DB
+		}
+		query = query.Where(map[string]any{column: subject})
+	}
+	var user model.User
+	err := query.First(&user).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &user, nil
 }
 
 // findOrCreateOAuthUser finds the existing user or creates a new one. For a
@@ -406,28 +498,29 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 		return user, nil, err
 	}
 
-	// Check if user already exists with new ID
-	if provider.IsUserIDTaken(oauthUser.ProviderUserID) {
-		err := provider.FillUserByProviderID(user, oauthUser.ProviderUserID)
-		if err != nil {
-			return nil, nil, err
-		}
-		// Check if user has been deleted
-		if user.Id == 0 {
+	// Check if the provider identity already owns an account before creating one.
+	existing, err := findOAuthUser(provider, oauthUser.ProviderUserID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if existing != nil {
+		if existing.DeletedAt.Valid {
 			return nil, nil, &OAuthUserDeletedError{}
 		}
-		return user, nil, nil
+		return existing, nil, nil
 	}
 
 	// Legacy GitHub bindings stored the login name, which only points at a
 	// candidate account. Values that are all digits are already numeric account
 	// IDs and never take part in the comparison.
 	legacyID, _ := oauthUser.Extra["legacy_id"].(string)
-	if strings.ContainsFunc(legacyID, func(r rune) bool { return r < '0' || r > '9' }) && provider.IsUserIDTaken(legacyID) {
-		if err := provider.FillUserByProviderID(user, legacyID); err != nil {
+	if strings.ContainsFunc(legacyID, func(r rune) bool { return r < '0' || r > '9' }) {
+		legacyUser, err := findOAuthUser(provider, legacyID)
+		if err != nil {
 			return nil, nil, err
 		}
-		if user.Id != 0 {
+		if legacyUser != nil && !legacyUser.DeletedAt.Valid {
+			user = legacyUser
 			state, err := model.GetUserVerificationState(user.Id)
 			if err != nil {
 				return nil, nil, err
@@ -459,7 +552,7 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 				var err error
 				written, err = model.MigrateLegacyGitHubBindingWithTx(tx, user.Id, legacyID, oauthUser.ProviderUserID)
 				return err
-			})
+			}, model.OAuthIdentityTransactionOptions("github_id"))
 			if err != nil {
 				return nil, nil, err
 			}
@@ -511,19 +604,15 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 	user.Role = common.RoleCommonUser
 	user.Status = common.UserStatusEnabled
 
-	// Handle affiliate code
-	inviterId := 0
-	if affiliateCode != "" {
-		inviterId, _ = model.GetUserIdByAffCode(affiliateCode)
-	}
-	user.InviterId = inviterId
+	// Resolve the invitation in the same transaction as creation and binding.
+	user.RegistrationAffCode = affiliateCode
 
 	// Use transaction to ensure user creation and OAuth binding are atomic
 	if genericProvider, ok := provider.(*oauth.GenericOAuthProvider); ok {
 		// Custom provider: create user and binding in a transaction
 		err := model.DB.Transaction(func(tx *gorm.DB) error {
 			// Create user
-			if err := user.InsertWithTx(tx, inviterId); err != nil {
+			if err := user.InsertWithTx(tx, 0); err != nil {
 				return err
 			}
 
@@ -543,13 +632,29 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 			return nil, nil, err
 		}
 
-		// Perform post-transaction tasks (logs, sidebar config, inviter rewards)
-		user.FinalizeOAuthUserCreation(inviterId)
+		// Perform non-financial post-transaction logging
+		user.FinalizeOAuthUserCreation(user.InviterId)
 	} else {
 		// Built-in provider: create user and update provider ID in a transaction
+		created := false
 		err := model.DB.Transaction(func(tx *gorm.DB) error {
+			owners, err := model.LockOAuthIdentityWithTx(tx, provider.ProviderUserIDColumn(), oauthUser.ProviderUserID)
+			if err != nil {
+				return err
+			}
+			for i := range owners {
+				owner := &owners[i]
+				if owner.DeletedAt.Valid {
+					if provider.ProviderUserIDColumn() == "oidc_id" {
+						continue
+					}
+					return &OAuthUserDeletedError{}
+				}
+				user = owner
+				return nil
+			}
 			// Create user
-			if err := user.InsertWithTx(tx, inviterId); err != nil {
+			if err := user.InsertWithTx(tx, 0); err != nil {
 				return err
 			}
 
@@ -566,14 +671,17 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 				return err
 			}
 
+			created = true
 			return nil
-		})
+		}, model.OAuthIdentityTransactionOptions(provider.ProviderUserIDColumn()))
 		if err != nil {
 			return nil, nil, err
 		}
 
 		// Perform post-transaction tasks
-		user.FinalizeOAuthUserCreation(inviterId)
+		if created {
+			user.FinalizeOAuthUserCreation(user.InviterId)
+		}
 	}
 
 	return user, nil, nil

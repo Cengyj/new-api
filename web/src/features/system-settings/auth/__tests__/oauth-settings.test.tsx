@@ -138,10 +138,14 @@ describe('OAuth settings saves', () => {
       await user.click(screen.getByRole('button', { name: 'Save Changes' }))
 
       await waitFor(() =>
-        expect(api.put).toHaveBeenCalledWith('/api/option/', {
-          key: 'GitHubClientId',
-          value: 'github-client',
-        })
+        expect(api.put).toHaveBeenCalledWith(
+          '/api/option/',
+          {
+            key: 'GitHubClientId',
+            value: 'github-client',
+          },
+          expect.objectContaining({ skipAuthRefresh: true })
+        )
       )
       expect(api.put).toHaveBeenCalledTimes(1)
       expect(discovery).not.toHaveBeenCalled()
@@ -179,10 +183,14 @@ describe('OAuth settings saves', () => {
     await user.click(screen.getByRole('button', { name: 'Save Changes' }))
 
     await waitFor(() =>
-      expect(api.put).toHaveBeenCalledWith('/api/option/', {
-        key: 'oidc.enabled',
-        value: false,
-      })
+      expect(api.put).toHaveBeenCalledWith(
+        '/api/option/',
+        {
+          key: 'oidc.enabled',
+          value: false,
+        },
+        expect.objectContaining({ skipAuthRefresh: true })
+      )
     )
     expect(api.put).toHaveBeenCalledTimes(1)
   })
@@ -262,18 +270,30 @@ describe('OAuth settings saves', () => {
       expect(screen.getByRole('button', { name: 'Reset' })).toBeDisabled()
     )
     await waitFor(() => expect(api.put).toHaveBeenCalledTimes(4))
-    expect(api.put).toHaveBeenCalledWith('/api/option/', {
-      key: 'oidc.authorization_endpoint',
-      value: response.data.authorization_endpoint,
-    })
-    expect(api.put).toHaveBeenCalledWith('/api/option/', {
-      key: 'oidc.token_endpoint',
-      value: response.data.token_endpoint,
-    })
-    expect(api.put).toHaveBeenCalledWith('/api/option/', {
-      key: 'oidc.user_info_endpoint',
-      value: response.data.userinfo_endpoint,
-    })
+    expect(api.put).toHaveBeenCalledWith(
+      '/api/option/',
+      {
+        key: 'oidc.authorization_endpoint',
+        value: response.data.authorization_endpoint,
+      },
+      expect.objectContaining({ skipAuthRefresh: true })
+    )
+    expect(api.put).toHaveBeenCalledWith(
+      '/api/option/',
+      {
+        key: 'oidc.token_endpoint',
+        value: response.data.token_endpoint,
+      },
+      expect.objectContaining({ skipAuthRefresh: true })
+    )
+    expect(api.put).toHaveBeenCalledWith(
+      '/api/option/',
+      {
+        key: 'oidc.user_info_endpoint',
+        value: response.data.userinfo_endpoint,
+      },
+      expect.objectContaining({ skipAuthRefresh: true })
+    )
     await waitFor(() =>
       expect(screen.getByRole('button', { name: 'Save Changes' })).toBeEnabled()
     )
@@ -330,10 +350,14 @@ describe('OAuth settings saves', () => {
     get.mockResolvedValue({ data: {} })
     await user.click(screen.getByRole('button', { name: 'Save Changes' }))
     await waitFor(() =>
-      expect(api.put).toHaveBeenCalledWith('/api/option/', {
-        key: 'oidc.well_known',
-        value: 'https://provider.example.com/discovery',
-      })
+      expect(api.put).toHaveBeenCalledWith(
+        '/api/option/',
+        {
+          key: 'oidc.well_known',
+          value: 'https://provider.example.com/discovery',
+        },
+        expect.objectContaining({ skipAuthRefresh: true })
+      )
     )
   })
 })

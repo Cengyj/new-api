@@ -152,6 +152,54 @@ func TestSetUpLoggerNeverWritesTaskArtifactAccess(t *testing.T) {
 	assert.False(t, strings.Contains(output.String(), "never-log-this"))
 }
 
+func TestSetUpLoggerRedactsPaymentAndOAuthQueriesWithoutChangingRequests(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousWriter := gin.DefaultWriter
+	var output bytes.Buffer
+	gin.DefaultWriter = &output
+	t.Cleanup(func() { gin.DefaultWriter = previousWriter })
+	for _, tc := range []struct {
+		method, path string
+		redacted     bool
+	}{
+		{http.MethodGet, "/api/user/epay/notify", true},
+		{http.MethodPost, "/api/user/epay/notify", true},
+		{http.MethodGet, "/api/subscription/epay/notify", true},
+		{http.MethodGet, "/api/subscription/epay/return", true},
+		{http.MethodPost, "/api/stripe/webhook", true},
+		{http.MethodPost, "/api/creem/webhook", true},
+		{http.MethodPost, "/api/waffo/webhook", true},
+		{http.MethodPost, "/api/waffo-pancake/webhook/production", true},
+		{http.MethodPost, "/api/waffo-pancake/webhook/sandbox", true},
+		{http.MethodGet, "/api/oauth/provider", true},
+		{http.MethodGet, "/oauth/provider", true},
+		{http.MethodGet, "/api/user/topup", false},
+	} {
+		t.Run(tc.method+tc.path, func(t *testing.T) {
+			output.Reset()
+			router := gin.New()
+			SetUpLogger(router)
+			const query = "sign=never-log-payment-signature&code=never-log-oauth-code&keep=ok"
+			router.Handle(tc.method, tc.path, func(c *gin.Context) {
+				assert.Equal(t, query, c.Request.URL.RawQuery, "verification still receives the original signed query")
+				assert.Equal(t, "never-log-payment-signature", c.Query("sign"))
+				assert.Equal(t, "never-log-oauth-code", c.Query("code"))
+				c.Status(http.StatusNoContent)
+			})
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(tc.method, tc.path+"?"+query, nil))
+			assert.Equal(t, http.StatusNoContent, recorder.Code)
+			assert.Contains(t, output.String(), tc.path)
+			if tc.redacted {
+				assert.NotContains(t, output.String(), "never-log-")
+				assert.NotContains(t, output.String(), "?", "callback access logs contain only the path")
+			} else {
+				assert.Contains(t, output.String(), "code=never-log-oauth-code&keep=ok&sign=never-log-payment-signature", "ordinary query values survive the upstream log normalization")
+			}
+		})
+	}
+}
+
 func urlQueryEscape(value string) string {
 	replacer := strings.NewReplacer("+", "%2B", "=", "%3D")
 	return replacer.Replace(value)

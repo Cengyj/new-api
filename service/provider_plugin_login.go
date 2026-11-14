@@ -103,7 +103,10 @@ var vendorErrorCodePattern = regexp.MustCompile(`^[A-Za-z0-9_.\-]{1,64}$`)
 // PluginLoginRedirectURI is the callback address of a plugin's logins. Each
 // plugin has its own, so a callback cannot reach another plugin's flow.
 func PluginLoginRedirectURI(pluginKey string) string {
-	return strings.TrimRight(system_setting.ServerAddress, "/") + "/oauth/plugin/" + pluginKey + "/callback"
+	common.OptionMapRWMutex.RLock()
+	serverAddress := system_setting.ServerAddress
+	common.OptionMapRWMutex.RUnlock()
+	return strings.TrimRight(serverAddress, "/") + "/oauth/plugin/" + pluginKey + "/callback"
 }
 
 // loginPluginOfChannel returns the plugin of a task plugin channel when it

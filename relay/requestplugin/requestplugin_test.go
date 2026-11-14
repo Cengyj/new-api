@@ -205,6 +205,13 @@ func TestStageGuardsAndFailures(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
+			if tc.class == jsplugin.TransformErrorMemory {
+				previous := constant.PluginMemoryLimitMB
+				// Exercise memory exhaustion before the hook deadline, including
+				// with the race detector's allocation overhead.
+				constant.PluginMemoryLimitMB = 8
+				t.Cleanup(func() { constant.PluginMemoryLimitMB = previous })
+			}
 			setupPlugins(t, `[{"id":"rp","name":"Rp","plugin":"rp-stages","enabled":true,"global":true,"config":`+tc.config+`}]`)
 			body := []byte(`{"model":"gpt","messages":[]}`)
 			outcome := NewPlan().Run(context.Background(), Call{Stage: tc.stage, Body: body})

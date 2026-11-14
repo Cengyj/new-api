@@ -2,12 +2,19 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting"
 	pancake "github.com/waffo-com/waffo-pancake-sdk-go"
+	"gorm.io/gorm"
 )
 
 // WaffoPancakePriceSnapshot is the per-session price override sent with checkout.
@@ -40,6 +47,44 @@ type WaffoPancakeCheckoutSession struct {
 	TokenExpiresAt string
 }
 
+// ErrWaffoPancakeCheckoutNotStarted identifies a local rejection before the
+// SDK can send either authenticated-checkout request. Errors after that
+// boundary may leave a remotely created session and must remain retryable.
+var ErrWaffoPancakeCheckoutNotStarted = errors.New("Waffo Pancake checkout request not started")
+
+type waffoPancakeCheckoutTransport struct {
+	transport http.RoundTripper
+	started   atomic.Bool
+}
+
+func (t *waffoPancakeCheckoutTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	t.started.Store(true)
+	return t.transport.RoundTrip(request)
+}
+
+// The installed SDK can expose data/errors without rejecting HTTP failures.
+// Preserve an authentication or server failure even if its body has data.
+type waffoPancakeResponseTransport struct {
+	transport http.RoundTripper
+}
+
+func (t *waffoPancakeResponseTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := t.transport.RoundTrip(request)
+	if err != nil {
+		return response, err
+	}
+	if response == nil {
+		return nil, fmt.Errorf("Waffo Pancake returned no response")
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		if response.Body != nil {
+			response.Body.Close()
+		}
+		return nil, fmt.Errorf("Waffo Pancake returned HTTP %d", response.StatusCode)
+	}
+	return response, nil
+}
+
 // WaffoPancakeWebhookEvent mirrors the SDK's WebhookEvent shape using plain
 // strings so controllers don't have to import the SDK package.
 type WaffoPancakeWebhookEvent struct {
@@ -53,7 +98,7 @@ type WaffoPancakeWebhookEvent struct {
 }
 
 type WaffoPancakeWebhookData struct {
-	// OrderID = Pancake ORD_* (logs); OrderMerchantExternalID = our trade_no (lookup).
+	// OrderID = Pancake ORD_* (authenticated inquiry); external ID = our trade_no.
 	OrderID                       string
 	OrderMerchantExternalID       string
 	BuyerEmail                    string
@@ -98,20 +143,38 @@ func newWaffoPancakeClientFromCreds(merchantID, privateKey string) (*pancake.Cli
 // attributable even if the buyer edits the email on Waffo's checkout form.
 func CreateWaffoPancakeCheckoutSession(ctx context.Context, params *WaffoPancakeCreateSessionParams) (*WaffoPancakeCheckoutSession, error) {
 	if params == nil {
-		return nil, fmt.Errorf("missing checkout params")
+		return nil, fmt.Errorf("%w: missing checkout params", ErrWaffoPancakeCheckoutNotStarted)
 	}
 	if strings.TrimSpace(params.BuyerIdentity) == "" {
-		return nil, fmt.Errorf("missing buyer identity")
+		return nil, fmt.Errorf("%w: missing buyer identity", ErrWaffoPancakeCheckoutNotStarted)
 	}
 	if strings.TrimSpace(params.OrderMerchantExternalID) == "" {
-		return nil, fmt.Errorf("missing order merchant external id")
+		return nil, fmt.Errorf("%w: missing order merchant external id", ErrWaffoPancakeCheckoutNotStarted)
 	}
-	if strings.TrimSpace(setting.WaffoPancakeStoreID) == "" {
-		return nil, fmt.Errorf("missing Waffo Pancake store id")
+	common.OptionMapRWMutex.RLock()
+	storeID := setting.WaffoPancakeStoreID
+	merchantID, privateKey := setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey
+	common.OptionMapRWMutex.RUnlock()
+	if strings.TrimSpace(storeID) == "" {
+		return nil, fmt.Errorf("%w: missing Waffo Pancake store id", ErrWaffoPancakeCheckoutNotStarted)
 	}
-	client, err := newWaffoPancakeClient()
+	// Authenticated checkout sends token and session requests concurrently.
+	// Track actual transport use so SDK-local validation failures can retain
+	// the original failed-order policy without guessing from SDK error types.
+	httpClient := *http.DefaultClient
+	transport := &waffoPancakeCheckoutTransport{transport: httpClient.Transport}
+	if transport.transport == nil {
+		transport.transport = http.DefaultTransport
+	}
+	transport.transport = &waffoPancakeResponseTransport{transport: transport.transport}
+	httpClient.Transport = transport
+	client, err := pancake.New(pancake.Config{
+		MerchantID: merchantID,
+		PrivateKey: privateKey,
+		HTTPClient: &httpClient,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("build Waffo Pancake client: %w", err)
+		return nil, fmt.Errorf("%w: build Waffo Pancake client: %w", ErrWaffoPancakeCheckoutNotStarted, err)
 	}
 
 	sdkParams := pancake.AuthenticatedCheckoutParams{
@@ -131,12 +194,27 @@ func CreateWaffoPancakeCheckoutSession(ctx context.Context, params *WaffoPancake
 		}
 	}
 
-	session, err := client.Checkout.Authenticated.Create(ctx, sdkParams)
+	// The SDK waits for both requests and its default HTTP client has no
+	// timeout. Bound the whole checkout, including reading either response;
+	// expiration after transport starts still leaves the original order pending.
+	checkoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	session, err := client.Checkout.Authenticated.Create(checkoutCtx, sdkParams)
 	if err != nil {
+		if !transport.started.Load() {
+			return nil, fmt.Errorf("%w: %w", ErrWaffoPancakeCheckoutNotStarted, err)
+		}
 		return nil, err
 	}
-	if session == nil || strings.TrimSpace(session.CheckoutURL) == "" || strings.TrimSpace(session.SessionID) == "" {
+	if session == nil || strings.TrimSpace(session.SessionID) == "" || strings.TrimSpace(session.Token) == "" {
 		return nil, fmt.Errorf("Waffo Pancake returned empty checkout session")
+	}
+	// The SDK appends #token even when either successful JSON response is
+	// incomplete. The fragment cannot turn an empty checkout URL into a valid
+	// session, and authenticated checkout must retain its buyer token.
+	checkoutURL, _, _ := strings.Cut(session.CheckoutURL, "#")
+	if strings.TrimSpace(checkoutURL) == "" {
+		return nil, fmt.Errorf("Waffo Pancake returned empty checkout URL")
 	}
 	return &WaffoPancakeCheckoutSession{
 		SessionID:      session.SessionID,
@@ -162,14 +240,48 @@ func WaffoPancakeBuyerIdentityFromUserID(userID int) string {
 	return fmt.Sprintf("new-api-user-%d", userID)
 }
 
-// VerifyConfiguredWaffoPancakeWebhook verifies the signature header. The SDK
-// picks the matching test / prod public key from the payload's `mode` field.
+// VerifyConfiguredWaffoPancakeWebhook verifies the signature with the key for
+// the payload's environment. The SDK's default auto-detection accepts either
+// key regardless of mode, so select the key explicitly before trusting data.
 func VerifyConfiguredWaffoPancakeWebhook(payload string, signatureHeader string) (*WaffoPancakeWebhookEvent, error) {
-	evt, err := pancake.VerifyWebhookTyped[pancake.WebhookEventData](payload, signatureHeader, nil)
+	var envelope struct {
+		Mode string `json:"mode"`
+	}
+	if err := common.UnmarshalJsonStr(payload, &envelope); err != nil {
+		return nil, fmt.Errorf("invalid Waffo Pancake webhook envelope: %w", err)
+	}
+	environment := pancake.Environment(strings.ToLower(strings.TrimSpace(envelope.Mode)))
+	if environment != pancake.EnvironmentTest && environment != pancake.EnvironmentProd {
+		return nil, fmt.Errorf("invalid Waffo Pancake webhook environment")
+	}
+	// Retries reuse the first signature timestamp and can arrive over 31
+	// minutes later. Match Waffo's documented 45-minute/1-minute window while
+	// keeping the installed SDK's signature verification and finite age check.
+	// https://github.com/waffo-com/waffo-pancake-sdk-go/releases/tag/v0.9.0
+	evt, err := pancake.VerifyWebhookTyped[pancake.WebhookEventData](payload, signatureHeader, &pancake.VerifyWebhookOptions{
+		Environment: environment,
+		ToleranceMS: (45 * time.Minute).Milliseconds(),
+	})
 	if err != nil {
 		return nil, err
 	}
-	if storeID := strings.TrimSpace(setting.WaffoPancakeStoreID); storeID == "" || evt.StoreID != storeID {
+	// v0.3.1 has only a symmetric tolerance. Read the same last t value as
+	// its parser so the wider retry window does not admit future signatures.
+	var timestamp string
+	for pair := range strings.SplitSeq(signatureHeader, ",") {
+		key, value, ok := strings.Cut(pair, "=")
+		if ok && strings.TrimSpace(key) == "t" {
+			timestamp = strings.TrimSpace(value)
+		}
+	}
+	signedAt, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil || signedAt > time.Now().Add(time.Minute).UnixMilli() {
+		return nil, fmt.Errorf("Waffo Pancake webhook timestamp outside tolerance window")
+	}
+	common.OptionMapRWMutex.RLock()
+	storeID := strings.TrimSpace(setting.WaffoPancakeStoreID)
+	common.OptionMapRWMutex.RUnlock()
+	if storeID == "" || evt.StoreID != storeID {
 		return nil, fmt.Errorf("Waffo Pancake webhook store mismatch")
 	}
 	identity := ""
@@ -200,9 +312,12 @@ func VerifyConfiguredWaffoPancakeWebhook(payload string, signatureHeader string)
 	}, nil
 }
 
+// A lookup outage must ask the provider to retry; it is not an unknown order.
+var ErrWaffoPancakeOrderLookup = errors.New("waffo pancake order lookup failed")
+
 // ResolveWaffoPancakeTradeNo maps a verified webhook event to a local TopUp
 // trade_no via OrderMerchantExternalID, and rejects buyer-identity mismatches.
-func ResolveWaffoPancakeTradeNo(event *WaffoPancakeWebhookEvent) (string, error) {
+func ResolveWaffoPancakeTradeNo(ctx context.Context, event *WaffoPancakeWebhookEvent) (string, error) {
 	if event == nil {
 		return "", fmt.Errorf("missing webhook event")
 	}
@@ -210,7 +325,10 @@ func ResolveWaffoPancakeTradeNo(event *WaffoPancakeWebhookEvent) (string, error)
 	if tradeNo == "" {
 		return "", fmt.Errorf("missing webhook orderMerchantExternalId")
 	}
-	topUp := model.GetTopUpByTradeNo(tradeNo)
+	topUp, err := model.GetTopUpByTradeNoWithError(tradeNo)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", errors.Join(ErrWaffoPancakeOrderLookup, err)
+	}
 	if topUp == nil || topUp.PaymentProvider != model.PaymentProviderWaffoPancake {
 		return "", fmt.Errorf("waffo pancake order not found for tradeNo=%s", tradeNo)
 	}
@@ -223,6 +341,76 @@ func ResolveWaffoPancakeTradeNo(event *WaffoPancakeWebhookEvent) (string, error)
 			expectedIdentity,
 			actualIdentity,
 		)
+	}
+	// A committed success already has a verified payment fact. Its original
+	// retry must still reach wallet-cache recovery during a provider outage.
+	if topUp.Status == common.TopUpStatusSuccess {
+		return tradeNo, nil
+	}
+	if strings.TrimSpace(event.Data.OrderID) == "" {
+		return "", fmt.Errorf("%w: missing provider order id", ErrWaffoPancakeOrderLookup)
+	}
+	common.OptionMapRWMutex.RLock()
+	merchantID, privateKey := setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey
+	common.OptionMapRWMutex.RUnlock()
+	httpClient := *http.DefaultClient
+	transport := httpClient.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	httpClient.Transport = &waffoPancakeResponseTransport{transport: transport}
+	client, err := pancake.New(pancake.Config{MerchantID: merchantID, PrivateKey: privateKey, HTTPClient: &httpClient})
+	if err != nil {
+		return "", errors.Join(ErrWaffoPancakeOrderLookup, err)
+	}
+	// API-key requests are scoped to that merchant and key's environment.
+	// Query the signed provider order ID, never an external reference alone;
+	// a rotated key that cannot see the old order must leave it retryable.
+	// The installed SDK documents these fields in docs/graphql-guide.md.
+	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	response, err := client.GraphQL.Query(queryCtx, pancake.GraphQLParams{
+		Query: `query ($id: ID!) {
+			onetimeOrder(id: $id) {
+				id orderMerchantExternalId status testMode currency
+				store { id }
+			}
+		}`,
+		Variables: map[string]any{"id": event.Data.OrderID},
+	})
+	if err != nil {
+		return "", errors.Join(ErrWaffoPancakeOrderLookup, err)
+	}
+	if response == nil || len(response.Errors) != 0 {
+		return "", fmt.Errorf("%w: provider query did not succeed", ErrWaffoPancakeOrderLookup)
+	}
+	var result struct {
+		Order *struct {
+			ID                      string `json:"id"`
+			OrderMerchantExternalID string `json:"orderMerchantExternalId"`
+			Status                  string `json:"status"`
+			TestMode                *bool  `json:"testMode"`
+			Currency                string `json:"currency"`
+			Store                   struct {
+				ID string `json:"id"`
+			} `json:"store"`
+		} `json:"onetimeOrder"`
+	}
+	if err := common.Unmarshal(response.Data, &result); err != nil {
+		return "", errors.Join(ErrWaffoPancakeOrderLookup, err)
+	}
+	remote := result.Order
+	if remote == nil || remote.ID != event.Data.OrderID || remote.OrderMerchantExternalID != tradeNo || remote.Store.ID != event.StoreID {
+		return "", fmt.Errorf("%w: provider order binding mismatch", ErrWaffoPancakeOrderLookup)
+	}
+	if remote.TestMode == nil || *remote.TestMode != strings.EqualFold(strings.TrimSpace(event.Mode), "test") || remote.Status != string(pancake.OnetimeOrderStatusCompleted) {
+		return "", fmt.Errorf("%w: provider order environment or status mismatch", ErrWaffoPancakeOrderLookup)
+	}
+	// Checkout fixes USD and the price override on the server. Bind the paid
+	// provider order to that checkout; taxes or promotions can make the
+	// collected amount differ, so preserve the existing completion contract.
+	if !strings.EqualFold(remote.Currency, "USD") || !strings.EqualFold(event.Data.Currency, remote.Currency) {
+		return "", fmt.Errorf("%w: provider order currency mismatch", ErrWaffoPancakeOrderLookup)
 	}
 	return tradeNo, nil
 }
@@ -237,7 +425,10 @@ func ResolveWaffoPancakeSubscriptionTradeNo(event *WaffoPancakeWebhookEvent) (st
 	if tradeNo == "" {
 		return "", fmt.Errorf("missing webhook orderMerchantExternalId")
 	}
-	order := model.GetSubscriptionOrderByTradeNo(tradeNo)
+	order, err := model.GetSubscriptionOrderByTradeNoWithError(tradeNo)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", errors.Join(ErrWaffoPancakeOrderLookup, err)
+	}
 	if order == nil || order.PaymentProvider != model.PaymentProviderWaffoPancake {
 		return "", fmt.Errorf("waffo pancake subscription order not found for tradeNo=%s", tradeNo)
 	}

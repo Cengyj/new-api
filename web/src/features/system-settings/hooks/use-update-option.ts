@@ -21,6 +21,7 @@ import i18next from 'i18next'
 import { toast } from 'sonner'
 
 import { handleServerError } from '@/lib/handle-server-error'
+import { authenticationIdentity } from '@/lib/http-client'
 import { requireServerSuccess } from '@/lib/server-error-message'
 
 import { updatePasskeyDomains, updateSystemOption } from '../api'
@@ -55,9 +56,21 @@ export function useUpdateOption() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: async (request: UpdateOptionRequest) =>
-      requireServerSuccess(await updateSystemOption(request)),
+    mutationFn: async (
+      request: UpdateOptionRequest & { authIdentity?: string }
+    ) => {
+      const { authIdentity, ...option } = request
+      return requireServerSuccess(
+        await updateSystemOption(option, authIdentity)
+      )
+    },
     onSuccess: (data, variables) => {
+      if (
+        variables.authIdentity !== undefined &&
+        variables.authIdentity !== authenticationIdentity()
+      ) {
+        return
+      }
       if (data.success) {
         // Always refresh system-options
         queryClient.invalidateQueries({ queryKey: ['system-options'] })

@@ -159,7 +159,10 @@ func (fixture *telegramOAuthFixture) authorization(t *testing.T, intent string, 
 	if intent == "bind" {
 		proof = issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{Scope: service.VerificationScopeAccountBind, Context: []byte(`{"provider":"telegram"}`)}, service.VerificationMethodPassword)
 	}
-	response := securityEnrollmentRequest("POST", "/api/oauth/state", string(request), proof, identity, GenerateOAuthCode)
+	response := securityEnrollmentRequest("POST", "/api/oauth/state", string(request), proof, identity, func(c *gin.Context) {
+		c.Request.AddCookie(oauthTestLoginCookie())
+		GenerateOAuthCode(c)
+	})
 	var body securityEnrollmentResponse
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
 	require.True(t, body.Success, response.Body.String())
@@ -195,6 +198,7 @@ func telegramOAuthCallback(state, code string, identity service.AuthIdentity) *h
 	path := "/api/oauth/telegram?" + url.Values{"state": {state}, "code": {code}}.Encode()
 	return securityEnrollmentRequest("GET", path, "", "", identity, func(c *gin.Context) {
 		c.Params = gin.Params{{Key: "provider", Value: "telegram"}}
+		c.Request.AddCookie(oauthTestLoginCookie())
 		HandleOAuth(c)
 	})
 }

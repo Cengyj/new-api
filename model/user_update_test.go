@@ -1,14 +1,19 @@
 package model
 
 import (
+	"context"
 	"errors"
+	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -622,4 +627,419 @@ func TestValidateAuthSessionWithTxChecksAccessTokenIdentity(t *testing.T) {
 			assert.ErrorIs(t, plainErr, ErrUserSessionInactive)
 		})
 	}
+}
+
+func TestInvitationRegistrationRewardsAndSnapshotShareCreationTransaction(t *testing.T) {
+	setupUserUpdateTestState(t)
+	previousPayment := *operation_setting.GetPaymentSetting()
+	previousNew, previousInvitee, previousInviter := common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter
+	payment := operation_setting.GetPaymentSetting()
+	payment.ComplianceConfirmed = true
+	payment.ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+	common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter = 20, 30, 40
+	t.Cleanup(func() {
+		*payment = previousPayment
+		common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter = previousNew, previousInvitee, previousInviter
+	})
+	require.NoError(t, DB.AutoMigrate(&Option{}))
+	require.NoError(t, InitializeReferralRebateRule(DB))
+	require.NoError(t, SaveReferralRebateRule(ReferralRebateRule{Enabled: true, RateBPS: 1250, ValidDays: 3}))
+	inviter := User{Username: "registration-owner", AffCode: "registration-code", Status: common.UserStatusEnabled, AffQuota: 100, AffHistoryQuota: 200}
+	require.NoError(t, DB.Create(&inviter).Error)
+
+	rollback := errors.New("third-party identity association failed")
+	failed := User{Username: "registration-rollback", RegistrationAffCode: inviter.AffCode}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := failed.InsertWithTx(tx, 0); err != nil {
+			return err
+		}
+		return rollback
+	})
+	require.ErrorIs(t, err, rollback)
+	var count int64
+	require.NoError(t, DB.Model(&User{}).Where("username = ?", failed.Username).Count(&count).Error)
+	assert.Zero(t, count)
+	var owner User
+	require.NoError(t, DB.First(&owner, inviter.Id).Error)
+	assert.Equal(t, 100, owner.AffQuota)
+	assert.Equal(t, 200, owner.AffHistoryQuota)
+	assert.Zero(t, owner.AffCount)
+
+	created := User{Username: "registration-success", RegistrationAffCode: inviter.AffCode, CreatedAt: 1, ReferralRateBPS: 9999, ReferralExpiresAt: 2}
+	require.NoError(t, created.Insert(0))
+	assert.Equal(t, inviter.Id, created.InviterId)
+	assert.Equal(t, 50, created.Quota)
+	assert.Equal(t, 1250, created.ReferralRateBPS)
+	assert.InDelta(t, time.Now().Unix(), created.CreatedAt, 3)
+	assert.Equal(t, created.CreatedAt+3*86400, created.ReferralExpiresAt)
+	created.FinalizeOAuthUserCreation(inviter.Id)
+	created.FinishInsert(inviter.Id)
+	require.NoError(t, DB.First(&owner, inviter.Id).Error)
+	assert.Equal(t, 140, owner.AffQuota)
+	assert.Equal(t, 240, owner.AffHistoryQuota)
+	assert.Equal(t, 1, owner.AffCount)
+	var stored User
+	require.NoError(t, DB.First(&stored, created.Id).Error)
+	assert.Equal(t, 50, stored.Quota, "post-commit initialization cannot award again")
+
+	require.NoError(t, SaveReferralRebateRule(ReferralRebateRule{Enabled: false, RateBPS: 1250, ValidDays: 3}))
+	paused := User{Username: "registration-paused", RegistrationAffCode: inviter.AffCode}
+	require.NoError(t, paused.Insert(0))
+	assert.Equal(t, inviter.Id, paused.InviterId)
+	assert.Equal(t, 50, paused.Quota, "fixed registration gifts do not depend on the rebate switch")
+	assert.Zero(t, paused.ReferralRateBPS)
+	assert.Zero(t, paused.ReferralExpiresAt)
+	require.NoError(t, DB.First(&owner, inviter.Id).Error)
+	assert.Equal(t, 180, owner.AffQuota)
+	assert.Equal(t, 280, owner.AffHistoryQuota)
+
+	stored.InviterId, stored.CreatedAt, stored.ReferralRateBPS, stored.ReferralExpiresAt = 9999, 1, 10000, 9999999999
+	stored.DisplayName = "updated profile"
+	require.NoError(t, stored.Update(false))
+	assert.Equal(t, inviter.Id, stored.InviterId)
+	assert.Equal(t, created.CreatedAt, stored.CreatedAt)
+	assert.Equal(t, created.ReferralRateBPS, stored.ReferralRateBPS)
+	assert.Equal(t, created.ReferralExpiresAt, stored.ReferralExpiresAt)
+}
+
+func setupAffiliateTransferCompliance(t *testing.T) {
+	t.Helper()
+	previous := *operation_setting.GetPaymentSetting()
+	operation_setting.GetPaymentSetting().ComplianceConfirmed = true
+	operation_setting.GetPaymentSetting().ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+	t.Cleanup(func() { *operation_setting.GetPaymentSetting() = previous })
+}
+
+func TestAffiliateTransferConservesFundsAndPersistsRequestResult(t *testing.T) {
+	setupAffiliateTransferCompliance(t)
+	setupUserUpdateTestState(t)
+	require.NoError(t, DB.AutoMigrate(&AffiliateTransfer{}))
+	require.NoError(t, DB.Exec("DELETE FROM affiliate_transfers").Error)
+	previousUnit := common.QuotaPerUnit
+	common.QuotaPerUnit = 10
+	t.Cleanup(func() { common.QuotaPerUnit = previousUnit })
+	user := User{Username: "transfer-owner", AffCode: "transfer-code", Status: common.UserStatusEnabled, Quota: -5, AffQuota: 100, AffHistoryQuota: 200, DisplayName: "original"}
+	require.NoError(t, DB.Create(&user).Error)
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).Update("display_name", "concurrent profile edit").Error)
+	requestID := "transfer-request-0001"
+	result, err := user.TransferAffQuotaToQuota(25, requestID)
+	require.NoError(t, err)
+	require.NotZero(t, result.ID)
+	assert.Equal(t, 25, result.Quota)
+	repeated, err := user.TransferAffQuotaToQuota(25, requestID)
+	require.NoError(t, err)
+	assert.Equal(t, result.ID, repeated.ID)
+	_, err = user.TransferAffQuotaToQuota(30, requestID)
+	require.Error(t, err)
+	known, err := GetAffiliateTransfer(user.Id, requestID)
+	require.NoError(t, err)
+	assert.Equal(t, result, known)
+	other, err := GetAffiliateTransfer(user.Id+1, requestID)
+	require.NoError(t, err)
+	assert.Nil(t, other, "result lookups are scoped to the authenticated account")
+	var stored User
+	require.NoError(t, DB.First(&stored, user.Id).Error)
+	assert.Equal(t, 20, stored.Quota)
+	assert.Equal(t, 75, stored.AffQuota)
+	assert.Equal(t, 200, stored.AffHistoryQuota)
+	assert.Equal(t, "concurrent profile edit", stored.DisplayName)
+
+	failure := errors.New("transfer result cannot be saved")
+	require.NoError(t, DB.Callback().Create().Before("gorm:create").Register("invitation_transfer_failure", func(tx *gorm.DB) {
+		if tx.Statement.Table == "affiliate_transfers" {
+			tx.AddError(failure)
+		}
+	}))
+	_, err = user.TransferAffQuotaToQuota(25, "transfer-request-0002")
+	require.ErrorIs(t, err, failure)
+	require.NoError(t, DB.Callback().Create().Remove("invitation_transfer_failure"))
+	require.NoError(t, DB.First(&stored, user.Id).Error)
+	assert.Equal(t, 20, stored.Quota)
+	assert.Equal(t, 75, stored.AffQuota)
+	missing, err := GetAffiliateTransfer(user.Id, "transfer-request-0002")
+	require.NoError(t, err)
+	assert.Nil(t, missing)
+
+	require.NoError(t, DB.Model(&User{}).Where("id = ?", user.Id).Update("quota", common.MaxWalletQuota-5).Error)
+	_, err = user.TransferAffQuotaToQuota(10, "transfer-request-0003")
+	require.Error(t, err)
+	require.NoError(t, DB.First(&stored, user.Id).Error)
+	assert.Equal(t, common.MaxWalletQuota-5, stored.Quota)
+	assert.Equal(t, 75, stored.AffQuota)
+	_, err = user.TransferAffQuotaToQuota(100, "transfer-request-0004")
+	require.Error(t, err)
+	_, err = user.TransferAffQuotaToQuota(-10, "transfer-request-0005")
+	require.Error(t, err)
+	_, err = user.TransferAffQuotaToQuota(1, "transfer-request-0006")
+	require.Error(t, err)
+}
+
+func TestAffiliateTransferCacheRecoveryUsesStoredIdentityAcrossDatabases(t *testing.T) {
+	setupAffiliateTransferCompliance(t)
+	if os.Getenv("NEW_API_REFERRAL_REDIS_ADDR") == "" {
+		t.Skip("isolated Redis is not configured")
+	}
+	for _, testCase := range []string{"sqlite/lookup", "sqlite/retry", "sqlite/unknown", "mysql/lookup", "mysql/retry", "mysql/unknown", "postgres/lookup", "postgres/retry", "postgres/unknown"} {
+		t.Run(testCase, func(t *testing.T) {
+			dialect, recovery, _ := strings.Cut(testCase, "/")
+			db, _ := newReferralIntegrationDatabase(t, dialect)
+			previousDB, previousClient, previousEnabled, previousUnit := DB, common.RDB, common.RedisEnabled, common.QuotaPerUnit
+			previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+			client := redis.NewClient(&redis.Options{Addr: os.Getenv("NEW_API_REFERRAL_REDIS_ADDR"), DB: 14, MaxRetries: -1})
+			require.NoError(t, client.Ping(t.Context()).Err())
+			DB, common.RDB, common.RedisEnabled, common.QuotaPerUnit = db, client, true, 1
+			kind := map[string]common.DatabaseType{"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL}[dialect]
+			common.SetDatabaseTypes(kind, kind)
+			user := User{Id: 100000000 + int(time.Now().UnixNano()%1000000000), Username: "round4-alias", AffCode: "round4-alias", Status: common.UserStatusEnabled, AffQuota: 100, AffHistoryQuota: 200}
+			require.NoError(t, db.AutoMigrate(&User{}, &AffiliateTransfer{}))
+			require.NoError(t, db.Create(&user).Error)
+			keys := []string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id), getWalletCacheFillKey(user.Id)}
+			t.Cleanup(func() {
+				DB, common.RDB, common.RedisEnabled, common.QuotaPerUnit = previousDB, previousClient, previousEnabled, previousUnit
+				common.SetDatabaseTypes(previousMain, previousLog)
+				assert.NoError(t, client.Del(context.Background(), keys...).Err())
+				assert.NoError(t, client.Close())
+			})
+			require.NoError(t, populateUserCache(user))
+			unavailable := redis.NewClient(&redis.Options{Addr: os.Getenv("NEW_API_REFERRAL_REDIS_ADDR"), DB: 14, MaxRetries: -1})
+			require.NoError(t, unavailable.Close())
+			connection, err := db.DB()
+			require.NoError(t, err)
+			lookupBlocked := false
+			lookupFailure := errors.New("isolated transfer result read unavailable")
+			commitFailure := errors.New("isolated acknowledgment lost after actual commit")
+			require.NoError(t, db.Callback().Query().Before("gorm:query").Register("stored_transfer_recovery_read", func(tx *gorm.DB) {
+				if lookupBlocked && tx.Statement.Table == "affiliate_transfers" {
+					tx.AddError(lookupFailure)
+				}
+			}))
+			t.Cleanup(func() { assert.NoError(t, db.Callback().Query().Remove("stored_transfer_recovery_read")) })
+			DB = db.Session(&gorm.Session{Context: t.Context()})
+			DB.Statement.ConnPool = creditCommitPool{ConnPool: connection, afterCommit: func() error {
+				common.RDB = unavailable
+				if recovery == "unknown" {
+					lookupBlocked = true
+					return commitFailure
+				}
+				return nil
+			}}
+			const canonical = "Round4-Transfer-Identity"
+			_, err = user.TransferAffQuotaToQuota(25, canonical)
+			if recovery == "unknown" {
+				require.ErrorIs(t, err, commitFailure)
+				var rejected *AffiliateTransferRejectedError
+				assert.False(t, errors.As(err, &rejected), "lost commit and failed lookup cannot become a definite rejection")
+				unresolved, lookupErr := GetAffiliateTransfer(user.Id, canonical)
+				assert.Nil(t, unresolved)
+				assert.ErrorIs(t, lookupErr, lookupFailure, "unreadable result is not a successful not-found answer")
+			} else {
+				require.Error(t, err, "a committed transfer with unfinished cache credit remains retryable by its original identity")
+				var rejected *AffiliateTransferRejectedError
+				assert.False(t, errors.As(err, &rejected), "cache completion failure is not a definite financial rejection")
+			}
+			lookupBlocked = false
+			DB, common.RDB = db, client
+			cached, err := client.HGet(t.Context(), keys[0], "Quota").Int()
+			require.NoError(t, err)
+			require.Zero(t, cached, "real SQL commit must precede interrupted cache finalization")
+			lookupID := canonical
+			if dialect == "mysql" {
+				lookupID = strings.ToLower(canonical)
+			} else {
+				missing, lookupErr := GetAffiliateTransfer(user.Id, strings.ToLower(canonical))
+				require.NoError(t, lookupErr)
+				assert.Nil(t, missing, "case-sensitive database identity remains unchanged")
+			}
+			var result *AffiliateTransfer
+			if recovery == "lookup" || recovery == "unknown" {
+				result, err = GetAffiliateTransfer(user.Id, lookupID)
+			} else {
+				result, err = user.TransferAffQuotaToQuota(25, lookupID)
+			}
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, canonical, result.RequestID)
+			cached, err = client.HGet(t.Context(), keys[0], "Quota").Int()
+			require.NoError(t, err)
+			assert.Equal(t, 25, cached, "SQL identity aliases must finish the persisted identity's cache operation")
+			repeated, err := user.TransferAffQuotaToQuota(25, canonical)
+			require.NoError(t, err)
+			assert.Equal(t, result.ID, repeated.ID)
+			cached, err = client.HGet(t.Context(), keys[0], "Quota").Int()
+			require.NoError(t, err)
+			assert.Equal(t, 25, cached, "a later exact-identity retry cannot credit twice")
+			_, mismatchErr := user.TransferAffQuotaToQuota(30, lookupID)
+			require.Error(t, mismatchErr)
+			var rejected *AffiliateTransferRejectedError
+			assert.False(t, errors.As(mismatchErr, &rejected), "an existing different amount remains unresolved, not a fresh definite rejection")
+			var count int64
+			require.NoError(t, db.Model(&AffiliateTransfer{}).Where("user_id = ?", user.Id).Count(&count).Error)
+			assert.EqualValues(t, 1, count)
+			var persisted User
+			require.NoError(t, db.First(&persisted, user.Id).Error)
+			assert.Equal(t, 25, persisted.Quota)
+			assert.Equal(t, 75, persisted.AffQuota)
+			assert.Equal(t, 200, persisted.AffHistoryQuota)
+		})
+	}
+}
+
+func TestAffiliateTransferExistingIdentityPrecedesInvalidAmountAcrossDatabases(t *testing.T) {
+	setupAffiliateTransferCompliance(t)
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			db, _ := newReferralIntegrationDatabase(t, dialect)
+			previousDB, previousUnit, previousRedis := DB, common.QuotaPerUnit, common.RedisEnabled
+			previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+			DB, common.QuotaPerUnit, common.RedisEnabled = db, 1, false
+			kind := map[string]common.DatabaseType{"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL}[dialect]
+			common.SetDatabaseTypes(kind, kind)
+			t.Cleanup(func() {
+				DB, common.QuotaPerUnit, common.RedisEnabled = previousDB, previousUnit, previousRedis
+				common.SetDatabaseTypes(previousMain, previousLog)
+			})
+			require.NoError(t, db.AutoMigrate(&User{}, &AffiliateTransfer{}))
+			owner := User{Username: "invalid-retry-owner", AffCode: "invalid-retry-owner", Status: common.UserStatusEnabled, AffQuota: 100, AffHistoryQuota: 200}
+			other := User{Username: "invalid-retry-other", AffCode: "invalid-retry-other", Status: common.UserStatusEnabled, AffQuota: 100, AffHistoryQuota: 200}
+			require.NoError(t, db.Create(&owner).Error)
+			require.NoError(t, db.Create(&other).Error)
+			const requestID = "Existing-Transfer-Invalid-Retry"
+			original, err := owner.TransferAffQuotaToQuota(25, requestID)
+			require.NoError(t, err)
+			lookupID := requestID
+			if dialect == "mysql" {
+				lookupID = strings.ToLower(requestID)
+			}
+			for index, amount := range []int{-1, 0, common.MaxWalletQuota + 1} {
+				result, err := owner.TransferAffQuotaToQuota(amount, lookupID)
+				require.Error(t, err)
+				assert.Nil(t, result)
+				var rejected *AffiliateTransferRejectedError
+				assert.False(t, errors.As(err, &rejected), "invalid retry amounts cannot erase a committed request identity")
+				known, err := GetAffiliateTransfer(owner.Id, lookupID)
+				require.NoError(t, err)
+				require.NotNil(t, known)
+				assert.Equal(t, original.ID, known.ID)
+				assert.Equal(t, 25, known.Quota)
+				newID := "new-rejected-transfer-" + strconv.Itoa(index)
+				_, err = owner.TransferAffQuotaToQuota(amount, newID)
+				require.Error(t, err)
+				assert.True(t, errors.As(err, &rejected), "a new invalid amount is still a definite rejection")
+				knownRejection, err := GetAffiliateTransfer(owner.Id, newID)
+				require.ErrorAs(t, err, &rejected)
+				assert.True(t, rejected.Persisted)
+				require.NotNil(t, knownRejection)
+				assert.Equal(t, amount, knownRejection.Quota)
+			}
+			otherResult, err := other.TransferAffQuotaToQuota(30, requestID)
+			require.NoError(t, err)
+			assert.NotEqual(t, original.ID, otherResult.ID, "the same request identity belongs independently to each account")
+			known, err := GetAffiliateTransfer(owner.Id, lookupID)
+			require.NoError(t, err)
+			require.NotNil(t, known)
+			assert.Equal(t, original.ID, known.ID)
+			assert.Equal(t, 25, known.Quota)
+			var current User
+			require.NoError(t, db.First(&current, owner.Id).Error)
+			assert.Equal(t, 25, current.Quota)
+			assert.Equal(t, 75, current.AffQuota)
+			assert.Equal(t, 200, current.AffHistoryQuota)
+			var count int64
+			require.NoError(t, db.Model(&AffiliateTransfer{}).Count(&count).Error)
+			assert.EqualValues(t, 5, count)
+
+			operation_setting.GetPaymentSetting().ComplianceConfirmed = false
+			_, err = owner.TransferAffQuotaToQuota(10, "compliance-rejected-transfer")
+			require.Error(t, err)
+			var complianceRejection *AffiliateTransferRejectedError
+			assert.True(t, errors.As(err, &complianceRejection))
+			knownRejection, err := GetAffiliateTransfer(owner.Id, "compliance-rejected-transfer")
+			require.ErrorAs(t, err, &complianceRejection)
+			assert.True(t, complianceRejection.Persisted)
+			require.NotNil(t, knownRejection)
+			replayed, err := owner.TransferAffQuotaToQuota(25, lookupID)
+			require.NoError(t, err, "a pause does not hide an already committed result")
+			assert.Equal(t, original.ID, replayed.ID)
+			_, err = owner.TransferAffQuotaToQuota(30, lookupID)
+			require.Error(t, err)
+			assert.False(t, errors.As(err, &complianceRejection), "a mismatched committed identity is not a new rejected operation")
+			operation_setting.GetPaymentSetting().ComplianceConfirmed = true
+			require.NoError(t, db.Model(&owner).Update("quota", common.MaxWalletQuota-5).Error)
+			_, err = owner.TransferAffQuotaToQuota(10, "wallet-capacity-rejected-transfer")
+			require.ErrorIs(t, err, ErrWalletQuotaLimitExceeded)
+			var capacityRejection *AffiliateTransferRejectedError
+			assert.True(t, errors.As(err, &capacityRejection), "a fresh request rejected before any write is a definite business rejection")
+			knownRejection, err = GetAffiliateTransfer(owner.Id, "wallet-capacity-rejected-transfer")
+			require.ErrorIs(t, err, ErrWalletQuotaLimitExceeded)
+			require.ErrorAs(t, err, &capacityRejection)
+			assert.True(t, capacityRejection.Persisted)
+			require.NotNil(t, knownRejection)
+			require.NoError(t, db.First(&current, owner.Id).Error)
+			assert.Equal(t, common.MaxWalletQuota-5, current.Quota)
+			assert.Equal(t, 75, current.AffQuota)
+			assert.Equal(t, 200, current.AffHistoryQuota)
+			replayed, err = owner.TransferAffQuotaToQuota(25, lookupID)
+			require.NoError(t, err, "an existing committed identity still wins over the current capacity check")
+			assert.Equal(t, original.ID, replayed.ID)
+			require.NoError(t, db.Model(&AffiliateTransfer{}).Count(&count).Error)
+			assert.EqualValues(t, 7, count)
+
+			for _, field := range []string{"quota", "aff_quota"} {
+				require.NoError(t, db.Model(&owner).Update(field, common.MaxWalletQuota+1).Error)
+				_, err = owner.TransferAffQuotaToQuota(10, "corrupt-balance-"+field)
+				require.ErrorIs(t, err, ErrWalletQuotaLimitExceeded)
+				var rejected *AffiliateTransferRejectedError
+				assert.False(t, errors.As(err, &rejected), "damaged stored balances remain an accounting error")
+				missing, err := GetAffiliateTransfer(owner.Id, "corrupt-balance-"+field)
+				require.NoError(t, err)
+				assert.Nil(t, missing)
+				require.NoError(t, db.Model(&owner).Updates(map[string]any{"quota": common.MaxWalletQuota - 5, "aff_quota": 75}).Error)
+			}
+
+			lookupFailure := errors.New("stored transfer identity lookup failed")
+			require.NoError(t, db.Callback().Query().Before("gorm:query").Register("invalid_retry_lookup_failure", func(tx *gorm.DB) {
+				if tx.Statement.Table == "affiliate_transfers" {
+					tx.AddError(lookupFailure)
+				}
+			}))
+			_, err = owner.TransferAffQuotaToQuota(-1, requestID)
+			require.NoError(t, db.Callback().Query().Remove("invalid_retry_lookup_failure"))
+			require.ErrorIs(t, err, lookupFailure)
+			var rejected *AffiliateTransferRejectedError
+			assert.False(t, errors.As(err, &rejected), "an unreadable original result cannot become a definite rejection")
+
+			for index, amount := range []int{0, common.MaxWalletQuota + 1} {
+				corrupt := AffiliateTransfer{UserID: owner.Id, RequestID: "corrupt-stored-transfer-" + strconv.Itoa(index), Quota: amount, CreatedAt: time.Now().Unix()}
+				require.NoError(t, db.Create(&corrupt).Error)
+				result, err := owner.TransferAffQuotaToQuota(amount, corrupt.RequestID)
+				require.ErrorIs(t, err, ErrWalletQuotaLimitExceeded)
+				assert.Nil(t, result)
+				assert.False(t, errors.As(err, &rejected), "damaged durable amounts cannot be accepted as successful retries")
+			}
+		})
+	}
+}
+
+func TestAffiliateTransferRejectedIdentityCannotBecomeMoney(t *testing.T) {
+	setupAffiliateTransferCompliance(t)
+	setupUserUpdateTestState(t)
+	require.NoError(t, DB.AutoMigrate(&AffiliateTransfer{}))
+	require.NoError(t, DB.Exec("DELETE FROM affiliate_transfers").Error)
+	oldUnit := common.QuotaPerUnit
+	common.QuotaPerUnit = 10
+	t.Cleanup(func() { common.QuotaPerUnit = oldUnit })
+	user := User{Username: "rejected-identity", AffCode: "rejected-identity", Status: common.UserStatusEnabled, Quota: 7, AffQuota: 5, AffHistoryQuota: 5}
+	require.NoError(t, DB.Create(&user).Error)
+	const requestID = "rejected-identity-replay"
+	_, err := user.TransferAffQuotaToQuota(25, requestID)
+	var rejected *AffiliateTransferRejectedError
+	require.ErrorAs(t, err, &rejected)
+	require.NoError(t, DB.Model(&user).Updates(map[string]any{"aff_quota": 105, "aff_history": 105}).Error)
+	_, err = user.TransferAffQuotaToQuota(25, requestID)
+	assert.ErrorAs(t, err, &rejected, "a delayed same-ID request must preserve the response that allowed the first page to release it")
+	var current User
+	require.NoError(t, DB.First(&current, user.Id).Error)
+	assert.Equal(t, 7, current.Quota)
+	assert.Equal(t, 105, current.AffQuota)
+	assert.Equal(t, 105, current.AffHistoryQuota)
 }

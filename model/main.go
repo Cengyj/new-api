@@ -354,6 +354,8 @@ func migrateDB() error {
 		&Log{},
 		&Midjourney{},
 		&TopUp{},
+		&ReferralRebate{},
+		&AffiliateTransfer{},
 		&QuotaData{},
 		&Task{},
 		&TaskPlugin{},
@@ -381,6 +383,9 @@ func migrateDB() error {
 		return err
 	}
 	if err := InitializeUserAuthVersions(); err != nil {
+		return err
+	}
+	if err := InitializeReferralRebateRule(DB); err != nil {
 		return err
 	}
 	if err := EnsureLegacyAccessTokenRetireAt(common.GetTimestamp()); err != nil {

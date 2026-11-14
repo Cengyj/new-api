@@ -83,7 +83,7 @@ func TestGetWaffoPancakePayMoney(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			operation_setting.GetGeneralSetting().QuotaDisplayType = tc.quotaDisplayType
-			actual := getWaffoPancakePayMoney(tc.amount, tc.group)
+			actual := getWaffoPancakePayMoney(tc.amount, tc.group, tc.quotaDisplayType, common.QuotaPerUnit)
 			require.InDelta(t, tc.expected, actual, 0.000001)
 		})
 	}

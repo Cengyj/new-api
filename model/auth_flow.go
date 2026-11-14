@@ -2,6 +2,7 @@ package model
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -242,7 +243,7 @@ func ConsumeAuthFlow(token string, match AuthFlowMatch) (*AuthFlow, error) {
 
 // ConsumeAuthFlowWithAction consumes a flow and runs action in the same
 // database transaction. An action failure rolls the consumption back.
-func ConsumeAuthFlowWithAction(token string, match AuthFlowMatch, action func(tx *gorm.DB, flow *AuthFlow) error) (*AuthFlow, error) {
+func ConsumeAuthFlowWithAction(token string, match AuthFlowMatch, action func(tx *gorm.DB, flow *AuthFlow) error, options ...*sql.TxOptions) (*AuthFlow, error) {
 	if token == "" || match.Purpose == "" {
 		return nil, ErrAuthFlowInvalid
 	}
@@ -279,7 +280,7 @@ func ConsumeAuthFlowWithAction(token string, match AuthFlowMatch, action func(tx
 			}
 		}
 		return nil
-	})
+	}, options...)
 	if err != nil {
 		return nil, err
 	}

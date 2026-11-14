@@ -251,14 +251,20 @@ func (o *SubscriptionOrder) Update() error {
 }
 
 func GetSubscriptionOrderByTradeNo(tradeNo string) *SubscriptionOrder {
+	order, _ := GetSubscriptionOrderByTradeNoWithError(tradeNo)
+	return order
+}
+
+// Payment callbacks must distinguish an absent order from an unavailable lookup.
+func GetSubscriptionOrderByTradeNoWithError(tradeNo string) (*SubscriptionOrder, error) {
 	if tradeNo == "" {
-		return nil
+		return nil, gorm.ErrRecordNotFound
 	}
 	var order SubscriptionOrder
 	if err := DB.Where("trade_no = ?", tradeNo).First(&order).Error; err != nil {
-		return nil
+		return nil, err
 	}
-	return &order
+	return &order, nil
 }
 
 // User subscription instance
@@ -594,7 +600,10 @@ func CompleteSubscriptionOrder(tradeNo string, providerPayload string, expectedP
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		var order SubscriptionOrder
 		if err := lockForUpdate(tx).Where(refCol+" = ?", tradeNo).First(&order).Error; err != nil {
-			return ErrSubscriptionOrderNotFound
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrSubscriptionOrderNotFound
+			}
+			return err
 		}
 		if expectedPaymentProvider != "" && order.PaymentProvider != expectedPaymentProvider {
 			return ErrPaymentMethodMismatch
@@ -708,7 +717,10 @@ func ExpireSubscriptionOrder(tradeNo string, expectedPaymentProvider string) err
 	return DB.Transaction(func(tx *gorm.DB) error {
 		var order SubscriptionOrder
 		if err := lockForUpdate(tx).Where(refCol+" = ?", tradeNo).First(&order).Error; err != nil {
-			return ErrSubscriptionOrderNotFound
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrSubscriptionOrderNotFound
+			}
+			return err
 		}
 		if expectedPaymentProvider != "" && order.PaymentProvider != expectedPaymentProvider {
 			return ErrPaymentMethodMismatch

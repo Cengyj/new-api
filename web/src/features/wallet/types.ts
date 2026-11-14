@@ -106,6 +106,8 @@ export interface PaymentMethod {
  * Waffo payment method configuration
  */
 export interface WaffoPayMethod {
+  /** Original server-list index, retained when entries cannot be displayed. */
+  sourceIndex?: number
   /** Display name of payment method */
   name: string
   /** Optional icon path */
@@ -194,6 +196,9 @@ export interface WaffoPaymentRequest {
   amount: number
   /** Optional server-side Waffo payment method index */
   pay_method_index?: number
+  /** Selected method identity; both fields are sent, including explicit empty values. */
+  pay_method_type?: string
+  pay_method_name?: string
 }
 
 /**
@@ -216,6 +221,8 @@ export interface AmountRequest {
  * Affiliate quota transfer request
  */
 export interface AffiliateTransferRequest {
+  /** Stable identifier reused for result lookup and retry */
+  request_id: string
   /** Quota amount to transfer */
   quota: number
 }
@@ -247,7 +254,7 @@ export interface UserWalletData {
 /**
  * Topup record status
  */
-export type TopupStatus = 'success' | 'pending' | 'expired'
+export type TopupStatus = 'success' | 'pending' | 'expired' | 'failed'
 
 /**
  * Topup billing record
@@ -257,14 +264,18 @@ export interface TopupRecord {
   id: number
   /** User ID */
   user_id: number
-  /** Topup amount (quota) */
+  /** Legacy topup amount; units depend on the payment provider. */
   amount: number
+  /** Frozen wallet quota; absent or null for legacy orders. */
+  credited_quota?: number | null
   /** Payment amount (actual money paid) */
   money: number
   /** Trade/order number */
   trade_no: string
   /** Payment method type */
   payment_method: string
+  /** Payment provider determines the stored amount's unit semantics. */
+  payment_provider?: string
   /** Creation timestamp */
   create_time: number
   /** Completion timestamp */

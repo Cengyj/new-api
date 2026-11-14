@@ -53,6 +53,13 @@ export default defineConfig(({ envMode }) => {
       },
     },
     source: {
+      // Publish only the non-secret release identifier used by build metadata.
+      // loadEnv alone does not expose VITE-prefixed values in Rsbuild.
+      define: {
+        'import.meta.env.VITE_REACT_APP_VERSION': JSON.stringify(
+          env.rawPublicVars.VITE_REACT_APP_VERSION || ''
+        ),
+      },
       entry: {
         index: './src/main.tsx',
       },

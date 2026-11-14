@@ -37,13 +37,17 @@ import {
 import { formatNumber } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
+import { DEFAULT_MIN_TOPUP } from '../constants'
 import {
   formatCurrency,
   getDiscountLabel,
   getPaymentIcon,
   getMinTopupAmount,
+  getDefaultPaymentType,
+  getPaymentMethodMinTopup,
   calculatePresetPricing,
 } from '../lib'
+import { isStripePayment, isValidTopupAmount } from '../lib/payment'
 import type {
   PaymentMethod,
   PresetAmount,
@@ -61,6 +65,7 @@ interface RechargeFormCardProps {
   topupAmount: number
   onTopupAmountChange: (amount: number) => void
   paymentAmount: number
+  paymentType?: string
   calculating: boolean
   onPaymentMethodSelect: (method: PaymentMethod) => void
   paymentLoading: string | null
@@ -91,6 +96,7 @@ export function RechargeFormCard({
   topupAmount,
   onTopupAmountChange,
   paymentAmount,
+  paymentType,
   calculating,
   onPaymentMethodSelect,
   paymentLoading,
@@ -113,6 +119,9 @@ export function RechargeFormCard({
   enableWaffoPancakeTopup,
 }: RechargeFormCardProps) {
   const { t } = useTranslation()
+  const stripe = isStripePayment(
+    paymentType ?? getDefaultPaymentType(topupInfo)
+  )
   const [localAmount, setLocalAmount] = useState(topupAmount.toString())
 
   useEffect(() => {
@@ -124,11 +133,11 @@ export function RechargeFormCard({
 
   const handleAmountChange = (value: string) => {
     setLocalAmount(value)
-    const numValue = Number.parseInt(value) || 0
-    if (numValue >= 0) {
-      onTopupAmountChange(numValue)
-    }
+    const numValue = Number(value)
+    onTopupAmountChange(isValidTopupAmount(numValue) ? numValue : 0)
   }
+  const validAmount =
+    isValidTopupAmount(Number(localAmount)) && isValidTopupAmount(topupAmount)
 
   const hasConfigurableTopup =
     topupInfo?.enable_online_topup ||
@@ -140,7 +149,15 @@ export function RechargeFormCard({
     Array.isArray(topupInfo?.pay_methods) && topupInfo.pay_methods.length > 0
   const hasWaffoPaymentMethods =
     Array.isArray(waffoPayMethods) && waffoPayMethods.length > 0
-  const minTopup = getMinTopupAmount(topupInfo)
+  const availableMinimums = (topupInfo?.pay_methods ?? []).map((method) =>
+    getPaymentMethodMinTopup(topupInfo, method)
+  )
+  if (enableWaffoTopup && hasWaffoPaymentMethods && onWaffoMethodSelect) {
+    availableMinimums.push(waffoMinTopup || DEFAULT_MIN_TOPUP)
+  }
+  const minTopup = availableMinimums.length
+    ? Math.min(...availableMinimums)
+    : getMinTopupAmount(topupInfo)
   const redemptionEnabled = topupInfo?.enable_redemption !== false
 
   if (loading) {
@@ -224,7 +241,7 @@ export function RechargeFormCard({
               {presetAmounts.length > 0 && (
                 <div className='space-y-2.5 sm:space-y-3'>
                   <Label className='text-muted-foreground text-xs font-medium tracking-wider uppercase'>
-                    {t('Amount')}
+                    {stripe ? t('Quantity') : t('Amount')}
                   </Label>
                   <div className='grid grid-cols-2 gap-1.5 sm:gap-3 md:grid-cols-4'>
                     {presetAmounts.map((preset) => {
@@ -257,33 +274,39 @@ export function RechargeFormCard({
                         >
                           <div className='flex w-full items-center justify-between'>
                             <div className='text-base font-semibold sm:text-lg'>
-                              {formatNumber(displayValue)}
+                              {formatNumber(
+                                stripe ? preset.value : displayValue
+                              )}
                             </div>
-                            {hasDiscount && (
+                            {!stripe && hasDiscount && (
                               <div className='text-xs font-medium text-green-600'>
                                 {getDiscountLabel(discount, t)}
                               </div>
                             )}
                           </div>
-                          <div className='text-muted-foreground mt-1.5 w-full text-xs sm:mt-2'>
-                            {hasDiscount && savedAmount > 0 ? (
-                              <Trans
-                                t={t}
-                                i18nKey='Pay {{amount}} <savings>• Save {{saved}}</savings>'
-                                values={{
+                          {!stripe && (
+                            <div className='text-muted-foreground mt-1.5 w-full text-xs sm:mt-2'>
+                              {hasDiscount && savedAmount > 0 ? (
+                                <Trans
+                                  t={t}
+                                  i18nKey='Pay {{amount}} <savings>• Save {{saved}}</savings>'
+                                  values={{
+                                    amount: formatCurrency(actualPrice),
+                                    saved: formatCurrency(savedAmount),
+                                  }}
+                                  components={{
+                                    savings: (
+                                      <span className='text-green-600' />
+                                    ),
+                                  }}
+                                />
+                              ) : (
+                                t('Pay {{amount}}', {
                                   amount: formatCurrency(actualPrice),
-                                  saved: formatCurrency(savedAmount),
-                                }}
-                                components={{
-                                  savings: <span className='text-green-600' />,
-                                }}
-                              />
-                            ) : (
-                              t('Pay {{amount}}', {
-                                amount: formatCurrency(actualPrice),
-                              })
-                            )}
-                          </div>
+                                })
+                              )}
+                            </div>
+                          )}
                         </Button>
                       )
                     })}
@@ -296,7 +319,7 @@ export function RechargeFormCard({
                   htmlFor='topup-amount'
                   className='text-muted-foreground text-xs font-medium tracking-wider uppercase'
                 >
-                  {t('Custom Amount')}
+                  {stripe ? t('Quantity') : t('Custom Amount')}
                 </Label>
                 <div className='grid grid-cols-[minmax(0,1fr)_minmax(110px,0.55fr)] gap-2 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center'>
                   <Input
@@ -310,7 +333,7 @@ export function RechargeFormCard({
                   />
                   <div className='bg-muted/30 flex min-h-9 items-center justify-between gap-2 rounded-md border px-3 lg:min-w-52'>
                     <span className='text-muted-foreground truncate text-xs'>
-                      {t('Amount to pay:')}
+                      {stripe ? t('Estimated payment') : t('Amount to pay:')}
                     </span>
                     {calculating ? (
                       <Skeleton className='h-5 w-16' />
@@ -330,9 +353,9 @@ export function RechargeFormCard({
                 {hasStandardPaymentMethods ? (
                   <div className='grid grid-cols-2 gap-1.5 sm:gap-3 lg:grid-cols-3'>
                     {topupInfo?.pay_methods?.map((method) => {
-                      const minTopup = Math.max(
-                        method.min_topup || 0,
-                        getMinTopupAmount(topupInfo)
+                      const minTopup = getPaymentMethodMinTopup(
+                        topupInfo,
+                        method
                       )
                       const disabled = minTopup > topupAmount
                       const disabledReason = disabled
@@ -349,7 +372,9 @@ export function RechargeFormCard({
                           key={method.type}
                           variant='outline'
                           onClick={() => onPaymentMethodSelect(method)}
-                          disabled={disabled || !!paymentLoading}
+                          disabled={
+                            !validAmount || disabled || !!paymentLoading
+                          }
                           title={disabledReason}
                           aria-label={
                             disabledReason
@@ -414,7 +439,8 @@ export function RechargeFormCard({
                     </Label>
                     <div className='grid grid-cols-2 gap-1.5 sm:gap-3 lg:grid-cols-3'>
                       {waffoPayMethods?.map((method, index) => {
-                        const loadingKey = `waffo-${index}`
+                        const sourceIndex = method.sourceIndex ?? index
+                        const loadingKey = `waffo-${sourceIndex}`
                         const methodKey = `${method.payMethodType ?? 'unknown'}-${method.payMethodName ?? method.name}`
                         const waffoMin = waffoMinTopup || 0
                         const belowMin = waffoMin > topupAmount
@@ -446,8 +472,12 @@ export function RechargeFormCard({
                           <Button
                             key={methodKey}
                             variant='outline'
-                            onClick={() => onWaffoMethodSelect(method, index)}
-                            disabled={belowMin || !!paymentLoading}
+                            onClick={() =>
+                              onWaffoMethodSelect(method, sourceIndex)
+                            }
+                            disabled={
+                              !validAmount || belowMin || !!paymentLoading
+                            }
                             title={disabledReason}
                             aria-label={
                               disabledReason

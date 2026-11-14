@@ -56,6 +56,15 @@
 
 ---
 
+> [!IMPORTANT]
+> This fork includes invitation recharge rebates and has merged upstream new-api `v1.0.0-rc.49` (`48a6c87f9e7757fdc58e5be9bcb4f8281ad0dfd0`). This records source integration; this change does not publish or deploy a new image. After an authorized publishing run passes image verification, the existing GHCR workflow publishes custom images to `ghcr.io/cengyj/new-api` with version-aligned tags `v1.0.0-rc.49`, `v1.0.0-rc.49-amd64`, `latest`, and `latest-amd64`. These tags target `linux/amd64`. The old `referral-rebate-rc45-amd64` tag is retained as a compatibility alias, not an upstream version indicator.
+>
+> The upstream Docker examples below use `calciumion/new-api` and do not install this customization. The sample Compose file accepts `NEW_API_IMAGE=ghcr.io/cengyj/new-api:v1.0.0-rc.49`; use this tag only after its publishing workflow completes successfully. Production deployments should use the verified digest recorded by the GHCR workflow. Preserve your existing production Compose settings when changing the image.
+>
+> `VERSION` records the merged upstream release. The GHCR workflow adds a `referral` suffix, source commit, and architecture to the application version so the customization remains identifiable. Release/latest aliases are published only after image verification, from the current head of the publishing branch. Updating these files affects future builds only; already published image digests retain their original version.
+
+> Upgrade all nodes sharing Redis together. They must retain the same effective `CRYPTO_SECRET` (which inherits `SESSION_SECRET` when unset); preserve these secrets on rollback too. Old and new versions do not reliably synchronize cache invalidations, so a mixed-version rolling upgrade is not verified. Back up SQLite with its online backup API, or stop writes and checkpoint before a consistent copy; copying a live database and its WAL files one by one is not an atomic backup. A rollback must preserve and reconcile payments, rebates, and transfers confirmed after the upgrade; switching source or image versions alone does not restore database or cache state.
+
 ## 📝 Project Description
 
 New API is a self-hosted AI gateway for applications, agents, and teams. Connect upstream model services, expose a consistent API to your clients, and manage routing, access, usage, and costs in one place.

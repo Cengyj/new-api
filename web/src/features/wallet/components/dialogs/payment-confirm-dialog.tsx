@@ -19,21 +19,15 @@ For commercial licensing, please contact support@quantumnous.com
 import { Loader2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
-import { formatLocalCurrencyAmount } from '@/lib/currency'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatLocalCurrencyAmount, getCurrencyDisplay } from '@/lib/currency'
+import { formatNumber } from '@/lib/format'
 
 import { DEFAULT_DISCOUNT_RATE } from '../../constants'
 import { formatCurrency, getPaymentIcon } from '../../lib'
+import { isStripePayment, isValidTopupAmount } from '../../lib/payment'
 import type { PaymentMethod } from '../../types'
 
 interface PaymentConfirmDialogProps {
@@ -61,96 +55,112 @@ export function PaymentConfirmDialog({
   discountRate = DEFAULT_DISCOUNT_RATE,
   usdExchangeRate = 1,
 }: PaymentConfirmDialogProps) {
-  const { t } = useTranslation()
-  const hasDiscount = discountRate > 0 && discountRate < 1 && paymentAmount > 0
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const stripe = isStripePayment(paymentMethod?.type ?? '')
+  const tokenAmount = getCurrencyDisplay().meta.kind === 'tokens'
+  const hasDiscount =
+    !stripe && discountRate > 0 && discountRate < 1 && paymentAmount > 0
   const originalAmount = hasDiscount ? paymentAmount / discountRate : 0
   const discountAmount = hasDiscount ? originalAmount - paymentAmount : 0
 
   return (
-    <AlertDialog open={open} onOpenChange={onOpenChange}>
-      <AlertDialogContent className='max-sm:w-[calc(100vw-1.5rem)] sm:max-w-md'>
-        <AlertDialogHeader>
-          <AlertDialogTitle className='text-xl font-semibold'>
-            {t('Confirm Payment')}
-          </AlertDialogTitle>
-          <AlertDialogDescription>
-            {t('Review your payment details')}
-          </AlertDialogDescription>
-        </AlertDialogHeader>
+    <ConfirmDialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (!processing) onOpenChange(nextOpen)
+      }}
+      title={t('Confirm Payment')}
+      desc={t('Review your payment details')}
+      className='max-sm:w-[calc(100vw-1.5rem)] sm:max-w-md'
+      handleConfirm={onConfirm}
+      isLoading={processing}
+      disabled={
+        calculating ||
+        !isValidTopupAmount(topupAmount) ||
+        !Number.isFinite(paymentAmount) ||
+        paymentAmount <= 0 ||
+        !paymentMethod
+      }
+      confirmText={
+        <>
+          {processing && <Loader2 className='mr-2 h-4 w-4 animate-spin' />}
+          {t('Confirm Payment')}
+        </>
+      }
+    >
+      <div className='space-y-3 py-3 sm:space-y-4 sm:py-4'>
+        <div className='flex items-center justify-between'>
+          <span className='text-muted-foreground text-sm'>
+            {stripe ? t('Quantity') : t('Topup Amount')}
+          </span>
+          <span className='text-lg font-semibold'>
+            {stripe || tokenAmount
+              ? formatNumber(topupAmount, locale)
+              : formatLocalCurrencyAmount(topupAmount * usdExchangeRate, {
+                  digitsLarge: 2,
+                  digitsSmall: 2,
+                  abbreviate: false,
+                })}
+          </span>
+        </div>
 
-        <div className='space-y-3 py-3 sm:space-y-4 sm:py-4'>
-          <div className='flex items-center justify-between'>
-            <span className='text-muted-foreground text-sm'>
-              {t('Topup Amount')}
-            </span>
-            <span className='text-lg font-semibold'>
-              {formatLocalCurrencyAmount(topupAmount * usdExchangeRate, {
-                digitsLarge: 2,
-                digitsSmall: 2,
-                abbreviate: false,
-              })}
-            </span>
-          </div>
-
-          <div className='flex items-center justify-between'>
-            <span className='text-muted-foreground text-sm'>
-              {t('You Pay')}
-            </span>
-            {calculating ? (
-              <Skeleton className='h-6 w-24' />
-            ) : (
-              <div className='flex items-baseline gap-2'>
-                <span className='text-2xl font-semibold'>
-                  {formatCurrency(paymentAmount)}
+        <div className='flex items-center justify-between'>
+          <span className='text-muted-foreground text-sm'>
+            {stripe ? t('Estimated payment before discounts') : t('You Pay')}
+          </span>
+          {calculating ? (
+            <Skeleton className='h-6 w-24' />
+          ) : (
+            <div className='flex items-baseline gap-2'>
+              <span className='text-2xl font-semibold'>
+                {formatCurrency(paymentAmount)}
+              </span>
+              {hasDiscount && (
+                <span className='text-muted-foreground text-sm line-through'>
+                  {formatCurrency(originalAmount)}
                 </span>
-                {hasDiscount && (
-                  <span className='text-muted-foreground text-sm line-through'>
-                    {formatCurrency(originalAmount)}
-                  </span>
-                )}
-              </div>
-            )}
-          </div>
-
-          {hasDiscount && !calculating && (
-            <div className='bg-muted/50 rounded-lg p-3'>
-              <div className='flex items-center justify-between text-sm'>
-                <span className='text-muted-foreground'>{t('You save')}</span>
-                <span className='font-semibold text-green-600'>
-                  {formatCurrency(discountAmount)}
-                </span>
-              </div>
+              )}
             </div>
           )}
+        </div>
 
-          <div className='border-t pt-4'>
-            <div className='flex items-center justify-between'>
-              <span className='text-muted-foreground text-sm'>
-                {t('Payment Method')}
+        {stripe && (
+          <p className='text-muted-foreground text-xs'>
+            {t(
+              'The final amount and any discounts are confirmed in Stripe Checkout.'
+            )}
+          </p>
+        )}
+
+        {hasDiscount && !calculating && (
+          <div className='bg-muted/50 rounded-lg p-3'>
+            <div className='flex items-center justify-between text-sm'>
+              <span className='text-muted-foreground'>{t('You save')}</span>
+              <span className='font-semibold text-green-600'>
+                {formatCurrency(discountAmount)}
               </span>
-              <div className='flex items-center gap-2'>
-                {getPaymentIcon(
-                  paymentMethod?.type,
-                  'h-4 w-4',
-                  paymentMethod?.icon,
-                  paymentMethod?.name
-                )}
-                <span className='font-medium'>{paymentMethod?.name}</span>
-              </div>
+            </div>
+          </div>
+        )}
+
+        <div className='border-t pt-4'>
+          <div className='flex items-center justify-between'>
+            <span className='text-muted-foreground text-sm'>
+              {t('Payment Method')}
+            </span>
+            <div className='flex items-center gap-2'>
+              {getPaymentIcon(
+                paymentMethod?.type,
+                'h-4 w-4',
+                paymentMethod?.icon,
+                paymentMethod?.name
+              )}
+              <span className='font-medium'>{paymentMethod?.name}</span>
             </div>
           </div>
         </div>
-
-        <AlertDialogFooter className='grid grid-cols-2 gap-2 sm:flex'>
-          <AlertDialogCancel disabled={processing}>
-            {t('Cancel')}
-          </AlertDialogCancel>
-          <AlertDialogAction onClick={onConfirm} disabled={processing}>
-            {processing && <Loader2 className='mr-2 h-4 w-4 animate-spin' />}
-            {t('Confirm Payment')}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+      </div>
+    </ConfirmDialog>
   )
 }

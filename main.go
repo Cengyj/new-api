@@ -368,7 +368,9 @@ func InitResources() error {
 			common.SysError(common.LogText("failed to migrate sensitive words: %s", err.Error()))
 		}
 	}
-	model.InitOptionMap()
+	if err := model.InitOptionMap(); err != nil {
+		service.SyncTopicLoadFailed(model.SyncTopicOptions, err)
+	}
 
 	// 清理旧的磁盘缓存文件
 	common.CleanupOldCacheFiles()

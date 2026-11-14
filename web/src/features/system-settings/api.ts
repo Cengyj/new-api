@@ -16,7 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { CanceledError } from 'axios'
+
 import { api } from '@/lib/api'
+import { authenticationIdentity } from '@/lib/http-client'
 
 import type {
   ConfirmPaymentComplianceResponse,
@@ -39,8 +42,17 @@ export async function getSystemOptions() {
   return res.data
 }
 
-export async function updateSystemOption(request: UpdateOptionRequest) {
-  const res = await api.put<UpdateOptionResponse>('/api/option/', request)
+export async function updateSystemOption(
+  request: UpdateOptionRequest,
+  authIdentity = authenticationIdentity()
+) {
+  const res = await api.put<UpdateOptionResponse>('/api/option/', request, {
+    authIdentity,
+    skipAuthRefresh: true,
+  })
+  if (authIdentity !== authenticationIdentity()) {
+    throw new CanceledError('Authentication changed')
+  }
   return res.data
 }
 

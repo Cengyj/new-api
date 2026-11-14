@@ -19,7 +19,10 @@ For commercial licensing, please contact support@quantumnous.com
 import { MutationCache, QueryCache, QueryClient } from '@tanstack/react-query'
 
 import { handleServerError } from './handle-server-error'
-import { getServerErrorStatus } from './server-error-message'
+import {
+  getServerErrorStatus,
+  isServerErrorCancelled,
+} from './server-error-message'
 
 interface ErrorNotificationMeta extends Record<string, unknown> {
   /** Disable automatic notifications when a caller presents the failure itself. */
@@ -40,7 +43,13 @@ export function createAppQueryClient(
     defaultOptions: {
       queries: {
         retry: (failureCount, error) => {
-          if (import.meta.env.DEV || failureCount > 3) return false
+          if (
+            import.meta.env.DEV ||
+            failureCount > 3 ||
+            isServerErrorCancelled(error)
+          ) {
+            return false
+          }
           return ![401, 403].includes(getServerErrorStatus(error) ?? 0)
         },
         refetchOnWindowFocus: false,

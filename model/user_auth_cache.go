@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/go-redis/redis/v8"
 
 	"gorm.io/gorm"
 )
@@ -23,6 +24,8 @@ import (
 var ErrUserAuthCachePending = errors.New("user authentication state update is pending")
 
 var ErrUserAuthVersionConflict = errors.New("user authentication version update conflicted")
+
+var errUserCacheFillSuperseded = errors.New("user cache fill was superseded")
 
 // Fence and version keys use the user cache key as their hash tag so the
 // cache fill script and the floor MGET stay in one slot on sharded Redis.
@@ -49,12 +52,31 @@ func writeUserCache(user *UserBase, includeQuota bool) error {
 	if user == nil || user.Id <= 0 || !common.RedisEnabled {
 		return nil
 	}
+	if !includeQuota {
+		return publishUserCache(context.Background(), common.RDB, user, "")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), walletCacheCoordinationTimeout)
+	defer cancel()
+	connection := common.RDB.Conn(ctx)
+	defer connection.Close()
+	fillToken, err := reserveWalletCacheFill(ctx, connection, user.Id)
+	if err != nil {
+		return err
+	}
+	return publishUserCache(ctx, connection, user, fillToken)
+}
+
+// A nonempty fill token permits quota initialization only while that one-use
+// reservation is current. Production hydration reserves it before its database
+// read; even a lost SQL lock cannot publish an old balance after a credit.
+// Metadata updates pass an empty token and retain their existing semantics.
+func publishUserCache(ctx context.Context, cacheCommands redis.Cmdable, user *UserBase, fillToken string) error {
 	user.CacheSchema = userCacheSchemaVersion
 	if user.AuthVersion <= 0 {
 		return fmt.Errorf("invalid user auth version")
 	}
 	includeQuotaArg := "0"
-	if includeQuota {
+	if fillToken != "" {
 		includeQuotaArg = "1"
 	}
 	ttl := userCacheTTLSeconds()
@@ -63,7 +85,31 @@ func writeUserCache(user *UserBase, includeQuota bool) error {
 	if err != nil {
 		return err
 	}
-	const script = `
+	const script = walletCacheRunGuard + `
+local quota = redis.call('HGET', KEYS[1], 'Quota') or ''
+local magnitude = string.match(quota, '^%-?([1-9]%d*)$')
+local limit = string.sub(quota, 1, 1) == '-' and '9223372036854775808' or '9223372036854775807'
+-- Match Redis's signed int64 counter format without Lua number rounding.
+local validQuota = quota == '0' or (magnitude and
+  (#magnitude < 19 or (#magnitude == 19 and magnitude <= limit)))
+if ARGV[10] == '1' and not validQuota then
+  -- SQL already includes committed credits. A damaged counter cannot be
+  -- rebased while a pending delta could be added to that snapshot again.
+  for _, field in ipairs(redis.call('HKEYS', KEYS[1])) do
+    if string.sub(field, 1, 13) == 'WalletCredit:' then
+      return redis.error_reply('WALLET_CACHE_RECOVERY_REQUIRED')
+    end
+  end
+end
+if ARGV[10] == '1' then
+  if string.match(ARGV[13], '^([^:]+):') ~= walletRunID then
+    return redis.error_reply('WALLET_CACHE_RECOVERY_REQUIRED')
+  end
+  if redis.call('GET', KEYS[4]) ~= ARGV[13] then
+    return 2
+  end
+  redis.call('DEL', KEYS[4])
+end
 local incoming = tonumber(ARGV[1])
 local pending = tonumber(redis.call('GET', KEYS[2]) or '0')
 local committed = tonumber(redis.call('GET', KEYS[3]) or '0')
@@ -84,34 +130,37 @@ redis.call('HSET', KEYS[1],
   'Id', ARGV[2], 'Group', ARGV[3], 'Email', ARGV[4],
   'Status', ARGV[5], 'Role', ARGV[6], 'Username', ARGV[7],
   'Setting', ARGV[8], 'AuthVersion', ARGV[1], 'CacheSchema', ARGV[9],
-  'CacheExpiresAt', ARGV[13], 'CacheMAC', ARGV[14])
-if ARGV[10] == '1' and not string.match(redis.call('HGET', KEYS[1], 'Quota') or '', '^-?%d+$') then
-  redis.call('HSET', KEYS[1], 'Quota', ARGV[11])
+  'CacheExpiresAt', ARGV[14], 'CacheMAC', ARGV[15])
+if ARGV[10] == '1' and not validQuota then
+  redis.call('HSET', KEYS[1], 'Quota', ARGV[11], 'WalletGeneration', ARGV[13], 'WalletRedisRunID', walletRunID)
 end
 redis.call('EXPIRE', KEYS[1], ARGV[12])
 return 1`
-	result, err := common.RDB.Eval(context.Background(), script,
-		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id)},
+	result, err := cacheCommands.Eval(ctx, script,
+		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id), getWalletCacheFillKey(user.Id)},
 		user.AuthVersion, user.Id, user.Group, user.Email, user.Status, user.Role,
-		user.Username, user.Setting, user.CacheSchema, includeQuotaArg, user.Quota, ttl,
+		user.Username, user.Setting, user.CacheSchema, includeQuotaArg, user.Quota, ttl, fillToken,
 		user.CacheExpiresAt, mac,
 	).Int()
 	if err != nil {
-		return err
+		return walletCacheValidationError(err)
 	}
 	if result == 0 {
 		return ErrUserAuthCachePending
 	}
+	if result == 2 {
+		return errUserCacheFillSuperseded
+	}
 	return nil
 }
 
-func getUserAuthVersionFloor(userId int) (int64, error) {
+func getUserAuthVersionFloor(ctx context.Context, cacheCommands redis.Cmdable, userId int) (int64, error) {
 	if !common.RedisEnabled {
 		return 0, nil
 	}
-	values, err := common.RDB.MGet(context.Background(), getUserAuthFenceKey(userId), getUserAuthVersionKey(userId)).Result()
+	values, err := cacheCommands.MGet(ctx, getUserAuthFenceKey(userId), getUserAuthVersionKey(userId)).Result()
 	if err != nil {
-		return 0, err
+		return 0, walletCacheValidationError(err)
 	}
 	var floor int64
 	for _, value := range values {
@@ -120,7 +169,7 @@ func getUserAuthVersionFloor(userId int) (int64, error) {
 		}
 		parsed, err := strconv.ParseInt(fmt.Sprint(value), 10, 64)
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("%w: %v", ErrWalletCacheValidationUnavailable, err)
 		}
 		if parsed > floor {
 			floor = parsed

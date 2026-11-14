@@ -83,10 +83,14 @@ describe('email delivery settings', () => {
     )
     await user.click(screen.getByRole('button', { name: 'Save Changes' }))
     await waitFor(() =>
-      expect(request).toHaveBeenCalledWith('/api/option/', {
-        key: 'QuotaRemindEnabled',
-        value: false,
-      })
+      expect(request).toHaveBeenCalledWith(
+        '/api/option/',
+        {
+          key: 'QuotaRemindEnabled',
+          value: false,
+        },
+        expect.objectContaining({ skipAuthRefresh: true })
+      )
     )
     expect(request).toHaveBeenCalledTimes(1)
   })
@@ -172,10 +176,14 @@ describe('email delivery settings', () => {
     await user.type(from, 'changed@example.com')
     await user.click(screen.getByRole('button', { name: 'Save Changes' }))
     await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
-    expect(request).toHaveBeenCalledWith('/api/option/', {
-      key: 'ResendFrom',
-      value: 'changed@example.com',
-    })
+    expect(request).toHaveBeenCalledWith(
+      '/api/option/',
+      {
+        key: 'ResendFrom',
+        value: 'changed@example.com',
+      },
+      expect.objectContaining({ skipAuthRefresh: true })
+    )
   })
 
   it('retains both Resend sender drafts when switching providers', async () => {
@@ -208,10 +216,14 @@ describe('email delivery settings', () => {
     await user.click(screen.getByRole('radio', { name: 'SMTP' }))
     await user.click(screen.getByRole('button', { name: 'Save Changes' }))
     await waitFor(() => expect(request).toHaveBeenCalledTimes(1))
-    expect(request).toHaveBeenCalledWith('/api/option/', {
-      key: 'EmailProvider',
-      value: 'smtp',
-    })
+    expect(request).toHaveBeenCalledWith(
+      '/api/option/',
+      {
+        key: 'EmailProvider',
+        value: 'smtp',
+      },
+      expect.objectContaining({ skipAuthRefresh: true })
+    )
   })
 
   it('does not activate Resend if saving its credential fails', async () => {
@@ -285,18 +297,26 @@ describe('email delivery settings', () => {
     await user.type(name, 'New API, "Support"')
     await user.click(screen.getByRole('button', { name: 'Save Changes' }))
     await waitFor(() =>
-      expect(request).toHaveBeenLastCalledWith('/api/option/', {
-        key: 'ResendFrom',
-        value: '"New API, \\"Support\\"" <notify@example.com>',
-      })
+      expect(request).toHaveBeenLastCalledWith(
+        '/api/option/',
+        {
+          key: 'ResendFrom',
+          value: '"New API, \\"Support\\"" <notify@example.com>',
+        },
+        expect.objectContaining({ skipAuthRefresh: true })
+      )
     )
     await user.clear(name)
     await user.click(screen.getByRole('button', { name: 'Save Changes' }))
     await waitFor(() =>
-      expect(request).toHaveBeenLastCalledWith('/api/option/', {
-        key: 'ResendFrom',
-        value: 'notify@example.com',
-      })
+      expect(request).toHaveBeenLastCalledWith(
+        '/api/option/',
+        {
+          key: 'ResendFrom',
+          value: 'notify@example.com',
+        },
+        expect.objectContaining({ skipAuthRefresh: true })
+      )
     )
   })
 

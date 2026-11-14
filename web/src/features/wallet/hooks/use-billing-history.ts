@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { isAxiosError } from 'axios'
 import i18next from 'i18next'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { toast } from 'sonner'
@@ -23,6 +24,8 @@ import { toast } from 'sonner'
 import { useIsAdmin } from '@/hooks/use-admin'
 import { useDebounce } from '@/hooks/use-debounce'
 import { handleServerError } from '@/lib/handle-server-error'
+import { useAuthStore } from '@/stores/auth-store'
+import { usePaymentRecoveryStore } from '@/stores/payment-recovery-store'
 
 import {
   getUserBillingHistory,
@@ -41,85 +44,153 @@ interface UseBillingHistoryOptions {
   initialPage?: number
   /** Initial page size */
   initialPageSize?: number
+  initialKeyword?: string
+  enabled?: boolean
+}
+
+export function billingHistoryIdentity(): string {
+  const auth = useAuthStore.getState().auth
+  return `${auth.user?.id ?? ''}:${auth.session?.sid ?? ''}:${auth.user?.role ?? ''}`
 }
 
 export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
-  const { initialPage = 1, initialPageSize = 10 } = options
+  const {
+    initialPage = 1,
+    initialPageSize = 10,
+    initialKeyword = '',
+    enabled = true,
+  } = options
   const isAdmin = useIsAdmin()
+  const identity = useAuthStore(billingHistoryIdentity)
+  const abort = useRef(new AbortController())
+  const pendingCompletion = useRef(false)
+  useEffect(() => {
+    const controller = new AbortController()
+    abort.current = controller
+    const unsubscribe = useAuthStore.subscribe(() => {
+      if (billingHistoryIdentity() !== identity) controller.abort()
+    })
+    return () => {
+      controller.abort()
+      unsubscribe()
+    }
+  }, [identity])
 
   const [records, setRecords] = useState<TopupRecord[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(initialPage)
   const [pageSize, setPageSize] = useState(initialPageSize)
-  const [keyword, setKeyword] = useState('')
+  const [keyword, setKeyword] = useState(initialKeyword)
   const debouncedKeyword = useDebounce(keyword)
   const requestIdRef = useRef(0)
   const [loading, setLoading] = useState(false)
+  const [loadFailed, setLoadFailed] = useState(false)
   const [completing, setCompleting] = useState(false)
+  const [refreshVersion, setRefreshVersion] = useState(0)
 
   /**
    * Fetch billing history
    */
   const fetchBillingHistory = useCallback(async () => {
+    const signal = abort.current.signal
+    if (signal.aborted || billingHistoryIdentity() !== identity) return
     const requestId = ++requestIdRef.current
     setLoading(true)
+    setLoadFailed(false)
     try {
       const response = isAdmin
-        ? await getAllBillingHistory(page, pageSize, debouncedKeyword)
-        : await getUserBillingHistory(page, pageSize, debouncedKeyword)
+        ? await getAllBillingHistory(page, pageSize, debouncedKeyword, signal)
+        : await getUserBillingHistory(page, pageSize, debouncedKeyword, signal)
 
-      if (requestId !== requestIdRef.current) return
+      if (requestId !== requestIdRef.current || signal.aborted) return
 
       if (isApiSuccess(response) && response.data) {
+        const userId = useAuthStore.getState().auth.user?.id
+        if (userId) {
+          // Only a successful authoritative read of this user's terminal order
+          // can retire a local reference. Empty/error/pending results retain it.
+          const terminalOrders = (response.data.items ?? [])
+            .filter(
+              (record) =>
+                record.user_id === userId &&
+                ['success', 'failed', 'expired'].includes(record.status)
+            )
+            .map((record) => record.trade_no)
+          if (terminalOrders.length) {
+            usePaymentRecoveryStore.getState().resolve(userId, terminalOrders)
+          }
+        }
         setRecords(response.data.items || [])
         setTotal(response.data.total || 0)
       } else {
         handleServerError(response, i18next.t('Failed to load billing history'))
-        setRecords([])
-        setTotal(0)
+        setLoadFailed(true)
       }
     } catch (error) {
-      if (requestId !== requestIdRef.current) return
+      if (requestId !== requestIdRef.current || signal.aborted) return
       handleServerError(error, i18next.t('Failed to load billing history'))
-      setRecords([])
-      setTotal(0)
+      setLoadFailed(true)
     } finally {
-      if (requestId === requestIdRef.current) {
+      if (requestId === requestIdRef.current && !signal.aborted) {
         setLoading(false)
       }
     }
-  }, [debouncedKeyword, isAdmin, page, pageSize])
+  }, [debouncedKeyword, identity, isAdmin, page, pageSize])
 
   /**
    * Complete a pending order (admin only)
    */
   const handleCompleteOrder = useCallback(
     async (tradeNo: string) => {
+      const signal = abort.current.signal
+      if (
+        signal.aborted ||
+        pendingCompletion.current ||
+        billingHistoryIdentity() !== identity
+      ) {
+        return false
+      }
       if (!isAdmin) {
         toast.error(i18next.t('Admin access required'))
         return false
       }
 
+      pendingCompletion.current = true
       setCompleting(true)
       try {
-        const response = await completeOrder({ trade_no: tradeNo })
+        const response = await completeOrder({ trade_no: tradeNo }, signal)
+        if (signal.aborted) return false
         if (isApiSuccess(response)) {
           toast.success(i18next.t('Order completed successfully'))
-          // Refresh the list
-          await fetchBillingHistory()
+          // Refresh the current search/page, not the values at confirmation.
+          // Completion already succeeded; a refresh failure cannot undo it.
+          setRefreshVersion((version) => version + 1)
           return true
         } else {
           handleServerError(response, i18next.t('Failed to complete order'))
           return false
         }
       } catch (error) {
-        handleServerError(error, i18next.t('Failed to complete order'))
+        if (signal.aborted) return false
+        const status = isAxiosError(error) ? error.response?.status : undefined
+        if (status !== undefined && status >= 400 && status < 500) {
+          handleServerError(error, i18next.t('Failed to complete order'))
+        } else {
+          // The database may have committed before the response was lost.
+          // Keep this order available for reconciliation and same-order retry.
+          handleServerError(error, undefined, {
+            title: i18next.t(
+              'Order completion result is unknown. Refresh Order History before retrying this order.'
+            ),
+          })
+        }
         return false
       } finally {
-        setCompleting(false)
+        pendingCompletion.current = false
+        if (!signal.aborted) setCompleting(false)
       }
     },
-    [isAdmin, fetchBillingHistory]
+    [identity, isAdmin]
   )
 
   /**
@@ -148,10 +219,10 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
 
   // Fetch data after the search draft has settled.
   useEffect(() => {
-    if (keyword !== debouncedKeyword) return
+    if (!enabled || keyword !== debouncedKeyword) return
 
     fetchBillingHistory()
-  }, [debouncedKeyword, fetchBillingHistory, keyword])
+  }, [debouncedKeyword, enabled, fetchBillingHistory, keyword, refreshVersion])
 
   return {
     records,
@@ -160,6 +231,7 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
     pageSize,
     keyword,
     loading,
+    loadFailed,
     completing,
     isAdmin,
     handlePageChange,

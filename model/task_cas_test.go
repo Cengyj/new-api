@@ -51,6 +51,9 @@ func TestMain(m *testing.M) {
 		&QuotaData{},
 		&Ability{},
 		&TopUp{},
+		&Option{},
+		&ReferralRebate{},
+		&AffiliateTransfer{},
 		&SubscriptionPlan{},
 		&SubscriptionOrder{},
 		&UserSubscription{},
@@ -63,6 +66,9 @@ func TestMain(m *testing.M) {
 	); err != nil {
 		panic("failed to migrate: " + err.Error())
 	}
+	if err := InitializeReferralRebateRule(db); err != nil {
+		panic(err)
+	}
 
 	os.Exit(m.Run())
 }
@@ -70,6 +76,9 @@ func TestMain(m *testing.M) {
 func truncateTables(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
+		DB.Exec("DELETE FROM referral_rebates")
+		DB.Exec("DELETE FROM affiliate_transfers")
+		DB.Model(&Option{}).Where(&Option{Key: ReferralRebateOptionKey}).Update("value", `{"enabled":false,"rate_bps":0,"valid_days":0}`)
 		DB.Exec("DELETE FROM tasks")
 		DB.Exec("DELETE FROM auth_flows")
 		DB.Exec("DELETE FROM external_identity_claims")

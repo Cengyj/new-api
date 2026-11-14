@@ -16,9 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 
 import { handleServerError } from '@/lib/handle-server-error'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getTopupInfo } from '../api'
 import {
@@ -26,6 +27,7 @@ import {
   mergePresetAmounts,
   getMinTopupAmount,
 } from '../lib'
+import { referralIdentity } from '../referral-api'
 import type {
   TopupInfo,
   PresetAmount,
@@ -85,18 +87,25 @@ function parsePaymentMethods(
 
 function parseWaffoPayMethods(data: unknown): WaffoPayMethod[] {
   return parseJsonArray(data)
-    .filter(
-      (item): item is Record<string, unknown> =>
-        !!item && typeof item === 'object'
-    )
-    .map((item) => ({
-      name: typeof item.name === 'string' ? item.name : '',
-      icon: typeof item.icon === 'string' ? item.icon : undefined,
-      payMethodType:
-        typeof item.payMethodType === 'string' ? item.payMethodType : undefined,
-      payMethodName:
-        typeof item.payMethodName === 'string' ? item.payMethodName : undefined,
-    }))
+    .flatMap((item, sourceIndex) => {
+      if (!item || typeof item !== 'object') return []
+      const method = item as Record<string, unknown>
+      return [
+        {
+          sourceIndex,
+          name: typeof method.name === 'string' ? method.name : '',
+          icon: typeof method.icon === 'string' ? method.icon : undefined,
+          payMethodType:
+            typeof method.payMethodType === 'string'
+              ? method.payMethodType
+              : undefined,
+          payMethodName:
+            typeof method.payMethodName === 'string'
+              ? method.payMethodName
+              : undefined,
+        },
+      ]
+    })
     .filter((item) => item.name)
 }
 
@@ -166,17 +175,29 @@ function parseDiscountMap(data: unknown): Record<number, number> {
 }
 
 export function useTopupInfo() {
-  const [topupInfo, setTopupInfo] = useState<TopupInfo | null>(null)
+  const identity = useAuthStore(referralIdentity)
+  const request = useRef<AbortController | null>(null)
+  const [snapshot, setSnapshot] = useState<{
+    identity: string
+    data: TopupInfo
+  } | null>(null)
   const [presetAmounts, setPresetAmounts] = useState<PresetAmount[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadFailed, setLoadFailed] = useState(false)
 
   const fetchTopupInfo = useCallback(async () => {
+    request.current?.abort()
+    const controller = new AbortController()
+    request.current = controller
     try {
       setLoading(true)
+      setLoadFailed(false)
 
-      const response = await getTopupInfo()
+      const response = await getTopupInfo(controller.signal)
+      if (controller.signal.aborted || referralIdentity() !== identity) return
 
       if (!response.success || !response.data) {
+        setLoadFailed(true)
         handleServerError(response)
         return
       }
@@ -195,7 +216,7 @@ export function useTopupInfo() {
         ),
       }
 
-      setTopupInfo(processedData)
+      setSnapshot({ identity, data: processedData })
 
       if (processedData.amount_options.length > 0) {
         const customPresets = mergePresetAmounts(
@@ -209,11 +230,16 @@ export function useTopupInfo() {
         setPresetAmounts(defaultPresets)
       }
     } catch (err) {
-      handleServerError(err)
+      if (!controller.signal.aborted && referralIdentity() === identity) {
+        setLoadFailed(true)
+        handleServerError(err)
+      }
     } finally {
-      setLoading(false)
+      if (!controller.signal.aborted && referralIdentity() === identity) {
+        setLoading(false)
+      }
     }
-  }, [])
+  }, [identity])
 
   useEffect(() => {
     let cancelled = false
@@ -224,13 +250,15 @@ export function useTopupInfo() {
 
     return () => {
       cancelled = true
+      request.current?.abort()
     }
   }, [fetchTopupInfo])
 
   return {
-    topupInfo,
-    presetAmounts,
+    topupInfo: snapshot?.identity === identity ? snapshot.data : null,
+    presetAmounts: snapshot?.identity === identity ? presetAmounts : [],
     loading,
+    loadFailed,
     refetch: fetchTopupInfo,
   }
 }

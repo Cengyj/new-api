@@ -41,6 +41,7 @@ declare module 'axios' {
     authRetry?: boolean
     acceptAuthRotation?: boolean
     singleUseAuthorization?: boolean
+    authIdentity?: string
   }
 }
 
@@ -58,12 +59,18 @@ export const api = axios.create({
 const inFlightGet = new Map<string, Promise<unknown>>()
 const originalGet = api.get.bind(api)
 
+export function authenticationIdentity(): string | undefined {
+  const auth = useAuthStore.getState().auth
+  if (!auth.user || !auth.session) return undefined
+  return `${auth.user.id}:${auth.session.sid}:${auth.user.role}`
+}
+
 api.get = ((url: string, config: ApiRequestConfig = {}) => {
   if (config.disableDuplicate) return originalGet(url, config)
 
   const params = config.params ? JSON.stringify(config.params) : '{}'
-  const sessionSID = useAuthStore.getState().auth.session?.sid || 'anonymous'
-  const key = `${sessionSID}:${url}?${params}`
+  const identity = authenticationIdentity() || 'anonymous'
+  const key = `${identity}:${url}?${params}`
   const existingRequest = inFlightGet.get(key)
   if (existingRequest) return existingRequest
 
@@ -85,6 +92,12 @@ function redirectToSignIn(): void {
 
 api.interceptors.response.use(
   (response) => {
+    if (
+      response.config.authIdentity !== undefined &&
+      response.config.authIdentity !== authenticationIdentity()
+    ) {
+      throw new axios.CanceledError('Authentication changed', response.config)
+    }
     if (response.config.acceptAuthRotation && response.data?.success === true) {
       applyAuthRotation(response.data.data)
     }
@@ -96,11 +109,33 @@ api.interceptors.response.use(
     const skipErrorHandler = config?.skipErrorHandler
     const status = error?.response?.status
 
+    // A delayed response belongs to the login that sent it, including
+    // failures that would otherwise surface in the next account's UI.
+    if (
+      config?.authIdentity !== undefined &&
+      config.authIdentity !== authenticationIdentity()
+    ) {
+      throw new axios.CanceledError('Authentication changed', error.config)
+    }
     if (status === 401) {
-      if (config && !config.skipAuthRefresh && !config.authRetry) {
+      // A write may already have taken effect before authentication fails.
+      // Only read-only HTTP methods are safe to replay after refreshing.
+      const canReplay = ['get', 'head', 'options'].includes(
+        config?.method?.toLowerCase() ?? 'get'
+      )
+      if (config && canReplay && !config.skipAuthRefresh && !config.authRetry) {
         config.authRetry = true
         const outcome = await refreshAuthentication()
         if (outcome.kind === 'authenticated') {
+          if (
+            config.authIdentity !== undefined &&
+            config.authIdentity !== authenticationIdentity()
+          ) {
+            throw new axios.CanceledError(
+              'Authentication changed',
+              error.config
+            )
+          }
           const token = useAuthStore.getState().auth.accessToken
           if (token) {
             config.headers = {
@@ -145,11 +180,23 @@ api.interceptors.response.use(
 )
 
 api.interceptors.request.use(async (config) => {
+  const identity = authenticationIdentity()
+  if (config.authIdentity !== undefined && config.authIdentity !== identity) {
+    throw new axios.CanceledError('Authentication changed', config)
+  }
+  // Preserve this binding when the same request is replayed after refresh.
+  config.authIdentity = identity
   if (config.singleUseAuthorization || config.headers.has('X-Security-Proof')) {
     // Refresh before spending a proof/flow, never by replaying its request.
     config.skipAuthRefresh = true
     try {
       const headers = await getFreshAuthHeaders()
+      if (
+        config.authIdentity !== undefined &&
+        config.authIdentity !== authenticationIdentity()
+      ) {
+        throw new axios.CanceledError('Authentication changed', config)
+      }
       for (const [name, value] of Object.entries(headers)) {
         config.headers.set(name, value)
       }

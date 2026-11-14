@@ -9,10 +9,15 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,7 +28,6 @@ import (
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/gin-gonic/gin"
-	"github.com/glebarez/sqlite"
 	"github.com/pquerna/otp/totp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -378,15 +382,17 @@ func TestSecurityLoginAllPrimaryTransportsRequireAdditionalVerification(t *testi
 					}))
 					require.NoError(t, model.DB.Create(&model.UserOAuthBinding{UserId: user.Id, ProviderId: 42, ProviderUserId: "bound-custom"}).Error)
 				} else {
+					require.NoError(t, model.DB.Model(user).Update("github_id", "external-user").Error)
 					oauth.Register(slug, &boundLoginOAuthProvider{userID: user.Id})
 				}
 				t.Cleanup(func() { oauth.Unregister(slug) })
-				token, _, err := model.CreateAuthFlow(model.AuthFlowCreate{Purpose: model.AuthFlowPurposeOAuth, Provider: slug, Intent: model.AuthFlowIntentLogin, Payload: `{}`, ExpiresAt: time.Now().Add(time.Minute)})
-				require.NoError(t, err)
+				token := startOAuthLoginTestFlow(t, slug)
 				router := gin.New()
 				router.GET("/api/oauth/:provider", HandleOAuth)
 				response = httptest.NewRecorder()
-				router.ServeHTTP(response, httptest.NewRequest("GET", "/api/oauth/"+slug+"?state="+token+"&code=provider-code", nil))
+				request := httptest.NewRequest("GET", "/api/oauth/"+slug+"?state="+token+"&code=provider-code", nil)
+				request.AddCookie(oauthTestLoginCookie())
+				router.ServeHTTP(response, request)
 			}
 			var result struct {
 				Success bool                   `json:"success"`
@@ -649,28 +655,73 @@ func (*authFlowTestOAuthProvider) IsUserIDTaken(string) bool                    
 func (*authFlowTestOAuthProvider) FillUserByProviderID(*model.User, string) error { return nil }
 func (*authFlowTestOAuthProvider) SetProviderUserID(*model.User, string)          {}
 func (*authFlowTestOAuthProvider) GetProviderPrefix() string                      { return "flow_" }
-func (*authFlowTestOAuthProvider) ProviderUserIDColumn() string                   { return "" }
+func (*authFlowTestOAuthProvider) ProviderUserIDColumn() string                   { return "github_id" }
 
 func setupAuthFlowControllerTest(t *testing.T) *authFlowTestOAuthProvider {
 	t.Helper()
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousRedis := common.RedisEnabled
 	common.RedisEnabled = false
-	previousType := common.MainDatabaseType()
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	dialect := os.Getenv("TEST_SECURITY_DIALECT")
+	if dialect == "" {
+		dialect = "sqlite"
+	}
+	databaseTypes := map[string]common.DatabaseType{
+		"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL,
+	}
+	require.Contains(t, databaseTypes, dialect)
+	db, _ := newAuditTestDatabase(t, dialect, os.Getenv("TEST_"+strings.ToUpper(dialect)+"_DSN"))
 	require.NoError(t, db.AutoMigrate(&model.AuthFlow{}, &model.User{}, &model.UserSession{}, &model.AuditLog{}))
 	model.DB, model.LOG_DB = db, db
-	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	common.SetDatabaseTypes(databaseTypes[dialect], databaseTypes[dialect])
+	versionQuery := "SELECT version()"
+	if dialect == "sqlite" {
+		versionQuery = "SELECT sqlite_version()"
+	}
+	var version string
+	require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+	t.Logf("OAuth flow database: %s %s", dialect, version)
 	provider := &authFlowTestOAuthProvider{}
 	oauth.Register("auth-flow-test", provider)
 	t.Cleanup(func() {
 		oauth.Unregister("auth-flow-test")
 		model.DB, model.LOG_DB = previousDB, previousLogDB
 		common.RedisEnabled = previousRedis
-		common.SetMainDatabaseType(previousType)
+		common.SetDatabaseTypes(previousMain, previousLog)
+		connection, err := db.DB()
+		if err == nil {
+			_ = connection.Close()
+		}
 	})
 	return provider
+}
+
+func oauthTestLoginCookie() *http.Cookie {
+	return &http.Cookie{Name: oauthLoginBrowserCookieName(), Value: strings.Repeat("a", 64)}
+}
+
+// Existing provider-specific fixtures start the same server-owned ceremony as
+// the browser. Cross-browser behavior is separately tested with independent jars.
+func startOAuthLoginTestFlow(t *testing.T, provider string) string {
+	t.Helper()
+	body, err := common.Marshal(map[string]string{"provider": provider, "intent": "login"})
+	require.NoError(t, err)
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/oauth/state", strings.NewReader(string(body)))
+	c.Request.AddCookie(oauthTestLoginCookie())
+	GenerateOAuthCode(c)
+	var result struct {
+		Success bool
+		Data    struct {
+			FlowToken string `json:"flow_token"`
+		}
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+	require.True(t, result.Success)
+	require.NotEmpty(t, result.Data.FlowToken)
+	return result.Data.FlowToken
 }
 
 func TestGenerateOAuthCodeCarriesAffiliateInLoginFlow(t *testing.T) {
@@ -737,15 +788,12 @@ func TestOAuthLoginConsumesFlowOnlyAfterProviderIdentity(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			provider.exchangeErr = test.exchangeErr
 			provider.userInfoErr = test.userInfoErr
-			token, _, err := model.CreateAuthFlow(model.AuthFlowCreate{
-				Purpose: model.AuthFlowPurposeOAuth, Provider: "auth-flow-test", Intent: model.AuthFlowIntentLogin,
-				Payload: `{}`, ExpiresAt: time.Now().Add(time.Minute),
-			})
-			require.NoError(t, err)
+			token := startOAuthLoginTestFlow(t, "auth-flow-test")
 
 			router := gin.New()
 			router.GET("/api/oauth/:provider", HandleOAuth)
 			request := httptest.NewRequest(http.MethodGet, "/api/oauth/auth-flow-test?state="+token+"&code=test", nil)
+			request.AddCookie(oauthTestLoginCookie())
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
 
@@ -763,27 +811,21 @@ func TestOAuthLoginConsumesFlowAfterProviderIdentityAndOnProviderError(t *testin
 
 	provider.exchangeErr = nil
 	provider.userInfoErr = nil
-	successToken, _, err := model.CreateAuthFlow(model.AuthFlowCreate{
-		Purpose: model.AuthFlowPurposeOAuth, Provider: "auth-flow-test", Intent: model.AuthFlowIntentLogin,
-		Payload: `{invalid`, ExpiresAt: time.Now().Add(time.Minute),
-	})
-	require.NoError(t, err)
+	successToken := startOAuthLoginTestFlow(t, "auth-flow-test")
 	router := gin.New()
 	router.GET("/api/oauth/:provider", HandleOAuth)
 	request := httptest.NewRequest(http.MethodGet, "/api/oauth/auth-flow-test?state="+successToken+"&code=test", nil)
+	request.AddCookie(oauthTestLoginCookie())
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, request)
-	_, err = model.GetAuthFlow(successToken, model.AuthFlowMatch{Purpose: model.AuthFlowPurposeOAuth})
+	_, err := model.GetAuthFlow(successToken, model.AuthFlowMatch{Purpose: model.AuthFlowPurposeOAuth})
 	assert.ErrorIs(t, err, model.ErrAuthFlowConsumed)
 	assert.Equal(t, 1, provider.exchangeCalls)
 	assert.Equal(t, 1, provider.userInfoCalls)
 
-	providerErrorToken, _, err := model.CreateAuthFlow(model.AuthFlowCreate{
-		Purpose: model.AuthFlowPurposeOAuth, Provider: "auth-flow-test", Intent: model.AuthFlowIntentLogin,
-		Payload: `{}`, ExpiresAt: time.Now().Add(time.Minute),
-	})
-	require.NoError(t, err)
+	providerErrorToken := startOAuthLoginTestFlow(t, "auth-flow-test")
 	request = httptest.NewRequest(http.MethodGet, "/api/oauth/auth-flow-test?state="+providerErrorToken+"&error=access_denied", nil)
+	request.AddCookie(oauthTestLoginCookie())
 	response = httptest.NewRecorder()
 	router.ServeHTTP(response, request)
 	_, err = model.GetAuthFlow(providerErrorToken, model.AuthFlowMatch{Purpose: model.AuthFlowPurposeOAuth})
@@ -858,12 +900,13 @@ func legacyGitHubOAuthLogin(t *testing.T, provider *legacyGitHubOAuthProvider) *
 	const slug = "github-legacy-login-test"
 	oauth.Register(slug, provider)
 	t.Cleanup(func() { oauth.Unregister(slug) })
-	token, _, err := model.CreateAuthFlow(model.AuthFlowCreate{Purpose: model.AuthFlowPurposeOAuth, Provider: slug, Intent: model.AuthFlowIntentLogin, Payload: `{}`, ExpiresAt: time.Now().Add(time.Minute)})
-	require.NoError(t, err)
+	token := startOAuthLoginTestFlow(t, slug)
 	router := gin.New()
 	router.GET("/api/oauth/:provider", HandleOAuth)
 	response := httptest.NewRecorder()
-	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/oauth/"+slug+"?state="+token+"&code=provider-code", nil))
+	request := httptest.NewRequest(http.MethodGet, "/api/oauth/"+slug+"?state="+token+"&code=provider-code", nil)
+	request.AddCookie(oauthTestLoginCookie())
+	router.ServeHTTP(response, request)
 	return response
 }
 
@@ -1124,8 +1167,231 @@ func TestOAuthBindIgnoresLegacyGitHubUsernames(t *testing.T) {
 	}
 }
 
+func TestOAuthLoginBindsBrowserBeforeProviderExchange(t *testing.T) {
+	for _, scenario := range []struct {
+		name            string
+		newUser, secure bool
+	}{
+		{"existing_account", false, true}, {"invited_registration", true, true}, {"local_http", false, false},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			inviter, _ := setupSecurityEnrollmentTest(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.ExternalIdentityClaim{}))
+			require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
+			require.NoError(t, model.InitializeReferralRebateRule(model.DB))
+			previousPayment := *operation_setting.GetPaymentSetting()
+			previousRegister, previousSecure := common.RegisterEnabled, common.SessionCookieSecure
+			previousAddress := system_setting.ServerAddress
+			previousNew, previousInviter, previousInvitee := common.QuotaForNewUser, common.QuotaForInviter, common.QuotaForInvitee
+			common.RegisterEnabled, common.SessionCookieSecure = true, scenario.secure
+			common.QuotaForNewUser, common.QuotaForInviter, common.QuotaForInvitee = 20, 40, 30
+			operation_setting.GetPaymentSetting().ComplianceConfirmed = true
+			operation_setting.GetPaymentSetting().ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+			t.Cleanup(func() {
+				*operation_setting.GetPaymentSetting() = previousPayment
+				common.RegisterEnabled, common.SessionCookieSecure = previousRegister, previousSecure
+				system_setting.ServerAddress = previousAddress
+				common.QuotaForNewUser, common.QuotaForInviter, common.QuotaForInvitee = previousNew, previousInviter, previousInvitee
+			})
+			require.NoError(t, model.SaveReferralRebateRule(model.ReferralRebateRule{Enabled: true, RateBPS: 1000, ValidDays: 2}))
+			require.NoError(t, model.DB.Model(inviter).Update("aff_code", "browser-referral").Error)
+			var tokenCalls atomic.Int32
+			var codeMu sync.Mutex
+			redeemed := map[string]bool{}
+			providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Path == "/token" {
+					tokenCalls.Add(1)
+					if r.ParseForm() != nil {
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					code := r.Form.Get("code")
+					codeMu.Lock()
+					accepted := (code == "first-grant" || code == "second-grant") && !redeemed[code]
+					redeemed[code] = true
+					codeMu.Unlock()
+					if !accepted {
+						w.WriteHeader(http.StatusBadRequest)
+						_, _ = w.Write([]byte("{\"error\":\"invalid_grant\"}"))
+						return
+					}
+					_, _ = w.Write([]byte("{\"access_token\":\"fixture-provider-token\",\"token_type\":\"Bearer\"}"))
+					return
+				}
+				if r.URL.Path == "/userinfo" && r.Header.Get("Authorization") == "Bearer fixture-provider-token" {
+					_, _ = w.Write([]byte("{\"sub\":\"authorized-provider-user\",\"preferred_username\":\"new-oauth-user\",\"name\":\"New OAuth User\"}"))
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			t.Cleanup(providerServer.Close)
+			provider := oauth.NewGenericOAuthProvider(&model.CustomOAuthProvider{Id: 42, Name: "Local OAuth", Slug: "browser-oauth", Enabled: true, TokenEndpoint: providerServer.URL + "/token", UserInfoEndpoint: providerServer.URL + "/userinfo", UserIdField: "sub", UsernameField: "preferred_username", DisplayNameField: "name"})
+			oauth.Register("browser-oauth", provider)
+			t.Cleanup(func() { oauth.Unregister("browser-oauth") })
+			if !scenario.newUser {
+				require.NoError(t, model.CreateUserOAuthBinding(&model.UserOAuthBinding{UserId: inviter.Id, ProviderId: 42, ProviderUserId: "authorized-provider-user"}))
+			}
+			routes := gin.New()
+			routes.POST("/api/oauth/state", middleware.CriticalRateLimit(), middleware.DisableCache(), middleware.TryUserAuth(), middleware.AnonymousRequestBodyLimit(), GenerateOAuthCode)
+			routes.GET("/api/oauth/:provider", middleware.CriticalRateLimit(), middleware.DisableCache(), middleware.TryUserAuth(), HandleOAuth)
+			app := httptest.NewUnstartedServer(routes)
+			if scenario.secure {
+				app.StartTLS()
+			} else {
+				app.Start()
+			}
+			t.Cleanup(app.Close)
+			system_setting.ServerAddress = app.URL
+			jarA, err := cookiejar.New(nil)
+			require.NoError(t, err)
+			jarB, err := cookiejar.New(nil)
+			require.NoError(t, err)
+			clientA := &http.Client{Transport: app.Client().Transport, Jar: jarA}
+			clientB := &http.Client{Transport: app.Client().Transport, Jar: jarB}
+			clientWithoutCookie := &http.Client{Transport: app.Client().Transport}
+			startBody := "{\"provider\":\"browser-oauth\",\"intent\":\"login\",\"aff\":\"browser-referral\"}"
+			states := make([]string, 0, 3)
+			var browserCookie *http.Cookie
+			for i, client := range []*http.Client{clientA, clientA, clientB} {
+				response, err := client.Post(app.URL+"/api/oauth/state", "application/json", strings.NewReader(startBody))
+				require.NoError(t, err)
+				var started struct {
+					Success bool
+					Data    struct {
+						FlowToken string `json:"flow_token"`
+					}
+				}
+				require.NoError(t, common.DecodeJson(response.Body, &started))
+				require.NoError(t, response.Body.Close())
+				require.True(t, started.Success)
+				require.NotEmpty(t, started.Data.FlowToken)
+				states = append(states, started.Data.FlowToken)
+				cookies := response.Cookies()
+				require.Len(t, cookies, 1)
+				cookie := cookies[0]
+				assert.Equal(t, scenario.secure, cookie.Secure)
+				assert.True(t, cookie.HttpOnly)
+				assert.Equal(t, http.SameSiteLaxMode, cookie.SameSite)
+				assert.Equal(t, "/", cookie.Path)
+				assert.Empty(t, cookie.Domain)
+				assert.Equal(t, int(oauthAuthFlowTTL/time.Second), cookie.MaxAge)
+				assert.Equal(t, scenario.secure, strings.HasPrefix(cookie.Name, "__Host-"))
+				if i == 0 {
+					browserCookie = cookie
+				} else if i == 1 {
+					assert.True(t, browserCookie.Value == cookie.Value, "starting another tab must retain the first tab's binding")
+				} else {
+					assert.True(t, browserCookie.Value != cookie.Value, "independent browsers must receive independent nonces")
+				}
+				flow, err := model.GetAuthFlow(started.Data.FlowToken, model.AuthFlowMatch{Purpose: model.AuthFlowPurposeOAuth})
+				require.NoError(t, err)
+				assert.InDelta(t, flow.ExpiresAt.Unix(), cookie.Expires.Unix(), 1)
+				assert.False(t, strings.Contains(flow.Payload, cookie.Value), "flow storage must not contain the browser nonce")
+			}
+			callbackURL := app.URL + "/api/oauth/browser-oauth?code=first-grant&state=" + states[0]
+			for _, attempt := range []struct {
+				name                       string
+				client                     *http.Client
+				wrongCookie, providerError bool
+			}{
+				{"missing nonce", clientWithoutCookie, false, false}, {"wrong nonce", clientWithoutCookie, true, false}, {"different browser", clientB, false, false}, {"foreign provider error", clientB, false, true},
+			} {
+				t.Run(attempt.name, func(t *testing.T) {
+					path := callbackURL
+					if attempt.providerError {
+						path = app.URL + "/api/oauth/browser-oauth?error=access_denied&state=" + states[0]
+					}
+					request, err := http.NewRequest(http.MethodGet, path, nil)
+					require.NoError(t, err)
+					if attempt.wrongCookie {
+						request.AddCookie(&http.Cookie{Name: browserCookie.Name, Value: strings.Repeat("z", 64)})
+					}
+					response, err := attempt.client.Do(request)
+					require.NoError(t, err)
+					var body struct{ Success bool }
+					require.NoError(t, common.DecodeJson(response.Body, &body))
+					require.NoError(t, response.Body.Close())
+					assert.Equal(t, http.StatusForbidden, response.StatusCode)
+					assert.False(t, body.Success)
+					assert.Zero(t, len(response.Cookies()))
+					assert.Zero(t, tokenCalls.Load(), "reject before contacting the provider")
+					flow, err := model.GetAuthFlow(states[0], model.AuthFlowMatch{Purpose: model.AuthFlowPurposeOAuth})
+					require.NoError(t, err)
+					assert.Nil(t, flow.ConsumedAt)
+				})
+			}
+			// Pre-upgrade in-flight states lack a binding and must restart sign-in.
+			oldState, _, err := model.CreateAuthFlow(model.AuthFlowCreate{Purpose: model.AuthFlowPurposeOAuth, Provider: "browser-oauth", Intent: model.AuthFlowIntentLogin, Payload: "{}", ExpiresAt: time.Now().Add(time.Minute)})
+			require.NoError(t, err)
+			rejected, err := clientA.Get(app.URL + "/api/oauth/browser-oauth?code=first-grant&state=" + oldState)
+			require.NoError(t, err)
+			require.NoError(t, rejected.Body.Close())
+			assert.Equal(t, http.StatusForbidden, rejected.StatusCode)
+			assert.Zero(t, tokenCalls.Load())
+			expired, err := model.GetAuthFlow(states[2], model.AuthFlowMatch{Purpose: model.AuthFlowPurposeOAuth})
+			require.NoError(t, err)
+			require.NoError(t, model.DB.Model(expired).Update("expires_at", time.Now().Add(-time.Minute)).Error)
+			rejected, err = clientB.Get(app.URL + "/api/oauth/browser-oauth?code=first-grant&state=" + states[2])
+			require.NoError(t, err)
+			require.NoError(t, rejected.Body.Close())
+			assert.Equal(t, http.StatusForbidden, rejected.StatusCode)
+			assert.Zero(t, tokenCalls.Load(), "expired flows must not reach the provider")
+			var usersBefore int64
+			require.NoError(t, model.DB.Model(&model.User{}).Count(&usersBefore).Error)
+			assert.EqualValues(t, 1, usersBefore)
+			for i, code := range []string{"first-grant", "second-grant"} {
+				response, err := clientA.Get(app.URL + "/api/oauth/browser-oauth?code=" + code + "&state=" + states[i])
+				require.NoError(t, err)
+				var body struct {
+					Success bool
+					Data    struct {
+						AccessToken string `json:"access_token"`
+						User        struct {
+							ID int `json:"id"`
+						}
+					}
+				}
+				require.NoError(t, common.DecodeJson(response.Body, &body))
+				require.NoError(t, response.Body.Close())
+				require.True(t, body.Success)
+				assert.True(t, body.Data.AccessToken != "")
+				assert.NotZero(t, len(response.Cookies()))
+				var account model.User
+				require.NoError(t, model.DB.First(&account, body.Data.User.ID).Error)
+				if scenario.newUser {
+					assert.NotEqual(t, inviter.Id, account.Id)
+					assert.Equal(t, inviter.Id, account.InviterId)
+					assert.Equal(t, 1000, account.ReferralRateBPS)
+					assert.Equal(t, account.CreatedAt+2*86400, account.ReferralExpiresAt)
+					assert.Equal(t, 50, account.Quota)
+					require.NoError(t, model.DB.First(inviter, inviter.Id).Error)
+					assert.Equal(t, 40, inviter.AffQuota)
+					assert.Equal(t, 40, inviter.AffHistoryQuota)
+				} else {
+					assert.Equal(t, inviter.Id, account.Id)
+				}
+				_, err = model.GetAuthFlow(states[i], model.AuthFlowMatch{Purpose: model.AuthFlowPurposeOAuth})
+				assert.ErrorIs(t, err, model.ErrAuthFlowConsumed)
+				replay, err := clientA.Get(app.URL + "/api/oauth/browser-oauth?code=" + code + "&state=" + states[i])
+				require.NoError(t, err)
+				require.NoError(t, replay.Body.Close())
+				assert.Equal(t, http.StatusForbidden, replay.StatusCode)
+				assert.EqualValues(t, i+1, tokenCalls.Load())
+			}
+			var audits []model.AuditLog
+			require.NoError(t, model.LOG_DB.Find(&audits).Error)
+			encoded, err := common.Marshal(audits)
+			require.NoError(t, err)
+			for _, secret := range []string{browserCookie.Value, states[0], states[1], "first-grant", "second-grant", "fixture-provider-token"} {
+				assert.False(t, strings.Contains(string(encoded), secret), "authentication audit must not contain OAuth secrets")
+			}
+		})
+	}
+}
+
 func TestOAuthRegistrationPersistsInviter(t *testing.T) {
-	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Log{})
+	db, dialect := openTaskDialectDatabase(t, &model.User{}, &model.Log{}, &model.Option{}, &model.ExternalIdentityClaim{})
 	oldDB, oldLogDB := model.DB, model.LOG_DB
 	oldMain, oldLog := common.MainDatabaseType(), common.LogDatabaseType()
 	oldRedis, oldRegister := common.RedisEnabled, common.RegisterEnabled
@@ -1140,6 +1406,7 @@ func TestOAuthRegistrationPersistsInviter(t *testing.T) {
 		common.RedisEnabled, common.RegisterEnabled = oldRedis, oldRegister
 		common.QuotaForNewUser, common.QuotaForInvitee, common.QuotaForInviter = oldNew, oldInvitee, oldInviter
 	})
+	require.NoError(t, model.InitializeReferralRebateRule(db))
 	inviter := model.User{Username: "inviter", AffCode: "valid-aff", Status: common.UserStatusEnabled}
 	require.NoError(t, db.Create(&inviter).Error)
 	for _, tc := range []struct {

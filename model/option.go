@@ -1,9 +1,13 @@
 package model
 
 import (
+	"errors"
 	"maps"
+	"math"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -16,11 +20,36 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Option struct {
 	Key   string `json:"key" gorm:"primaryKey"`
 	Value string `json:"value"`
+}
+
+// Keep this process's payment configuration in the same order as its durable
+// saves and reloads. Sync tasks and periodic reloads use the same path.
+var walletPaymentOptionMutex sync.Mutex
+
+var walletPaymentOptionKeys = []string{
+	"TopupGroupRatio", "Price", "StripeUnitPrice", "WaffoUnitPrice",
+	"WaffoPancakeUnitPrice", "CreemProducts", "payment_setting.amount_discount",
+	"QuotaPerUnit", "QuotaForInviter", "QuotaForInvitee",
+	"general_setting.quota_display_type", "DisplayInCurrencyEnabled",
+	"PayAddress", "CustomCallbackAddress", "EpayId", "EpayKey", "MinTopUp", "PayMethods", "USDExchangeRate",
+	operation_setting.EpaySignTypeOptionKey, operation_setting.EpayMerchantPrivateKeyOptionKey, operation_setting.EpayPlatformPublicKeyOptionKey,
+	"StripeApiSecret", "StripeWebhookSecret", "StripePriceId", "StripeMinTopUp", "StripePromotionCodesEnabled",
+	"CreemApiKey", "CreemWebhookSecret", "CreemTestMode",
+	"WaffoEnabled", "WaffoApiKey", "WaffoPrivateKey", "WaffoPublicCert",
+	"WaffoSandbox", "WaffoSandboxApiKey", "WaffoSandboxPrivateKey", "WaffoSandboxPublicCert",
+	"WaffoMerchantId", "WaffoNotifyUrl", "WaffoReturnUrl", "WaffoSubscriptionReturnUrl",
+	"WaffoCurrency", "WaffoMinTopUp", "WaffoPayMethods",
+	"WaffoPancakeMerchantID", "WaffoPancakePrivateKey", "WaffoPancakeReturnURL",
+	"WaffoPancakeStoreID", "WaffoPancakeProductID", "WaffoPancakeMinTopUp",
+	"payment_setting.amount_options", "payment_setting.compliance_confirmed",
+	"payment_setting.compliance_terms_version", "payment_setting.compliance_confirmed_at",
+	"payment_setting.compliance_confirmed_by", "payment_setting.compliance_confirmed_ip",
 }
 
 func AllOption() ([]*Option, error) {
@@ -30,7 +59,7 @@ func AllOption() ([]*Option, error) {
 	return options, err
 }
 
-func InitOptionMap() {
+func InitOptionMap() error {
 	common.OptionMapRWMutex.Lock()
 	common.OptionMap = make(map[string]string)
 
@@ -51,7 +80,7 @@ func InitOptionMap() {
 	common.OptionMap["AutomaticDisableChannelEnabled"] = strconv.FormatBool(common.AutomaticDisableChannelEnabled)
 	common.OptionMap["AutomaticEnableChannelEnabled"] = strconv.FormatBool(common.AutomaticEnableChannelEnabled)
 	common.OptionMap["LogConsumeEnabled"] = strconv.FormatBool(common.LogConsumeEnabled)
-	common.OptionMap["DisplayInCurrencyEnabled"] = strconv.FormatBool(common.DisplayInCurrencyEnabled)
+	common.OptionMap["DisplayInCurrencyEnabled"] = strconv.FormatBool(operation_setting.IsCurrencyDisplay())
 	common.OptionMap["DisplayTokenStatEnabled"] = strconv.FormatBool(common.DisplayTokenStatEnabled)
 	common.OptionMap["DrawingEnabled"] = strconv.FormatBool(common.DrawingEnabled)
 	common.OptionMap["TaskEnabled"] = strconv.FormatBool(common.TaskEnabled)
@@ -192,7 +221,9 @@ func InitOptionMap() {
 	common.OptionMapRWMutex.Unlock()
 	if err := LoadOptionsFromDatabase(); err != nil {
 		common.SysError(common.LogText("failed to load options from database: %s", err.Error()))
+		return err
 	}
+	return nil
 }
 
 // LoadOptionsFromDatabase applies every stored option. A failed read keeps
@@ -202,28 +233,74 @@ func LoadOptionsFromDatabase() error {
 	defer requestPolicyOptionMutex.Unlock()
 	passkeyOptionMutex.Lock()
 	defer passkeyOptionMutex.Unlock()
+	walletPaymentOptionMutex.Lock()
+	defer walletPaymentOptionMutex.Unlock()
+	// Model pricing has its own transaction/publication lock. Hold it before
+	// reading too, so this reload cannot publish prices older than a local save.
+	modelPricingMutationMu.Lock()
+	defer modelPricingMutationMu.Unlock()
 	options, err := AllOption()
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err := refreshRequestPolicySnapshot(); err != nil {
-			common.SysError(common.LogText("invalid request policy: %s", err.Error()))
-		}
-	}()
-	passkeyOptions := make(map[string]string)
+	// Validate every persisted wallet value before publishing any of them.
+	// Invalid rows leave the last usable configuration active and make node sync retry.
+	// An rc.49 database has none of the signing rows and uses MD5. Missing
+	// durable keys must not inherit stale RSA material from this node.
+	paymentValues := map[string]string{
+		operation_setting.EpaySignTypeOptionKey:           operation_setting.EpaySignTypeMD5,
+		operation_setting.EpayMerchantPrivateKeyOptionKey: "",
+		operation_setting.EpayPlatformPublicKeyOptionKey:  "",
+	}
 	for _, option := range options {
+		if slices.Contains(walletPaymentOptionKeys, option.Key) {
+			if err := validateOptionValue(option.Key, option.Value); err != nil {
+				return err
+			}
+			paymentValues[option.Key] = option.Value
+		}
+	}
+	if err := operation_setting.ValidateEpaySignOptions(paymentValues); err != nil {
+		return err
+	}
+	common.OptionMapRWMutex.Lock()
+	var loadError error
+	passkeyOptions := make(map[string]string)
+	displayOptions := make(map[string]string)
+	for _, option := range options {
+		if option.Key == "general_setting.quota_display_type" || option.Key == "DisplayInCurrencyEnabled" {
+			displayOptions[option.Key] = option.Value
+			continue
+		}
 		if IsPasskeyDomainOption(option.Key) {
 			passkeyOptions[option.Key] = option.Value
 			continue
 		}
-		err := updateOptionMap(option.Key, option.Value)
-		if err != nil {
-			common.SysLog(common.LogText("failed to update option map: %s", err.Error()))
+		if err := updateOptionMapLocked(option.Key, option.Value); err != nil {
+			loadError = errors.Join(loadError, err)
 		}
 	}
-	applyPasskeyDomainOptions(passkeyOptions)
-	return nil
+	// Only persisted canonical values take precedence. An exported default in
+	// OptionMap must not hide a legacy-only database's selected input unit.
+	displayType, hasDisplayType := displayOptions["general_setting.quota_display_type"]
+	if !hasDisplayType {
+		if legacy, exists := displayOptions["DisplayInCurrencyEnabled"]; exists {
+			hasDisplayType = true
+			displayType = operation_setting.QuotaDisplayTypeTokens
+			if legacy == "true" {
+				displayType = operation_setting.QuotaDisplayTypeUSD
+			}
+		}
+	}
+	if hasDisplayType {
+		loadError = errors.Join(loadError, updateOptionMapLocked("general_setting.quota_display_type", displayType))
+	}
+	for _, key := range []string{operation_setting.EpaySignTypeOptionKey, operation_setting.EpayMerchantPrivateKeyOptionKey, operation_setting.EpayPlatformPublicKeyOptionKey} {
+		loadError = errors.Join(loadError, updateOptionMapLocked(key, paymentValues[key]))
+	}
+	applyPasskeyDomainOptionsLocked(passkeyOptions)
+	common.OptionMapRWMutex.Unlock()
+	return errors.Join(loadError, refreshRequestPolicySnapshot())
 }
 
 func SyncOptions(frequency int) {
@@ -237,13 +314,28 @@ func SyncOptions(frequency int) {
 }
 
 func validateOptionValue(key string, value string) error {
+	switch key {
+	case "TopupGroupRatio":
+		var ratios map[string]float64
+		return common.UnmarshalJsonStr(value, &ratios)
+	case "PayMethods":
+		var methods []map[string]string
+		return common.UnmarshalJsonStr(value, &methods)
+	case "payment_setting.amount_discount":
+		// The generic config loader ignores decoding failures. Reject those
+		// before persistence, using the exact existing discount value type.
+		var discounts map[int]float64
+		return common.UnmarshalJsonStr(value, &discounts)
+	case "Price", "StripeUnitPrice", "WaffoUnitPrice", "WaffoPancakeUnitPrice", "QuotaPerUnit":
+		price, err := strconv.ParseFloat(value, 64)
+		if err != nil || math.IsNaN(price) || math.IsInf(price, 0) {
+			return common.NewMessage("Invalid parameters")
+		}
+	}
 	if key == legacyAccessTokenRetireAtKey {
 		return errLegacyRetireAtReadOnly
 	}
 	if err := operation_setting.ValidateQuotaOption(key, value); err != nil {
-		return err
-	}
-	if err := operation_setting.ValidateEpaySignOption(key, value); err != nil {
 		return err
 	}
 	if key == "EmailProvider" || key == "ResendApiKey" || key == "ResendFrom" {
@@ -285,7 +377,46 @@ func validateOptionValue(key string, value string) error {
 	return nil
 }
 
+// Compare payment keys using the real column collation, even before their
+// first save. Let GORM resolve the table so custom naming strategies still work.
+func rejectWalletPaymentOptionAliases(keys []string) error {
+	aliases := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if !slices.Contains(walletPaymentOptionKeys, key) {
+			aliases = append(aliases, key)
+		}
+	}
+	if len(aliases) == 0 {
+		return nil
+	}
+	var query strings.Builder
+	query.WriteString("?")
+	arguments := []any{DB.Model(&Option{}).Select("?", clause.Column{Name: "key"}).Where("1 = 0")}
+	for _, key := range walletPaymentOptionKeys {
+		query.WriteString(" UNION ALL SELECT ?")
+		arguments = append(arguments, key)
+	}
+	var matches int64
+	if err := DB.Table("(?) AS wallet_payment_option_key", DB.Raw(query.String(), arguments...)).
+		Where(map[string]any{"key": aliases}).Count(&matches).Error; err != nil {
+		return err
+	}
+	if matches != 0 {
+		return common.NewMessage("Invalid parameters")
+	}
+	return nil
+}
+
 func UpdateOption(key string, value string) error {
+	if err := rejectGenericReferralRuleUpdates([]string{key}); err != nil {
+		return err
+	}
+	if slices.Contains(walletPaymentOptionKeys, key) {
+		return UpdateOptionsBulk(map[string]string{key: value})
+	}
+	if err := rejectWalletPaymentOptionAliases([]string{key}); err != nil {
+		return err
+	}
 	if IsRequestPolicyOption(key) {
 		return UpdateRequestPolicyOptions(map[string]string{key: value})
 	}
@@ -296,23 +427,7 @@ func UpdateOption(key string, value string) error {
 	if IsModelPricingOption(key) {
 		return UpdateModelPricingOptions(map[string]string{key: value})
 	}
-	if err := validateOptionValue(key, value); err != nil {
-		return err
-	}
-	// Save to database first
-	option := Option{
-		Key: key,
-	}
-	// https://gorm.io/docs/update.html#Save-All-Fields
-	DB.FirstOrCreate(&option, Option{Key: key})
-	option.Value = value
-	// Save is a combination function.
-	// If save value does not contain primary key, it will execute Create,
-	// otherwise it will execute Update (with all fields).
-	DB.Save(&option)
-	BumpSyncTopic(SyncTopicOptions)
-	// Update OptionMap
-	return updateOptionMap(key, value)
+	return UpdateOptionsBulk(map[string]string{key: value})
 }
 
 // UpdateOptionsBulk persists multiple key/value pairs in a single database
@@ -324,14 +439,34 @@ func UpdateOptionsBulk(values map[string]string) error {
 	if len(values) == 0 {
 		return nil
 	}
+	values = maps.Clone(values)
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	if err := rejectGenericReferralRuleUpdates(keys); err != nil {
+		return err
+	}
+	if err := rejectWalletPaymentOptionAliases(keys); err != nil {
+		return err
+	}
+	displayType, hasDisplayType := values["general_setting.quota_display_type"]
+	legacyDisplay, hasLegacyDisplay := values["DisplayInCurrencyEnabled"]
+	if hasDisplayType || hasLegacyDisplay {
+		if !hasDisplayType {
+			displayType = operation_setting.QuotaDisplayTypeTokens
+			if legacyDisplay == "true" {
+				displayType = operation_setting.QuotaDisplayTypeUSD
+			}
+		}
+		// Store both representations in the same transaction. A canonical
+		// value supplied in the same save preserves CNY and CUSTOM as well.
+		values["general_setting.quota_display_type"] = displayType
+		values["DisplayInCurrencyEnabled"] = strconv.FormatBool(displayType != operation_setting.QuotaDisplayTypeTokens)
+	}
 	for key := range values {
 		if IsPasskeyDomainOption(key) {
 			_, err := UpdatePasskeyDomainOptions(values, false, "")
-			return err
-		}
-	}
-	for key, value := range values {
-		if err := validateOptionValue(key, value); err != nil {
 			return err
 		}
 	}
@@ -354,12 +489,33 @@ func UpdateOptionsBulk(values map[string]string) error {
 			break
 		}
 	}
-
+	// Reload takes this lock before reading, so an older read cannot overwrite
+	// a completed save. Publish every value in a batch under one OptionMap lock.
+	walletPaymentOptionMutex.Lock()
+	defer walletPaymentOptionMutex.Unlock()
+	for key, value := range values {
+		if err := validateOptionValue(key, value); err != nil {
+			return err
+		}
+	}
 	err := DB.Transaction(func(tx *gorm.DB) error {
-		for k, v := range values {
+		if err := lockEpaySigningOptions(tx, values); err != nil {
+			return err
+		}
+		for _, k := range slices.Sorted(maps.Keys(values)) {
+			v := values[k]
 			option := Option{Key: k}
 			if err := tx.FirstOrCreate(&option, Option{Key: k}).Error; err != nil {
 				return err
+			}
+			if slices.Contains(walletPaymentOptionKeys, k) && option.Key != k {
+				// A historical alias can compare equal in MySQL. Save alone
+				// preserves that primary key, which startup would not recognize.
+				if err := tx.Model(&Option{}).Where(&Option{Key: option.Key}).
+					Updates(map[string]any{"key": k, "value": v}).Error; err != nil {
+					return err
+				}
+				continue
 			}
 			option.Value = v
 			if err := tx.Save(&option).Error; err != nil {
@@ -371,31 +527,94 @@ func UpdateOptionsBulk(values map[string]string) error {
 	if err != nil {
 		return err
 	}
-	BumpSyncTopic(SyncTopicOptions)
+	common.OptionMapRWMutex.Lock()
+	var publicationError error
 	for k, v := range values {
-		if err := updateOptionMap(k, v); err != nil {
-			return err
-		}
+		publicationError = errors.Join(publicationError, updateOptionMapLocked(k, v))
 	}
+	common.OptionMapRWMutex.Unlock()
 	if policySnapshot != nil {
 		requestPolicySnapshot.Store(policySnapshot)
 	}
+	BumpSyncTopic(SyncTopicOptions)
+	return publicationError
+}
+
+// lockEpaySigningOptions validates a complete signing candidate
+// from locked durable rows. Another node may still have an older active mode;
+// that node must not clear a key required by the mode already saved in the DB.
+func lockEpaySigningOptions(tx *gorm.DB, values map[string]string) error {
+	rows := []Option{
+		{Key: operation_setting.EpayMerchantPrivateKeyOptionKey},
+		{Key: operation_setting.EpayPlatformPublicKeyOptionKey},
+		{Key: operation_setting.EpaySignTypeOptionKey, Value: operation_setting.EpaySignTypeMD5},
+	}
+	changed := false
+	for _, row := range rows {
+		if _, exists := values[row.Key]; exists {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return nil
+	}
+	// Materialize absent rows before reading so the first configuration also
+	// serializes across nodes. This acquires SQLite's writer lock as well.
+	// Every caller takes the rows in this order, after any passkey domain rows.
+	candidate := make(map[string]string, len(rows))
+	for _, row := range rows {
+		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
+			return err
+		}
+		var stored Option
+		if err := lockForUpdate(tx).Where(&Option{Key: row.Key}).First(&stored).Error; err != nil {
+			return err
+		}
+		candidate[row.Key] = stored.Value
+		if value, exists := values[row.Key]; exists {
+			candidate[row.Key] = value
+		}
+		// MySQL can resolve a historical noncanonical spelling to this row.
+		// Both save paths and later reloads must retain the canonical key.
+		if stored.Key != row.Key {
+			if err := tx.Model(&Option{}).Where(&Option{Key: stored.Key}).Update("key", row.Key).Error; err != nil {
+				return err
+			}
+		}
+	}
+	if err := operation_setting.ValidateEpaySignOptions(candidate); err != nil {
+		return err
+	}
+	maps.Copy(values, candidate)
 	return nil
 }
 
-func updateOptionMap(key string, value string) (err error) {
-	if key == retiredThemeOptionKey || key == legacyAccessTokenRetireAtKey {
-		common.OptionMapRWMutex.Lock()
-		delete(common.OptionMap, key)
-		common.OptionMapRWMutex.Unlock()
-		return nil
-	}
+func updateOptionMap(key string, value string) error {
 	common.OptionMapRWMutex.Lock()
 	defer common.OptionMapRWMutex.Unlock()
+	return updateOptionMapLocked(key, value)
+}
+
+// updateOptionMapLocked publishes a value while the caller holds OptionMapRWMutex.
+// Bulk saves and reloads keep that lock across their entire payment snapshot.
+func updateOptionMapLocked(key string, value string) (err error) {
+	if key == retiredThemeOptionKey || key == legacyAccessTokenRetireAtKey {
+		delete(common.OptionMap, key)
+		return nil
+	}
+	if key == "DisplayInCurrencyEnabled" {
+		// The legacy key is a projection; saves and historical loads select
+		// the canonical type before publishing it through this function.
+		value = strconv.FormatBool(operation_setting.IsCurrencyDisplay())
+	}
 	common.OptionMap[key] = value
 
 	// 检查是否是模型配置 - 使用更规范的方式处理
 	if handleConfigUpdate(key, value) {
+		if key == "general_setting.quota_display_type" {
+			common.OptionMap["DisplayInCurrencyEnabled"] = strconv.FormatBool(operation_setting.IsCurrencyDisplay())
+		}
 		return nil // 已由配置系统处理
 	}
 
@@ -446,16 +665,6 @@ func updateOptionMap(key string, value string) (err error) {
 			common.QuotaRemindEnabled = boolValue
 		case "LogConsumeEnabled":
 			common.LogConsumeEnabled = boolValue
-		case "DisplayInCurrencyEnabled":
-			// 兼容旧字段：同步到新配置 general_setting.quota_display_type（运行时生效）
-			// true -> USD, false -> TOKENS
-			newVal := "USD"
-			if !boolValue {
-				newVal = "TOKENS"
-			}
-			if cfg := config.GlobalConfig.Get("general_setting"); cfg != nil {
-				_ = config.UpdateConfigFromMap(cfg, map[string]string{"quota_display_type": newVal})
-			}
 		case "DisplayTokenStatEnabled":
 			common.DisplayTokenStatEnabled = boolValue
 		case "DrawingEnabled":

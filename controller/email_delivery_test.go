@@ -42,6 +42,30 @@ func configureEmailDelivery(t *testing.T, options map[string]string) {
 	})
 }
 
+func configureEmailOptions(t *testing.T, options map[string]string) *gorm.DB {
+	t.Helper()
+	configureEmailDelivery(t, options)
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	require.NoError(t, db.AutoMigrate(&model.Option{}))
+	for key, value := range options {
+		require.NoError(t, db.Create(&model.Option{Key: key, Value: value}).Error)
+	}
+	previousDB, previousRedis := model.DB, common.RedisEnabled
+	previousType := common.MainDatabaseType()
+	model.DB, common.RedisEnabled = db, false
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		model.DB, common.RedisEnabled = previousDB, previousRedis
+		common.SetMainDatabaseType(previousType)
+	})
+	return db
+}
+
 func TestResendDeliversThroughSelectedProvider(t *testing.T) {
 	configureEmailDelivery(t, map[string]string{"EmailProvider": "resend", "ResendApiKey": "test-key", "ResendFrom": "New API <sender@example.com>"})
 	calls := 0
@@ -155,7 +179,7 @@ func TestEmailOptionsNeverReturnResendCredentials(t *testing.T) {
 func TestEmailProviderOptionRejectsInvalidValues(t *testing.T) {
 	for _, provider := range []string{"", "both", "SMTP", "smtp,resend"} {
 		t.Run(provider, func(t *testing.T) {
-			configureEmailDelivery(t, map[string]string{"EmailProvider": "smtp"})
+			db := configureEmailOptions(t, map[string]string{"EmailProvider": "smtp"})
 			body, err := common.Marshal(OptionUpdateRequest{Key: "EmailProvider", Value: provider})
 			require.NoError(t, err)
 			response := httptest.NewRecorder()
@@ -165,6 +189,9 @@ func TestEmailProviderOptionRejectsInvalidValues(t *testing.T) {
 			assert.Contains(t, response.Body.String(), `"success":false`)
 			assert.Contains(t, response.Body.String(), `"message_key":"Email sending method must be SMTP or Resend"`)
 			assert.Equal(t, "smtp", common.OptionMap["EmailProvider"])
+			var stored model.Option
+			require.NoError(t, db.Where(&model.Option{Key: "EmailProvider"}).First(&stored).Error)
+			assert.Equal(t, "smtp", stored.Value)
 		})
 	}
 }
@@ -178,27 +205,23 @@ func TestEmailProviderCannotActivateIncompleteResend(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			settings["EmailProvider"] = "smtp"
-			configureEmailDelivery(t, settings)
+			db := configureEmailOptions(t, settings)
 			response := httptest.NewRecorder()
 			context, _ := gin.CreateTestContext(response)
 			context.Request = httptest.NewRequest(http.MethodPut, "/api/option/", strings.NewReader(`{"key":"EmailProvider","value":"resend"}`))
-			require.NotPanics(t, func() { UpdateOption(context) }, "invalid activation must fail before accessing storage")
+			UpdateOption(context)
 			assert.Contains(t, response.Body.String(), `"success":false`)
 			assert.Contains(t, response.Body.String(), `"message_key":"Resend `)
 			assert.Equal(t, "smtp", common.OptionMap["EmailProvider"])
 			assert.NotContains(t, response.Body.String(), "test-key")
+			var stored model.Option
+			require.NoError(t, db.Where(&model.Option{Key: "EmailProvider"}).First(&stored).Error)
+			assert.Equal(t, "smtp", stored.Value)
 		})
 	}
 }
 
 func TestResendSettingsChangesKeepActiveDeliveryWorking(t *testing.T) {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
-	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&model.Option{}))
-	previousDB, previousRedis := model.DB, common.RedisEnabled
-	model.DB, common.RedisEnabled = db, false
-	t.Cleanup(func() { model.DB, common.RedisEnabled = previousDB, previousRedis })
-
 	tests := []struct {
 		name, provider, key, value string
 		saved                      bool
@@ -214,7 +237,7 @@ func TestResendSettingsChangesKeepActiveDeliveryWorking(t *testing.T) {
 			if test.provider == "smtp" {
 				settings["ResendApiKey"] = ""
 			}
-			configureEmailDelivery(t, settings)
+			db := configureEmailOptions(t, settings)
 			before := settings[test.key]
 			body, err := common.Marshal(OptionUpdateRequest{Key: test.key, Value: test.value})
 			require.NoError(t, err)
@@ -222,19 +245,23 @@ func TestResendSettingsChangesKeepActiveDeliveryWorking(t *testing.T) {
 			context, _ := gin.CreateTestContext(response)
 			context.Request = httptest.NewRequest(http.MethodPut, "/api/option/", strings.NewReader(string(body)))
 			UpdateOption(context)
+			var stored model.Option
+			require.NoError(t, db.Where(&model.Option{Key: test.key}).First(&stored).Error)
 			if test.saved {
 				assert.Contains(t, response.Body.String(), `"success":true`)
 				assert.Equal(t, test.value, common.OptionMap[test.key])
+				assert.Equal(t, test.value, stored.Value)
 				return
 			}
 			assert.Contains(t, response.Body.String(), `"message_key":"Resend `)
 			assert.Equal(t, before, common.OptionMap[test.key])
+			assert.Equal(t, before, stored.Value)
 		})
 	}
 }
 
 func TestEmailKeyStatusIsDerivedAndReadOnly(t *testing.T) {
-	configureEmailDelivery(t, map[string]string{"EmailProvider": "smtp", "ResendKeyConfigured": "true"})
+	db := configureEmailOptions(t, map[string]string{"EmailProvider": "smtp", "ResendKeyConfigured": "true"})
 	response := httptest.NewRecorder()
 	context, _ := gin.CreateTestContext(response)
 	context.Request = httptest.NewRequest(http.MethodGet, "/api/option/", nil)
@@ -248,4 +275,7 @@ func TestEmailKeyStatusIsDerivedAndReadOnly(t *testing.T) {
 	UpdateOption(context)
 	assert.Contains(t, response.Body.String(), `"success":false`)
 	assert.Contains(t, response.Body.String(), "read-only")
+	var stored model.Option
+	require.NoError(t, db.Where(&model.Option{Key: "ResendKeyConfigured"}).First(&stored).Error)
+	assert.Equal(t, "true", stored.Value)
 }

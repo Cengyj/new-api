@@ -1,21 +1,53 @@
 package router
 
 import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/iotest"
+	"time"
 
+	"github.com/Calcium-Ion/go-epay/epay"
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	sqlmysql "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/stripe/stripe-go/v81/webhook"
+	waffonet "github.com/waffo-com/waffo-go/net"
+	"github.com/waffo-com/waffo-go/types/order"
+	waffoutils "github.com/waffo-com/waffo-go/utils"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
 // accessTokenExemptRoutes are /api routes that never reach dashboard
@@ -79,10 +111,13 @@ var accessTokenHelperRoutes = map[string]authz.Permission{
 	"GET /api/audit":               authz.AuditRead,
 }
 
-func newAccessTokenScopeTestEngine(t *testing.T) *gin.Engine {
+func newAccessTokenScopeTestEngine(t *testing.T, setup ...func(*gin.Engine)) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
+	for _, configure := range setup {
+		configure(engine)
+	}
 	// A permission route that is also in the static table panics here.
 	require.NotPanics(t, func() {
 		SetApiRouter(engine)
@@ -198,5 +233,1448 @@ func TestAccessTokenVerificationScopesAreAllListed(t *testing.T) {
 	for _, scope := range scopes {
 		_, listed := service.AccessTokenVerificationScope(scope)
 		assert.True(t, listed, "verification scope %s has no access token rule", scope)
+	}
+}
+
+func TestReferralRoutesEnforceIdentityRolesAndTokenScopes(t *testing.T) {
+	previousDB, previousLogDB, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+	previousType := common.MainDatabaseType()
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "referral-auth.db")), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+		common.SetMainDatabaseType(previousType)
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserAccessToken{}, &model.AuditLog{}, &model.Option{}, &model.ReferralRebate{}, &model.AffiliateTransfer{}, &model.TopUp{}, &model.SubscriptionOrder{}, &model.Log{}))
+	require.NoError(t, model.InitializeReferralRebateRule(db))
+	users := []model.User{
+		{Username: "referral-normal", AffCode: "r-normal", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, AffQuota: 321, Group: "default"},
+		{Username: "referral-admin", AffCode: "r-admin", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AffQuota: 654, Group: "default"},
+		{Username: "referral-root", AffCode: "r-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, Group: "default"},
+	}
+	for i := range users {
+		require.NoError(t, db.Create(&users[i]).Error)
+	}
+	credit := 100
+	order := model.TopUp{UserId: users[0].Id, TradeNo: "referral-route-completion", Amount: 100, Money: 90, PaymentProvider: model.PaymentProviderEpay, Status: common.TopUpStatusPending, CreditedQuota: &credit}
+	require.NoError(t, db.Create(&order).Error)
+	engine := newAccessTokenScopeTestEngine(t)
+	for _, tc := range []struct {
+		name, method, path, scope, body string
+		user                            int
+		status                          int
+		quota                           string
+		failure                         bool
+	}{
+		{name: "anonymous", method: "GET", path: "/api/user/referral", user: -1, status: http.StatusUnauthorized},
+		{name: "own summary ignores injected identity", method: "GET", path: "/api/user/referral?user_id=2", scope: "wallet:read", user: 0, status: http.StatusOK, quota: "321"},
+		{name: "own list", method: "GET", path: "/api/user/referral/invitees?user_id=2", scope: "wallet:read", user: 0, status: http.StatusOK},
+		{name: "transfer result is a wallet read", method: "GET", path: "/api/user/aff_transfer/abcdefghijklmnop", scope: "wallet:read", user: 0, status: http.StatusOK},
+		{name: "profile scope cannot read wallet", method: "GET", path: "/api/user/referral", scope: "profile:read", user: 0, status: http.StatusForbidden},
+		{name: "user cannot read admin history", method: "GET", path: "/api/user/referral_rebates", scope: "billing:read", user: 0, status: http.StatusForbidden},
+		{name: "admin requires financial read scope", method: "GET", path: "/api/user/referral_rebates", scope: "user:read", user: 1, status: http.StatusForbidden},
+		{name: "wallet scope cannot read admin history", method: "GET", path: "/api/user/referral_rebates", scope: "wallet:read", user: 1, status: http.StatusForbidden},
+		{name: "admin reads history while disabled", method: "GET", path: "/api/user/referral_rebates", scope: "billing:read", user: 1, status: http.StatusOK},
+		{name: "anonymous cannot complete orders", method: "POST", path: "/api/user/topup/complete", user: -1, status: http.StatusUnauthorized, body: `{"trade_no":"referral-route-completion"}`},
+		{name: "user billing scope cannot complete orders", method: "POST", path: "/api/user/topup/complete", scope: "billing:write", user: 0, status: http.StatusForbidden, body: `{"trade_no":"referral-route-completion"}`},
+		{name: "admin read scope cannot complete orders", method: "POST", path: "/api/user/topup/complete", scope: "billing:read", user: 1, status: http.StatusForbidden, body: `{"trade_no":"referral-route-completion"}`},
+		{name: "admin billing write completes pending order", method: "POST", path: "/api/user/topup/complete", scope: "billing:write", user: 1, status: http.StatusOK, body: `{"trade_no":"referral-route-completion"}`},
+		{name: "root replay cannot credit completed order again", method: "POST", path: "/api/user/topup/complete", scope: "billing:write", user: 2, status: http.StatusOK, body: `{"trade_no":"referral-route-completion"}`},
+		{name: "anonymous cannot transfer rewards", method: "POST", path: "/api/user/aff_transfer", user: -1, status: http.StatusUnauthorized, body: `{"quota":25,"request_id":"referral-route-transfer"}`},
+		{name: "wallet read cannot transfer rewards", method: "POST", path: "/api/user/aff_transfer", scope: "wallet:read", user: 0, status: http.StatusForbidden, body: `{"quota":25,"request_id":"referral-route-transfer"}`},
+		{name: "wallet write transfers only own rewards", method: "POST", path: "/api/user/aff_transfer", scope: "wallet:write", user: 0, status: http.StatusOK, body: `{"quota":25,"request_id":"referral-route-transfer","user_id":2}`},
+		{name: "transfer replay remains successful while paused", method: "POST", path: "/api/user/aff_transfer", scope: "wallet:write", user: 0, status: http.StatusOK, body: `{"quota":25,"request_id":"referral-route-transfer"}`},
+		{name: "admin cannot change root settings", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 1, status: http.StatusForbidden},
+		{name: "root needs read scope", method: "GET", path: "/api/option/referral_rebate", scope: "wallet:read", user: 2, status: http.StatusForbidden},
+		{name: "root reads rule", method: "GET", path: "/api/option/referral_rebate", scope: "option:read", user: 2, status: http.StatusOK},
+		{name: "read scope cannot save", method: "PUT", path: "/api/option/referral_rebate", scope: "option:read", user: 2, status: http.StatusForbidden},
+		{name: "root saves default disabled rule", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":false,"percentage":"5","valid_days":"7"}`},
+		{name: "root cannot erase configured default rule", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":false,"percentage":"","valid_days":""}`, failure: true},
+		{name: "root saves complete unconfigured rule", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":false,"percentage":"","valid_days":""}`},
+		{name: "root cannot save only one rule field", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":true}`, failure: true},
+		{name: "general option endpoint cannot bypass rule validation", method: "PUT", path: "/api/option/", scope: "option:write", user: 2, status: http.StatusOK, body: `{"key":"ReferralRebateRule","value":"{}"}`, failure: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "root saves complete unconfigured rule" {
+				// Historical installations may have an explicitly empty rule. New
+				// installations now have configured, disabled defaults instead.
+				value, err := common.Marshal(model.ReferralRebateRule{})
+				require.NoError(t, err)
+				require.NoError(t, db.Model(&model.Option{}).Where(&model.Option{Key: model.ReferralRebateOptionKey}).Update("value", string(value)).Error)
+			}
+			if tc.name == "wallet write transfers only own rewards" || tc.name == "transfer replay remains successful while paused" {
+				previousPayment, previousUnit := *operation_setting.GetPaymentSetting(), common.QuotaPerUnit
+				operation_setting.GetPaymentSetting().ComplianceConfirmed = tc.name == "wallet write transfers only own rewards"
+				operation_setting.GetPaymentSetting().ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+				common.QuotaPerUnit = 10
+				t.Cleanup(func() {
+					*operation_setting.GetPaymentSetting(), common.QuotaPerUnit = previousPayment, previousUnit
+				})
+			}
+			request := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			request.Header.Set("Content-Type", "application/json")
+			if tc.user >= 0 {
+				raw := model.AccessTokenPrefix + strings.Repeat("x", 24) + strconv.Itoa(tc.user) + strings.ReplaceAll(tc.name, " ", "-")
+				token := model.UserAccessToken{Name: tc.name, TokenHash: model.AccessTokenFingerprint(raw), TokenHint: model.AccessTokenHint(raw)}
+				require.NoError(t, token.SetScopes([]string{tc.scope}))
+				require.NoError(t, model.CreateUserAccessToken(users[tc.user].Id, &token, service.AccessTokenMaxPerUser))
+				request.Header.Set("Authorization", "Bearer "+raw)
+			}
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			assert.Equal(t, tc.status, response.Code, response.Body.String())
+			if tc.status == http.StatusOK {
+				var result struct {
+					Success bool `json:"success"`
+					Data    struct {
+						AffQuota string `json:"aff_quota"`
+					} `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+				assert.Equal(t, !tc.failure, result.Success, response.Body.String())
+				if tc.quota != "" {
+					assert.Equal(t, tc.quota, result.Data.AffQuota)
+				}
+			}
+			if tc.name == "root reads rule" || tc.name == "root saves default disabled rule" || tc.name == "root cannot erase configured default rule" {
+				rule, err := model.GetReferralRebateRule()
+				require.NoError(t, err)
+				assert.Equal(t, model.ReferralRebateRule{RateBPS: 500, ValidDays: 7}, rule)
+			}
+		})
+	}
+	var creditedUser model.User
+	require.NoError(t, db.First(&creditedUser, users[0].Id).Error)
+	assert.Equal(t, credit+25, creditedUser.Quota)
+	assert.Equal(t, 321-25, creditedUser.AffQuota)
+	var unaffectedUser model.User
+	require.NoError(t, db.First(&unaffectedUser, users[1].Id).Error)
+	assert.Zero(t, unaffectedUser.Quota)
+	assert.Equal(t, 654, unaffectedUser.AffQuota)
+	var transfers []model.AffiliateTransfer
+	require.NoError(t, db.Find(&transfers).Error)
+	require.Len(t, transfers, 1)
+	assert.Equal(t, users[0].Id, transfers[0].UserID)
+	assert.Equal(t, 25, transfers[0].Quota)
+	require.NoError(t, db.First(&order, order.Id).Error)
+	assert.Equal(t, common.TopUpStatusSuccess, order.Status)
+	assert.Positive(t, order.CompleteTime)
+	var rebateCount int64
+	require.NoError(t, db.Model(&model.ReferralRebate{}).Count(&rebateCount).Error)
+	assert.Zero(t, rebateCount, "manual completion does not create eligibility for a historical user")
+
+	t.Run("dashboard login sessions enforce identity and revocation", func(t *testing.T) {
+		previousLogin, previousEncryption, previousTurnstile := common.PasswordLoginEnabled, common.PasswordLoginEncryptionEnabled, common.TurnstileCheckEnabled
+		previousSecret := common.SessionSecret
+		common.PasswordLoginEnabled, common.PasswordLoginEncryptionEnabled, common.TurnstileCheckEnabled = true, false, false
+		common.SessionSecret = "referral-route-session-test-secret"
+		t.Cleanup(func() {
+			common.PasswordLoginEnabled, common.PasswordLoginEncryptionEnabled, common.TurnstileCheckEnabled = previousLogin, previousEncryption, previousTurnstile
+			common.SessionSecret = previousSecret
+		})
+		require.NoError(t, db.AutoMigrate(&model.UserSession{}, &model.TwoFA{}, &model.PasskeyCredential{}))
+		hash, err := common.HashAccountPassword("referral-session-password")
+		require.NoError(t, err)
+		require.NoError(t, db.Model(&model.User{}).Where("id IN ?", []int{users[0].Id, users[2].Id}).Update("password", hash).Error)
+		for _, userIndex := range []int{0, 2} {
+			loginBody, err := common.Marshal(map[string]any{"username": users[userIndex].Username, "password": "referral-session-password"})
+			require.NoError(t, err)
+			loginRequest := httptest.NewRequest(http.MethodPost, "/api/user/login", strings.NewReader(string(loginBody)))
+			loginRequest.Header.Set("Content-Type", "application/json")
+			loginResponse := httptest.NewRecorder()
+			engine.ServeHTTP(loginResponse, loginRequest)
+			var login struct {
+				Success bool `json:"success"`
+				Data    struct {
+					AccessToken string `json:"access_token"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(loginResponse.Body.Bytes(), &login))
+			require.True(t, login.Success, loginResponse.Body.String())
+			require.NotEmpty(t, login.Data.AccessToken)
+			for _, path := range []string{"/api/user/referral?user_id=2", "/api/option/referral_rebate"} {
+				request := httptest.NewRequest(http.MethodGet, path, nil)
+				request.Header.Set("Authorization", "Bearer "+login.Data.AccessToken)
+				response := httptest.NewRecorder()
+				engine.ServeHTTP(response, request)
+				expectedStatus := http.StatusOK
+				if userIndex == 0 && path == "/api/option/referral_rebate" {
+					expectedStatus = http.StatusForbidden
+				}
+				assert.Equal(t, expectedStatus, response.Code, response.Body.String())
+				if userIndex == 0 && strings.Contains(path, "/user/referral") {
+					assert.Contains(t, response.Body.String(), `"aff_quota":"296"`)
+					assert.NotContains(t, response.Body.String(), `"aff_quota":"654"`)
+				}
+			}
+			cookieRequest := httptest.NewRequest(http.MethodPut, "/api/option/referral_rebate", strings.NewReader(`{"enabled":false,"percentage":"","valid_days":""}`))
+			cookieRequest.Header.Set("Origin", "https://untrusted.example")
+			for _, cookie := range loginResponse.Result().Cookies() {
+				cookieRequest.AddCookie(cookie)
+			}
+			cookieResponse := httptest.NewRecorder()
+			engine.ServeHTTP(cookieResponse, cookieRequest)
+			assert.Equal(t, http.StatusUnauthorized, cookieResponse.Code, "refresh cookies alone cannot authorize a rule write")
+			identity, err := service.ParseAccessToken(login.Data.AccessToken)
+			require.NoError(t, err)
+			_, err = model.RevokeUserSession(users[userIndex].Id, identity.SessionID, "referral_route_test")
+			require.NoError(t, err)
+			revokedRequest := httptest.NewRequest(http.MethodGet, "/api/user/referral", nil)
+			revokedRequest.Header.Set("Authorization", "Bearer "+login.Data.AccessToken)
+			revokedResponse := httptest.NewRecorder()
+			engine.ServeHTTP(revokedResponse, revokedRequest)
+			assert.Equal(t, http.StatusUnauthorized, revokedResponse.Code, revokedResponse.Body.String())
+		}
+	})
+}
+
+func TestWalletHistoryPanicPreservesFailureThroughAPICompression(t *testing.T) {
+	previousDB, previousLogDB, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+	previousType, previousLimit := common.MainDatabaseType(), common.GlobalApiRateLimitEnable
+	previousLog, previousErrorLog := common.LogWriter, common.ErrorLogWriter
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "history-compression.db")), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	common.GlobalApiRateLimitEnable = false
+	var output bytes.Buffer
+	common.LogWriter, common.ErrorLogWriter = &output, &output
+	t.Cleanup(func() {
+		assert.NoError(t, sqlDB.Close())
+		model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+		common.SetMainDatabaseType(previousType)
+		common.GlobalApiRateLimitEnable = previousLimit
+		common.LogWriter, common.ErrorLogWriter = previousLog, previousErrorLog
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserAccessToken{}, &model.AuditLog{}, &model.TopUp{}, &model.ReferralRebate{}, &model.AffiliateTransfer{}))
+	user := model.User{Username: "history-compression", AffCode: "history-compression", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Quota: 123, AffQuota: 45, AffHistoryQuota: 67, Group: "default"}
+	require.NoError(t, db.Create(&user).Error)
+	rawToken := model.AccessTokenPrefix + strings.Repeat("h", 32)
+	accessToken := model.UserAccessToken{Name: "history-compression", TokenHash: model.AccessTokenFingerprint(rawToken), TokenHint: model.AccessTokenHint(rawToken)}
+	require.NoError(t, accessToken.SetScopes([]string{"wallet:read", "billing:read"}))
+	require.NoError(t, model.CreateUserAccessToken(user.Id, &accessToken, service.AccessTokenMaxPerUser))
+	credit := 1000
+	order := model.TopUp{UserId: user.Id, TradeNo: "history-compression-original", Amount: 100, Money: 90, PaymentProvider: model.PaymentProviderEpay, Status: common.TopUpStatusPending, CreateTime: common.GetTimestamp(), CreditedQuota: &credit}
+	require.NoError(t, db.Create(&order).Error)
+	engine := newAccessTokenScopeTestEngine(t, func(engine *gin.Engine) {
+		engine.Use(middleware.PanicRecover(), middleware.RequestId())
+		middleware.SetUpLogger(engine)
+	})
+	for _, path := range []string{"/api/user/topup/self", "/api/user/topup"} {
+		for _, encoding := range []string{"identity", "gzip"} {
+			t.Run(path+"/"+encoding, func(t *testing.T) {
+				output.Reset()
+				injected := false
+				require.NoError(t, db.Callback().Query().After("gorm:query").Register("test:history_compression_panic", func(tx *gorm.DB) {
+					if !injected && tx.Statement.Table == "top_ups" && strings.Contains(strings.ToLower(tx.Statement.SQL.String()), "count(") {
+						injected = true
+						panic("history-query-private-panic-value")
+					}
+				}))
+				t.Cleanup(func() { assert.NoError(t, db.Callback().Query().Remove("test:history_compression_panic")) })
+				for attempt := range 2 {
+					request := httptest.NewRequest(http.MethodGet, path+"?keyword="+order.TradeNo, nil)
+					request.Header.Set("Authorization", "Bearer "+rawToken)
+					request.Header.Set("Accept-Encoding", encoding)
+					response := httptest.NewRecorder()
+					engine.ServeHTTP(response, request)
+					require.True(t, injected, "the actual SQL count must reach the panic boundary")
+					var requestAudits []model.AuditLog
+					require.NoError(t, db.Where("request_id = ? AND category = ?", response.Header().Get(common.RequestIdKey), model.AuditCategoryAccessToken).Find(&requestAudits).Error)
+					require.Len(t, requestAudits, 1)
+					assert.Equal(t, "access_token", requestAudits[0].AuthMethod)
+					body := response.Body.Bytes()
+					if encoding == "gzip" {
+						require.Equal(t, "gzip", response.Header().Get("Content-Encoding"))
+						reader, err := gzip.NewReader(bytes.NewReader(body))
+						require.NoError(t, err)
+						body, err = io.ReadAll(reader)
+						require.NoError(t, err)
+						require.NoError(t, reader.Close())
+					}
+					if attempt == 0 {
+						assert.Equal(t, http.StatusInternalServerError, response.Code)
+						assert.Equal(t, http.StatusInternalServerError, requestAudits[0].Status)
+						assert.False(t, requestAudits[0].Success)
+						assert.Contains(t, string(body), `"type":"new_api_panic"`)
+						assert.NotContains(t, string(body), order.TradeNo)
+						requestID := response.Header().Get(common.RequestIdKey)
+						require.NotEmpty(t, requestID)
+						assert.Contains(t, output.String(), requestID)
+						assert.Contains(t, output.String(), "panic_type=string")
+						assert.NotContains(t, output.String(), "history-query-private-panic-value")
+						assert.NotContains(t, string(body), "history-query-private-panic-value")
+						continue
+					}
+					require.Equal(t, http.StatusOK, response.Code)
+					assert.Equal(t, http.StatusOK, requestAudits[0].Status)
+					assert.True(t, requestAudits[0].Success)
+					var history struct {
+						Success bool
+						Data    struct {
+							Total int
+							Items []model.TopUp
+						}
+					}
+					require.NoError(t, common.Unmarshal(body, &history))
+					require.True(t, history.Success)
+					require.Equal(t, 1, history.Data.Total)
+					require.Len(t, history.Data.Items, 1)
+					assert.Equal(t, order.TradeNo, history.Data.Items[0].TradeNo)
+					assert.Equal(t, common.TopUpStatusPending, history.Data.Items[0].Status)
+					assert.Equal(t, credit, *history.Data.Items[0].CreditedQuota)
+				}
+			})
+		}
+	}
+	var unchanged model.User
+	require.NoError(t, db.First(&unchanged, user.Id).Error)
+	assert.Equal(t, []int{123, 45, 67}, []int{unchanged.Quota, unchanged.AffQuota, unchanged.AffHistoryQuota})
+	var rebates, transfers int64
+	require.NoError(t, db.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+	require.NoError(t, db.Model(&model.AffiliateTransfer{}).Count(&transfers).Error)
+	assert.Zero(t, rebates)
+	assert.Zero(t, transfers)
+}
+
+// Exercise the real public routing/middleware chain, rather than mounting a
+// callback directly. These local signed notifications do not prove that a real
+// payment provider has accepted a charge or can reach a deployed callback URL.
+func TestWalletPaymentRoutesVerifySignaturesAndSettleOnce(t *testing.T) {
+	previousDB, previousLogDB, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+	previousMainType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "payment-routes.db")), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
+	model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
+	common.SetDatabaseTypes(common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	previousRateEnabled, previousRateNum, previousRateDuration := common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration
+	previousBodyLimit := constant.AnonymousRequestBodyLimitKB
+	common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = true, 1000, 180
+	constant.AnonymousRequestBodyLimitKB = 1
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+		common.SetDatabaseTypes(previousMainType, previousLogType)
+		common.GlobalApiRateLimitEnable, common.GlobalApiRateLimitNum, common.GlobalApiRateLimitDuration = previousRateEnabled, previousRateNum, previousRateDuration
+		constant.AnonymousRequestBodyLimitKB = previousBodyLimit
+		require.NoError(t, sqlDB.Close())
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserAccessToken{}, &model.AuditLog{}, &model.Option{}, &model.ReferralRebate{}, &model.TopUp{}, &model.SubscriptionOrder{}, &model.Log{}))
+	paymentSetting := operation_setting.GetPaymentSetting()
+	previousCompliance, previousTerms := paymentSetting.ComplianceConfirmed, paymentSetting.ComplianceTermsVersion
+	paymentSetting.ComplianceConfirmed, paymentSetting.ComplianceTermsVersion = true, operation_setting.CurrentComplianceTermsVersion
+	t.Cleanup(func() {
+		paymentSetting.ComplianceConfirmed, paymentSetting.ComplianceTermsVersion = previousCompliance, previousTerms
+	})
+	require.NoError(t, model.InitializeReferralRebateRule(db))
+	require.NoError(t, model.SaveReferralRebateRule(model.ReferralRebateRule{Enabled: true, RateBPS: 1000, ValidDays: 30}))
+	keys, err := waffoutils.GenerateKeyPair()
+	require.NoError(t, err)
+	wrongKeys, err := waffoutils.GenerateKeyPair()
+	require.NoError(t, err)
+	merchantKeys, err := waffoutils.GenerateKeyPair()
+	require.NoError(t, err)
+	productionKeys, err := waffoutils.GenerateKeyPair()
+	require.NoError(t, err)
+	stringsToRestore := []*string{
+		&setting.StripeApiSecret, &setting.StripeWebhookSecret, &setting.StripePriceId,
+		&setting.CreemApiKey, &setting.CreemProducts, &setting.CreemWebhookSecret,
+		&setting.WaffoApiKey, &setting.WaffoPrivateKey, &setting.WaffoPublicCert, &setting.WaffoMerchantId,
+		&setting.WaffoPancakeMerchantID, &setting.WaffoPancakePrivateKey, &setting.WaffoPancakeProductID, &setting.WaffoPancakeStoreID,
+		&operation_setting.PayAddress, &operation_setting.EpayId, &operation_setting.EpayKey,
+	}
+	previousStrings := make([]string, len(stringsToRestore))
+	for i, value := range stringsToRestore {
+		previousStrings[i] = *value
+	}
+	previousWaffoEnabled, previousSandbox, previousCreemTest, previousMethods := setting.WaffoEnabled, setting.WaffoSandbox, setting.CreemTestMode, operation_setting.PayMethods
+	t.Cleanup(func() {
+		for i, value := range stringsToRestore {
+			*value = previousStrings[i]
+		}
+		setting.WaffoEnabled, setting.WaffoSandbox, setting.CreemTestMode, operation_setting.PayMethods = previousWaffoEnabled, previousSandbox, previousCreemTest, previousMethods
+	})
+	setting.StripeApiSecret, setting.StripeWebhookSecret, setting.StripePriceId = "sk_test_route_fixture", "whsec_route_fixture", "price_route_fixture"
+	setting.CreemApiKey, setting.CreemProducts, setting.CreemWebhookSecret = "creem_route_key", "[{}]", "creem_route_secret"
+	setting.CreemTestMode = false
+	setting.WaffoEnabled, setting.WaffoSandbox = true, false
+	setting.WaffoApiKey, setting.WaffoPrivateKey, setting.WaffoPublicCert, setting.WaffoMerchantId = "waffo_route_key", merchantKeys.PrivateKey, keys.PublicKey, "merchant_route_fixture"
+	oldWaffoTransport := service.WaffoHTTPTransport
+	t.Cleanup(func() { service.WaffoHTTPTransport = oldWaffoTransport })
+	waffoFacts := make(map[string]map[string]any)
+	waffoInquiryFailure := false
+	service.WaffoHTTPTransport = paymentRouteWaffoTransport(func(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		require.Equal(t, http.MethodPost, request.Method)
+		require.True(t, strings.HasSuffix(request.URL, "/order/inquiry"))
+		require.Equal(t, "waffo_route_key", request.Headers["X-API-KEY"])
+		require.True(t, waffoutils.Verify(string(request.Body), request.Headers["X-SIGNATURE"], merchantKeys.PublicKey))
+		var query order.InquiryOrderParams
+		require.NoError(t, common.Unmarshal(request.Body, &query))
+		if waffoInquiryFailure {
+			return nil, errors.New("isolated merchant inquiry unavailable")
+		}
+		data, exists := waffoFacts[query.PaymentRequestID]
+		require.True(t, exists, "inquiry must use the original merchant order")
+		body, err := common.Marshal(map[string]any{"code": "0", "data": data})
+		require.NoError(t, err)
+		signature, err := waffoutils.Sign(string(body), keys.PrivateKey)
+		require.NoError(t, err)
+		return waffonet.NewHttpResponse(http.StatusOK, map[string]string{"X-SIGNATURE": signature}, body), nil
+	})
+	setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey, setting.WaffoPancakeProductID, setting.WaffoPancakeStoreID = "MER_AbCdEfGhIjKlMnOpQrStUv", keys.PrivateKey, "product_route_fixture", "store_route_fixture"
+	// This is the SDK's existing public-key injection contract, not a mock of
+	// signature verification and not an application-level verification bypass.
+	t.Setenv("WAFFO_WEBHOOK_TEST_PUBLIC_KEY", keys.PublicKey)
+	t.Setenv("WAFFO_WEBHOOK_PROD_PUBLIC_KEY", productionKeys.PublicKey)
+	t.Setenv("WAFFO_WEBHOOK_PUBLIC_KEY", "")
+	operation_setting.PayAddress, operation_setting.EpayId, operation_setting.EpayKey = "https://pay.example.invalid", "epay_route_id", "epay_route_secret"
+	operation_setting.PayMethods = []map[string]string{{"type": "alipay"}}
+	var accessLog bytes.Buffer
+	previousWriter := gin.DefaultWriter
+	gin.DefaultWriter = &accessLog
+	t.Cleanup(func() { gin.DefaultWriter = previousWriter })
+	engine := newAccessTokenScopeTestEngine(t, middleware.SetUpLogger)
+	admin := model.User{Username: "payment-route-admin", AffCode: "route-admin", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, Group: "default"}
+	require.NoError(t, db.Create(&admin).Error)
+	adminRaw := model.AccessTokenPrefix + strings.Repeat("a", 32)
+	adminToken := model.UserAccessToken{Name: "payment-route-admin", TokenHash: model.AccessTokenFingerprint(adminRaw), TokenHint: model.AccessTokenHint(adminRaw)}
+	require.NoError(t, adminToken.SetScopes([]string{"billing:read", "billing:write"}))
+	require.NoError(t, model.CreateUserAccessToken(admin.Id, &adminToken, service.AccessTokenMaxPerUser))
+	for i, tc := range []struct{ provider, method, environment string }{
+		{model.PaymentProviderEpay, http.MethodGet, ""}, {model.PaymentProviderEpay, http.MethodPost, ""},
+		{model.PaymentProviderStripe, http.MethodPost, ""}, {model.PaymentProviderCreem, http.MethodPost, ""},
+		{model.PaymentProviderWaffo, http.MethodPost, ""},
+		{model.PaymentProviderWaffoPancake, http.MethodPost, "test"}, {model.PaymentProviderWaffoPancake, http.MethodPost, "prod"},
+	} {
+		t.Run(tc.provider+"/"+tc.method+"/"+tc.environment, func(t *testing.T) {
+			name := "route-" + tc.provider + "-" + tc.method + tc.environment
+			now := time.Now().Unix()
+			inviter := model.User{Username: "route-inviter-" + strconv.Itoa(i), AffCode: "route-aff-" + strconv.Itoa(i), Status: common.UserStatusEnabled, Role: common.RoleCommonUser, AffQuota: 7, AffHistoryQuota: 11, Group: "default"}
+			require.NoError(t, db.Create(&inviter).Error)
+			buyer := model.User{Username: "route-buyer-" + strconv.Itoa(i), AffCode: "route-buyer-aff-" + strconv.Itoa(i), Status: common.UserStatusEnabled, Role: common.RoleCommonUser, Quota: -10, InviterId: inviter.Id, CreatedAt: now - 60, ReferralRateBPS: 1000, ReferralExpiresAt: now + 3600, Group: "default"}
+			require.NoError(t, db.Create(&buyer).Error)
+			credit, merchant := 1000, setting.WaffoMerchantId
+			money := 90.0
+			if tc.provider == model.PaymentProviderStripe {
+				money = 100
+			}
+			method := tc.provider
+			if method == model.PaymentProviderEpay {
+				method = "alipay"
+			}
+			order := model.TopUp{UserId: buyer.Id, TradeNo: name, Amount: 100, Money: money, PaymentMethod: method, PaymentProvider: tc.provider, Status: common.TopUpStatusPending, CreditedQuota: &credit}
+			if tc.provider == model.PaymentProviderCreem {
+				order.Amount = 1000
+			}
+			if tc.provider == model.PaymentProviderWaffo {
+				order.WaffoMerchantID = &merchant
+				waffoFacts[name] = map[string]any{"merchantOrderId": name, "paymentRequestId": name, "acquiringOrderId": "acquiring_" + name, "orderStatus": "PAY_SUCCESS", "orderAmount": "90.00", "orderCurrency": "USD", "merchantInfo": map[string]any{"merchantId": merchant}, "userInfo": map[string]any{"userId": strconv.Itoa(buyer.Id)}}
+			}
+			require.NoError(t, db.Create(&order).Error)
+			foreignProvider := model.PaymentProviderEpay
+			if tc.provider == model.PaymentProviderEpay {
+				foreignProvider = model.PaymentProviderStripe
+			}
+			foreign := model.TopUp{UserId: buyer.Id, TradeNo: name + "-foreign", Amount: 100, Money: money, PaymentProvider: foreignProvider, Status: common.TopUpStatusPending, CreditedQuota: &credit}
+			require.NoError(t, db.Create(&foreign).Error)
+			var pancakeInquiryMode atomic.Value
+			pancakeInquiryMode.Store("")
+			var pancakeQueries atomic.Int32
+			if tc.provider == model.PaymentProviderWaffoPancake {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+					pancakeQueries.Add(1)
+					assert.Equal(t, "/v1/graphql", request.URL.Path)
+					assert.Equal(t, setting.WaffoPancakeMerchantID, request.Header.Get("X-Merchant-Id"))
+					raw, err := io.ReadAll(request.Body)
+					if !assert.NoError(t, err) {
+						return
+					}
+					hash := sha256.Sum256(raw)
+					canonical := "POST\n/v1/graphql\n" + request.Header.Get("X-Timestamp") + "\n" + base64.StdEncoding.EncodeToString(hash[:])
+					assert.True(t, waffoutils.Verify(canonical, request.Header.Get("X-Signature"), keys.PublicKey))
+					var query struct {
+						Variables map[string]string `json:"variables"`
+					}
+					assert.NoError(t, common.Unmarshal(raw, &query))
+					assert.Equal(t, "ORD_route_fixture", query.Variables["id"])
+					mode := pancakeInquiryMode.Load().(string)
+					if mode == "inquiry-unavailable" {
+						_, _ = w.Write([]byte(`{"data":{"onetimeOrder":null}}`))
+						return
+					}
+					testMode := tc.environment == "test"
+					if mode == "inquiry-other-environment" {
+						testMode = !testMode
+					}
+					body, err := common.Marshal(map[string]any{"data": map[string]any{"onetimeOrder": map[string]any{
+						"id": "ORD_route_fixture", "orderMerchantExternalId": name, "status": "completed", "testMode": testMode, "currency": "USD",
+						"store": map[string]string{"id": "store_route_fixture"}, "priceSnapshot": map[string]string{"currency": "USD", "subtotal": strconv.FormatFloat(money, 'f', 2, 64)},
+					}}})
+					if assert.NoError(t, err) {
+						_, _ = w.Write(body)
+					}
+				}))
+				target, err := url.Parse(server.URL)
+				require.NoError(t, err)
+				oldClient := http.DefaultClient
+				http.DefaultClient = &http.Client{Transport: paymentRoutePancakeTransport(func(request *http.Request) (*http.Response, error) {
+					if request.URL.Host != "api.waffo.ai" || request.URL.Path != "/v1/graphql" {
+						return nil, fmt.Errorf("unexpected Pancake inquiry URL: %s", request.URL)
+					}
+					local := request.Clone(request.Context())
+					local.URL.Scheme, local.URL.Host = target.Scheme, target.Host
+					return server.Client().Transport.RoundTrip(local)
+				})}
+				t.Cleanup(func() { http.DefaultClient = oldClient; server.Close() })
+			}
+			variants := []string{"wrong-key", "tampered", "missing-signature", "malformed-signature", "unrelated-event", "wrong-binding", "cross-channel"}
+			if tc.provider == model.PaymentProviderWaffo {
+				variants = append(variants, "inquiry-unavailable", "inquiry-amount-mismatch")
+			}
+			if tc.method == http.MethodPost {
+				variants = append(variants, "oversized-body")
+			}
+			if tc.provider == model.PaymentProviderStripe || tc.provider == model.PaymentProviderWaffoPancake {
+				variants = append(variants, "expired-signature")
+			}
+			if tc.provider == model.PaymentProviderWaffoPancake {
+				variants = append(variants, "other-environment-key", "inquiry-other-environment", "inquiry-unavailable")
+			}
+			variants = append(variants, "valid", "duplicate", "manual-replay")
+			for _, variant := range variants {
+				t.Run(variant, func(t *testing.T) {
+					pancakeInquiryMode.Store(variant)
+					if variant == "duplicate" {
+						pancakeInquiryMode.Store("inquiry-unavailable")
+					}
+					previousPancakeQueries := pancakeQueries.Load()
+					signingKeys := keys
+					if tc.provider == model.PaymentProviderWaffoPancake && tc.environment == "prod" {
+						signingKeys = productionKeys
+					}
+					if variant == "wrong-key" {
+						signingKeys = wrongKeys
+					} else if variant == "other-environment-key" {
+						signingKeys = productionKeys
+						if tc.environment == "prod" {
+							signingKeys = keys
+						}
+					}
+					request := signedPaymentRouteRequest(t, signingKeys, tc.provider, name, buyer.Id, variant, tc.environment)
+					if tc.method == http.MethodGet {
+						body, err := io.ReadAll(request.Body)
+						require.NoError(t, err)
+						request = httptest.NewRequest(http.MethodGet, request.URL.Path+"?"+string(body), nil)
+						if variant == "duplicate" {
+							// Repeated, encoded names must reach the real verifier unchanged.
+							signature := request.URL.Query().Get("sign")
+							query := strings.ReplaceAll(request.URL.RawQuery, "sign=", "%73ign=")
+							query += "&sign=" + url.QueryEscape(signature)
+							request = httptest.NewRequest(http.MethodGet, request.URL.Path+"?"+query, nil)
+						}
+					}
+					if variant == "manual-replay" {
+						body, err := common.Marshal(map[string]string{"trade_no": name})
+						require.NoError(t, err)
+						request = httptest.NewRequest(http.MethodPost, "/api/user/topup/complete", bytes.NewReader(body))
+						request.Header.Set("Content-Type", "application/json")
+						request.Header.Set("Authorization", "Bearer "+adminRaw)
+					}
+					if tc.provider != model.PaymentProviderEpay && (variant == "valid" || variant == "duplicate") {
+						request.URL.RawQuery = "%73ign=route-private-signature&key=route-private-key&code=route-private-code&code=route-private-code-2"
+						request.RequestURI = request.URL.RequestURI()
+					}
+					request.RemoteAddr = "198.51.100." + strconv.Itoa(40+i) + ":10000"
+					response := httptest.NewRecorder()
+					if tc.provider == model.PaymentProviderWaffo {
+						waffoInquiryFailure = variant == "inquiry-unavailable"
+						waffoFacts[name]["orderAmount"] = "90.00"
+						if variant == "inquiry-amount-mismatch" {
+							waffoFacts[name]["orderAmount"] = "1.00"
+						}
+					}
+					originalURL, originalQuery, originalURI := request.URL.String(), request.URL.RawQuery, request.RequestURI
+					accessLog.Reset()
+					engine.ServeHTTP(response, request)
+					assert.Equal(t, originalURL, request.URL.String())
+					assert.Equal(t, originalQuery, request.URL.RawQuery)
+					assert.Equal(t, originalURI, request.RequestURI)
+					assert.Contains(t, accessLog.String(), request.URL.Path)
+					if signature := request.URL.Query().Get("sign"); signature != "" {
+						assert.NotContains(t, accessLog.String(), signature)
+						assert.NotContains(t, accessLog.String(), "?")
+					}
+					if tc.provider == model.PaymentProviderWaffoPancake {
+						wantQueries := previousPancakeQueries
+						if variant == "valid" || strings.HasPrefix(variant, "inquiry-") {
+							wantQueries++
+						}
+						assert.Equal(t, wantQueries, pancakeQueries.Load())
+					}
+					settled := variant == "valid" || variant == "duplicate" || variant == "manual-replay"
+					wantStatus := http.StatusOK
+					switch variant {
+					case "inquiry-other-environment", "inquiry-unavailable":
+						if tc.provider == model.PaymentProviderWaffoPancake {
+							wantStatus = http.StatusInternalServerError
+						}
+					case "wrong-key", "tampered", "missing-signature", "malformed-signature", "expired-signature", "other-environment-key":
+						switch tc.provider {
+						case model.PaymentProviderStripe, model.PaymentProviderWaffo:
+							wantStatus = http.StatusBadRequest
+						case model.PaymentProviderCreem, model.PaymentProviderWaffoPancake:
+							wantStatus = http.StatusUnauthorized
+						}
+					case "cross-channel":
+						if tc.provider == model.PaymentProviderStripe || tc.provider == model.PaymentProviderCreem {
+							wantStatus = http.StatusInternalServerError
+						}
+					case "oversized-body":
+						wantStatus = http.StatusRequestEntityTooLarge
+					}
+					assert.Equal(t, wantStatus, response.Code, response.Body.String())
+					if wantStatus == http.StatusOK {
+						if variant == "manual-replay" {
+							assert.Contains(t, response.Body.String(), "\"success\":true")
+						} else if tc.provider == model.PaymentProviderEpay {
+							wantBody := "fail"
+							if settled || variant == "unrelated-event" {
+								wantBody = "success"
+							}
+							assert.Equal(t, wantBody, response.Body.String())
+						} else if tc.provider == model.PaymentProviderWaffo {
+							assert.True(t, waffoutils.Verify(response.Body.String(), response.Header().Get("X-SIGNATURE"), merchantKeys.PublicKey))
+							if settled || variant == "unrelated-event" {
+								assert.Contains(t, response.Body.String(), "\"message\":\"success\"")
+							} else {
+								assert.Contains(t, response.Body.String(), "\"message\":\"failed\"")
+							}
+						}
+					}
+					require.NoError(t, db.First(&buyer, buyer.Id).Error)
+					require.NoError(t, db.First(&inviter, inviter.Id).Error)
+					require.NoError(t, db.First(&order, order.Id).Error)
+					require.NoError(t, db.First(&foreign, foreign.Id).Error)
+					assert.Equal(t, common.TopUpStatusPending, foreign.Status)
+					assert.Zero(t, foreign.CompleteTime)
+					var foreignFacts int64
+					require.NoError(t, db.Model(&model.ReferralRebate{}).Where("top_up_id = ?", foreign.Id).Count(&foreignFacts).Error)
+					assert.Zero(t, foreignFacts)
+					var facts []model.ReferralRebate
+					require.NoError(t, db.Where("top_up_id = ?", order.Id).Find(&facts).Error)
+					if settled {
+						assert.Equal(t, 990, buyer.Quota)
+						assert.Equal(t, 107, inviter.AffQuota)
+						assert.Equal(t, 111, inviter.AffHistoryQuota)
+						assert.Equal(t, common.TopUpStatusSuccess, order.Status)
+						if tc.provider == model.PaymentProviderEpay {
+							assert.Equal(t, "wxpay", order.PaymentMethod)
+						}
+						assert.GreaterOrEqual(t, order.CompleteTime, now)
+						require.Len(t, facts, 1)
+						assert.Equal(t, order.Id, facts[0].TopUpID)
+						assert.Equal(t, name, facts[0].TradeNo)
+						assert.Equal(t, inviter.Id, facts[0].InviterID)
+						assert.Equal(t, buyer.Id, facts[0].InviteeID)
+						assert.EqualValues(t, 1000, facts[0].CreditedQuota)
+						assert.EqualValues(t, 100, facts[0].RewardQuota)
+					} else {
+						assert.Equal(t, -10, buyer.Quota)
+						assert.Equal(t, 7, inviter.AffQuota)
+						assert.Equal(t, 11, inviter.AffHistoryQuota)
+						assert.Equal(t, common.TopUpStatusPending, order.Status)
+						assert.Zero(t, order.CompleteTime)
+						assert.Empty(t, facts)
+					}
+				})
+			}
+			// Close the HTTP chain with actual token authentication, never c.Set(id).
+			raw := model.AccessTokenPrefix + strings.Repeat("u", 24) + strconv.Itoa(inviter.Id)
+			token := model.UserAccessToken{Name: name, TokenHash: model.AccessTokenFingerprint(raw), TokenHint: model.AccessTokenHint(raw)}
+			require.NoError(t, token.SetScopes([]string{"wallet:read"}))
+			require.NoError(t, model.CreateUserAccessToken(inviter.Id, &token, service.AccessTokenMaxPerUser))
+			summaryRequest := httptest.NewRequest(http.MethodGet, "/api/user/referral", nil)
+			summaryRequest.Header.Set("Authorization", "Bearer "+raw)
+			summaryResponse := httptest.NewRecorder()
+			engine.ServeHTTP(summaryResponse, summaryRequest)
+			require.Equal(t, http.StatusOK, summaryResponse.Code, summaryResponse.Body.String())
+			var summary struct {
+				Success bool
+				Data    model.ReferralSummary
+			}
+			require.NoError(t, common.Unmarshal(summaryResponse.Body.Bytes(), &summary))
+			assert.True(t, summary.Success)
+			assert.Equal(t, "107", summary.Data.AffQuota)
+			assert.Equal(t, "111", summary.Data.AffHistoryQuota)
+			assert.Equal(t, "100", summary.Data.RebateQuota)
+			assert.EqualValues(t, 1, summary.Data.DirectCount)
+			query := "/api/user/referral_rebates?inviter_id=" + strconv.Itoa(inviter.Id) + "&trade_no=" + url.QueryEscape(name)
+			adminRequest := httptest.NewRequest(http.MethodGet, query, nil)
+			adminRequest.Header.Set("Authorization", "Bearer "+adminRaw)
+			adminResponse := httptest.NewRecorder()
+			engine.ServeHTTP(adminResponse, adminRequest)
+			require.Equal(t, http.StatusOK, adminResponse.Code, adminResponse.Body.String())
+			var page struct {
+				Success bool
+				Data    model.ReferralRebatePage
+			}
+			require.NoError(t, common.Unmarshal(adminResponse.Body.Bytes(), &page))
+			assert.True(t, page.Success)
+			assert.EqualValues(t, 1, page.Data.Total)
+			assert.Equal(t, "1000", page.Data.CreditedQuota)
+			assert.Equal(t, "100", page.Data.RewardQuota)
+			require.Len(t, page.Data.Items, 1)
+			assert.Equal(t, order.Id, page.Data.Items[0].TopUpID)
+			assert.Equal(t, inviter.Id, page.Data.Items[0].InviterID)
+			assert.Equal(t, buyer.Id, page.Data.Items[0].InviteeID)
+		})
+	}
+}
+
+// Generate protocol signatures with the installed SDK algorithms and local
+// credentials, then let SetApiRouter read the original bytes and authenticate.
+type paymentRouteWaffoTransport func(context.Context, *waffonet.HttpRequest) (*waffonet.HttpResponse, error)
+
+func (transport paymentRouteWaffoTransport) Send(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+	return transport(ctx, request)
+}
+
+type paymentRoutePancakeTransport func(*http.Request) (*http.Response, error)
+
+func (transport paymentRoutePancakeTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
+func signedPaymentRouteRequest(t *testing.T, keys *waffoutils.KeyPair, provider, tradeNo string, buyerID int, variant, environment string) *http.Request {
+	t.Helper()
+	if variant == "cross-channel" {
+		tradeNo += "-foreign"
+	}
+	if provider == model.PaymentProviderEpay {
+		params := map[string]string{"pid": operation_setting.EpayId, "type": "alipay", "name": "route fixture", "out_trade_no": tradeNo, "trade_status": epay.StatusTradeSuccess, "money": "90.00", "sign_type": "MD5"}
+		if variant == "unrelated-event" {
+			params["trade_status"] = "WAIT_BUYER_PAY"
+		}
+		if variant == "wrong-binding" {
+			params["out_trade_no"] += "-unknown"
+		}
+		// Epay reports the final chosen method; it may legitimately differ
+		// from the original checkout. Provider/order binding is the guard.
+		if variant == "valid" || variant == "duplicate" {
+			params["type"] = "wxpay"
+		}
+		secret := operation_setting.EpayKey
+		if variant == "wrong-key" {
+			secret += "_wrong"
+		}
+		signed, err := epay.GenerateParamsWithError(params, secret)
+		require.NoError(t, err)
+		switch variant {
+		case "tampered":
+			signed["name"] += " changed"
+		case "missing-signature":
+			delete(signed, "sign")
+		case "malformed-signature":
+			signed["sign"] = "invalid"
+		}
+		encoded := make(url.Values, len(signed))
+		for key, value := range signed {
+			encoded.Set(key, value)
+		}
+		body := encoded.Encode()
+		if variant == "oversized-body" {
+			body = strings.Repeat("x", 1025)
+		}
+		request := httptest.NewRequest(http.MethodPost, "/api/user/epay/notify", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return request
+	}
+	path := "/api/" + provider + "/webhook"
+	var payload map[string]any
+	switch provider {
+	case model.PaymentProviderStripe:
+		object := map[string]any{"id": "cs_route_fixture", "mode": "payment", "payment_link": nil, "status": "complete", "payment_status": "paid", "client_reference_id": tradeNo, "customer": "cus_route_fixture", "currency": "usd", "amount_total": 9000}
+		eventType := "checkout.session.completed"
+		if variant == "unrelated-event" {
+			eventType = "customer.created"
+		}
+		if variant == "wrong-binding" {
+			object["payment_link"] = "plink_other"
+		}
+		payload = map[string]any{"id": "evt_route_fixture", "object": "event", "type": eventType, "data": map[string]any{"object": object}}
+	case model.PaymentProviderCreem:
+		eventType := "checkout.completed"
+		if variant == "unrelated-event" {
+			eventType = "checkout.expired"
+		}
+		orderType := "onetime"
+		if variant == "wrong-binding" {
+			orderType = "recurring"
+		}
+		payload = map[string]any{"id": "evt_route_fixture", "eventType": eventType, "object": map[string]any{"id": "ch_route_fixture", "request_id": tradeNo, "order": map[string]any{"id": "ord_route_fixture", "status": "paid", "type": orderType, "currency": "USD", "amount": 9000, "amount_paid": 9000}}}
+	case model.PaymentProviderWaffo:
+		eventType, merchant := "PAYMENT_NOTIFICATION", setting.WaffoMerchantId
+		if variant == "unrelated-event" {
+			eventType = "UNRELATED_NOTIFICATION"
+		}
+		if variant == "wrong-binding" {
+			merchant = "other_merchant"
+		}
+		payload = map[string]any{"eventType": eventType, "result": map[string]any{"merchantOrderId": tradeNo, "paymentRequestId": tradeNo, "orderStatus": "PAY_SUCCESS", "orderAmount": "90.00", "orderCurrency": "USD", "merchantInfo": map[string]any{"merchantId": merchant}}}
+	case model.PaymentProviderWaffoPancake:
+		path = "/api/waffo-pancake/webhook/" + environment
+		eventType := "order.completed"
+		if variant == "unrelated-event" {
+			eventType = "order.pending"
+		}
+		if variant == "wrong-binding" {
+			path = "/api/waffo-pancake/webhook/prod"
+			if environment == "prod" {
+				path = "/api/waffo-pancake/webhook/test"
+			}
+		}
+		payload = map[string]any{"id": "evt_route_fixture", "eventType": eventType, "mode": environment, "storeId": setting.WaffoPancakeStoreID, "data": map[string]any{"orderId": "ORD_route_fixture", "orderMerchantExternalId": tradeNo, "merchantProvidedBuyerIdentity": service.WaffoPancakeBuyerIdentityFromUserID(buyerID), "amount": "90.00", "currency": "USD"}}
+	default:
+		t.Fatalf("unsupported payment fixture provider %s", provider)
+	}
+	body, err := common.Marshal(payload)
+	require.NoError(t, err)
+	header, signature := "", ""
+	switch provider {
+	case model.PaymentProviderStripe:
+		secret := setting.StripeWebhookSecret
+		if variant == "wrong-key" {
+			secret += "_wrong"
+		}
+		timestamp := time.Now()
+		if variant == "expired-signature" {
+			timestamp = timestamp.Add(-6 * time.Minute)
+		}
+		signed := webhook.GenerateTestSignedPayload(&webhook.UnsignedPayload{Payload: body, Secret: secret, Timestamp: timestamp})
+		header, signature = "Stripe-Signature", signed.Header
+	case model.PaymentProviderCreem:
+		secret := setting.CreemWebhookSecret
+		if variant == "wrong-key" {
+			secret += "_wrong"
+		}
+		mac := hmac.New(sha256.New, []byte(secret))
+		_, err = mac.Write(body)
+		require.NoError(t, err)
+		header, signature = "creem-signature", hex.EncodeToString(mac.Sum(nil))
+	case model.PaymentProviderWaffo:
+		header = "X-SIGNATURE"
+		signature, err = waffoutils.Sign(string(body), keys.PrivateKey)
+		require.NoError(t, err)
+	case model.PaymentProviderWaffoPancake:
+		timestamp := time.Now()
+		if variant == "expired-signature" {
+			timestamp = timestamp.Add(-46 * time.Minute)
+		}
+		millis := strconv.FormatInt(timestamp.UnixMilli(), 10)
+		signed, err := waffoutils.Sign(millis+"."+string(body), keys.PrivateKey)
+		require.NoError(t, err)
+		header, signature = "X-Waffo-Signature", "t="+millis+",v1="+signed
+	}
+	switch variant {
+	case "tampered":
+		body = append(body, ' ')
+	case "malformed-signature":
+		signature = "invalid"
+	case "missing-signature":
+		signature = ""
+	case "oversized-body":
+		body = []byte(strings.Repeat("x", 1025))
+	}
+	request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	if signature != "" {
+		request.Header.Set(header, signature)
+	}
+	return request
+}
+
+func TestRefreshRoutePreservesValidCredentialDuringSessionLookupOutage(t *testing.T) {
+	previousDB, previousLogDB, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+	previousType, previousSecret := common.MainDatabaseType(), common.SessionSecret
+	previousSecure, previousTrusted := common.SessionCookieSecure, common.SessionCookieTrustedURLs
+	previousGlobalLimit, previousCriticalLimit := common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable
+	path := filepath.Join(t.TempDir(), "refresh-outage.db")
+	db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}))
+	model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	common.SessionSecret = "isolated-refresh-outage-regression-secret"
+	common.SessionCookieSecure, common.SessionCookieTrustedURLs = true, nil
+	common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable = false, false
+	t.Cleanup(func() {
+		if sqlDB, err := model.DB.DB(); err == nil {
+			_ = sqlDB.Close()
+		}
+		model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+		common.SetMainDatabaseType(previousType)
+		common.SessionSecret = previousSecret
+		common.SessionCookieSecure, common.SessionCookieTrustedURLs = previousSecure, previousTrusted
+		common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable = previousGlobalLimit, previousCriticalLimit
+	})
+	user := &model.User{Username: "refresh-outage-user", Password: "unused", Role: common.RoleCommonUser,
+		Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1}
+	require.NoError(t, db.Create(user).Error)
+	bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "isolated-regression")
+	require.NoError(t, err)
+	storedBefore, err := model.GetUserSessionBySID(bundle.Session.SID)
+	require.NoError(t, err)
+	originalHash := storedBefore.RefreshHash
+	engine := newAccessTokenScopeTestEngine(t)
+	requestRefresh := func(t *testing.T, rawToken, sid string) (*httptest.ResponseRecorder, map[string]any, bool) {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, "https://refresh-test.invalid/api/user/auth/refresh", nil)
+		request.Header.Set("Origin", "https://refresh-test.invalid")
+		request.Header.Set("X-Auth-Session", sid)
+		request.AddCookie(&http.Cookie{Name: service.RefreshCookieName, Value: rawToken})
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		var result map[string]any
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		assert.Contains(t, response.Header().Get("Cache-Control"), "no-store")
+		cleared := false
+		for _, cookie := range response.Result().Cookies() {
+			if cookie.Name == service.RefreshCookieName && cookie.MaxAge < 0 {
+				cleared = true
+			}
+		}
+		return response, result, cleared
+	}
+	t.Run("lookup outage preserves the credential", func(t *testing.T) {
+		sqlDB, err := db.DB()
+		require.NoError(t, err)
+		require.NoError(t, sqlDB.Close())
+		// This is a real database/sql failure, not a mocked authentication error.
+		// Redis is disabled, so the lookup necessarily takes the database path.
+		_, err = model.GetUserSessionCached(bundle.Session.SID)
+		require.ErrorContains(t, err, "database is closed")
+		response, result, cleared := requestRefresh(t, bundle.RefreshToken, bundle.Session.SID)
+		assert.Equal(t, http.StatusInternalServerError, response.Code)
+		assert.Equal(t, "AUTH_INTERNAL_ERROR", result["code"])
+		assert.Equal(t, false, result["success"])
+		assert.NotContains(t, result, "data", "an unavailable session store cannot issue authentication data")
+		assert.False(t, cleared, "transient lookup failure must preserve the valid refresh credential")
+	})
+	restored, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB, model.LOG_DB = restored, restored
+	storedAfter, err := model.GetUserSessionBySID(bundle.Session.SID)
+	require.NoError(t, err)
+	require.Equal(t, originalHash, storedAfter.RefreshHash)
+	require.Equal(t, model.UserSessionStatusActive, storedAfter.Status)
+	t.Run("original credential succeeds after database recovery", func(t *testing.T) {
+		response, result, cleared := requestRefresh(t, bundle.RefreshToken, bundle.Session.SID)
+		require.Equal(t, http.StatusOK, response.Code)
+		require.Equal(t, true, result["success"])
+		assert.False(t, cleared)
+		renewed := false
+		for _, cookie := range response.Result().Cookies() {
+			if cookie.Name == service.RefreshCookieName && cookie.Value != "" && cookie.MaxAge > 0 {
+				renewed = true
+				assert.True(t, cookie.Secure)
+				assert.True(t, cookie.HttpOnly)
+				assert.Equal(t, http.SameSiteStrictMode, cookie.SameSite)
+			}
+		}
+		require.True(t, renewed)
+		stored, err := model.GetUserSessionBySID(bundle.Session.SID)
+		require.NoError(t, err)
+		assert.Equal(t, model.UserSessionStatusActive, stored.Status)
+		assert.NotEqual(t, originalHash, stored.RefreshHash)
+	})
+	for _, tc := range []struct{ name, code string }{
+		{"missing", "AUTH_UNAUTHORIZED"},
+		{"invalid secret", "AUTH_UNAUTHORIZED"},
+		{"revoked", "AUTH_SESSION_REVOKED"},
+		{"expired", "AUTH_SESSION_REVOKED"},
+	} {
+		t.Run(tc.name+" session remains rejected", func(t *testing.T) {
+			sid, rawToken := "00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000001.nonexistent-test-secret"
+			if tc.name == "missing" {
+				_, err := model.GetUserSessionBySID(sid)
+				require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+			} else {
+				control, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "rejection-control")
+				require.NoError(t, err)
+				sid, rawToken = control.Session.SID, control.RefreshToken
+				switch tc.name {
+				case "invalid secret":
+					rawToken = sid + ".incorrect-test-secret"
+				case "revoked":
+					revoked, err := model.RevokeUserSession(user.Id, sid, "regression_control")
+					require.NoError(t, err)
+					require.True(t, revoked)
+				case "expired":
+					require.NoError(t, restored.Model(&model.UserSession{}).Where("sid = ?", sid).Update("expires_at", time.Now().Unix()-1).Error)
+				}
+			}
+			response, result, cleared := requestRefresh(t, rawToken, sid)
+			assert.Equal(t, http.StatusUnauthorized, response.Code)
+			assert.Equal(t, tc.code, result["code"])
+			assert.Equal(t, false, result["success"])
+			assert.True(t, cleared)
+			assert.NotContains(t, result, "data")
+			if tc.name == "invalid secret" {
+				stored, err := model.GetUserSessionBySID(sid)
+				require.NoError(t, err)
+				assert.Equal(t, model.UserSessionStatusActive, stored.Status, "an unknown secret must not revoke the legitimate session")
+			}
+		})
+	}
+}
+
+func TestPaymentCatalogCredentialsUseBodyAndNeverEnterLogs(t *testing.T) {
+	previousDB, previousLogDB, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+	previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+	previousSecret, previousLimit := common.SessionSecret, common.GlobalApiRateLimitEnable
+	previousMerchant, previousKey := setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey
+	previousClient, previousWriter := http.DefaultClient, gin.DefaultWriter
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "catalog-credentials.db")), &gorm.Config{})
+	require.NoError(t, err)
+	model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	common.SetLogDatabaseType(common.DatabaseTypeSQLite)
+	common.SessionSecret, common.GlobalApiRateLimitEnable = "catalog-isolated-session-secret", false
+	t.Cleanup(func() {
+		sqlDB, err := db.DB()
+		if err == nil {
+			_ = sqlDB.Close()
+		}
+		model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+		common.SetMainDatabaseType(previousType)
+		common.SetLogDatabaseType(previousLogType)
+		common.SessionSecret, common.GlobalApiRateLimitEnable = previousSecret, previousLimit
+		setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey = previousMerchant, previousKey
+		http.DefaultClient, gin.DefaultWriter = previousClient, previousWriter
+	})
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.UserAccessToken{}, &model.AuditLog{}))
+	users := []model.User{
+		{Username: "catalog-root", AffCode: "catalog-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default"},
+		{Username: "catalog-admin", AffCode: "catalog-admin", Role: common.RoleAdminUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default"},
+	}
+	for i := range users {
+		require.NoError(t, db.Create(&users[i]).Error)
+	}
+	credentials := map[string]string{}
+	for _, tc := range []struct {
+		name, scope string
+		user        int
+	}{
+		{"root-read", "option:read", 0}, {"root-wallet", "wallet:read", 0}, {"admin-read", "option:read", 1},
+	} {
+		raw := model.AccessTokenPrefix + strings.Repeat("p", 32) + tc.name
+		token := model.UserAccessToken{Name: tc.name, TokenHash: model.AccessTokenFingerprint(raw), TokenHint: model.AccessTokenHint(raw)}
+		require.NoError(t, token.SetScopes([]string{tc.scope}))
+		require.NoError(t, model.CreateUserAccessToken(users[tc.user].Id, &token, service.AccessTokenMaxPerUser))
+		credentials[tc.name] = raw
+	}
+	bundle, err := service.CreateLoginSession(users[0].Id, "password", "127.0.0.1", "catalog-regression")
+	require.NoError(t, err)
+	credentials["root-session"] = bundle.AccessToken
+	savedKeys, err := waffoutils.GenerateKeyPair()
+	require.NoError(t, err)
+	typedKeys, err := waffoutils.GenerateKeyPair()
+	require.NoError(t, err)
+	setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey = "MER_AbCdEfGhIjKlMnOpQrStUv", savedKeys.PrivateKey
+	typedMerchant := "MER_ZyXwVuTsRqPoNmLkJiHgFe"
+	typedBody, err := common.Marshal(map[string]string{"merchant_id": typedMerchant, "private_key": typedKeys.PrivateKey})
+	require.NoError(t, err)
+	var accessLog bytes.Buffer
+	gin.DefaultWriter = &accessLog
+	engine := newAccessTokenScopeTestEngine(t, func(engine *gin.Engine) { engine.Use(middleware.RequestId()); middleware.SetUpLogger(engine) })
+	upstreamCalls := 0
+	expectedMerchant, expectedPublicKey := "", ""
+	http.DefaultClient = &http.Client{Transport: paymentRoutePancakeTransport(func(request *http.Request) (*http.Response, error) {
+		upstreamCalls++
+		require.Equal(t, "https://api.waffo.ai/v1/graphql", request.URL.String(), "the actual SDK must use its authenticated GraphQL endpoint")
+		require.Equal(t, http.MethodPost, request.Method)
+		assert.Equal(t, expectedMerchant, request.Header.Get("X-Merchant-Id"))
+		body, err := io.ReadAll(request.Body)
+		require.NoError(t, err)
+		hash := sha256.Sum256(body)
+		canonical := "POST\n/v1/graphql\n" + request.Header.Get("X-Timestamp") + "\n" + base64.StdEncoding.EncodeToString(hash[:])
+		assert.True(t, waffoutils.Verify(canonical, request.Header.Get("X-Signature"), expectedPublicKey), "server must use the supplied/saved private key without exposing it")
+		assert.NotContains(t, string(body), "PRIVATE KEY")
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"data":{"stores":[{"id":"store-fixture","name":"Fixture store","onetimeProducts":[{"id":"product-fixture","name":"Fixture product","status":"active"}]}]}}`))}, nil
+	})}
+	for _, tc := range []struct {
+		name, method, path, query, credential, body, errorMessage string
+		status                                                    int
+		wantCatalog, typed                                        bool
+	}{
+		{name: "root session submits typed credentials only in body", method: "POST", credential: "root-session", body: string(typedBody), status: 200, wantCatalog: true, typed: true},
+		{name: "root read token submits typed credentials", method: "POST", credential: "root-read", body: string(typedBody), status: 200, wantCatalog: true, typed: true},
+		{name: "post empty object uses saved credentials", method: "POST", credential: "root-read", body: `{}`, status: 200, wantCatalog: true},
+		{name: "legacy credential-free get uses saved credentials", method: "GET", credential: "root-read", status: 200, wantCatalog: true},
+		{name: "legacy query private key rejected and hidden", method: "GET", credential: "root-read", query: "?merchant_id=merchant-fixture&private_key=fixture-pancake-private-key-never-log", status: 200},
+		{name: "encoded query private key rejected and hidden", method: "GET", credential: "root-read", query: "?%70rivate_key=fixture-pancake-private-key-never-log", status: 200},
+		{name: "malformed query cannot fall back to saved credentials", method: "GET", credential: "root-read", query: "?private_key=fixture-pancake-private-key-never-log%ZZ", status: 200},
+		{name: "encoded path keeps legacy credentials hidden", method: "GET", path: "/%61pi/option/waffo-pancake/catalog", credential: "root-read", query: "?private_key=fixture-pancake-private-key-never-log", status: 200},
+		{name: "legacy slash redirect keeps credentials out of access log", method: "GET", path: "/api/option/waffo-pancake/catalog/", query: "?private_key=fixture-pancake-private-key-never-log", status: http.StatusMovedPermanently},
+		{name: "legacy merchant-only query cannot override stored identity", method: "GET", credential: "root-read", query: "?merchant_id=merchant-fixture", status: 200},
+		{name: "post query credentials rejected even with valid body", method: "POST", credential: "root-read", query: "?private_key=fixture-pancake-private-key-never-log", body: string(typedBody), status: 200},
+		{name: "malformed body rejected before provider", method: "POST", credential: "root-read", body: `{`, status: 200},
+		{name: "missing credentials are audited as failure", method: "POST", credential: "root-read", body: `{"merchant_id":"MER_AbCdEfGhIjKlMnOpQrStUv"}`, status: 200, errorMessage: "Waffo Pancake credentials are not configured"},
+		{name: "SDK failure is audited as failure", method: "POST", credential: "root-session", body: `{"merchant_id":"invalid-local-merchant","private_key":"invalid-local-fixture"}`, status: 200, errorMessage: "Failed to fetch the catalog"},
+		{name: "admin cannot probe merchant credentials", method: "POST", credential: "admin-read", body: string(typedBody), status: 403},
+		{name: "root token without option scope denied", method: "POST", credential: "root-wallet", body: string(typedBody), status: 403},
+		{name: "anonymous post denied", method: "POST", body: string(typedBody), status: 401},
+		{name: "anonymous legacy query cannot leak key", method: "GET", query: "?private_key=fixture-pancake-private-key-never-log", status: 401},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			expectedMerchant, expectedPublicKey = setting.WaffoPancakeMerchantID, savedKeys.PublicKey
+			if tc.typed {
+				expectedMerchant, expectedPublicKey = typedMerchant, typedKeys.PublicKey
+			}
+			beforeCalls := upstreamCalls
+			path := tc.path
+			if path == "" {
+				path = "/api/option/waffo-pancake/catalog"
+			}
+			request := httptest.NewRequest(tc.method, path+tc.query, strings.NewReader(tc.body))
+			request.Header.Set("Content-Type", "application/json")
+			if raw := credentials[tc.credential]; raw != "" {
+				request.Header.Set("Authorization", "Bearer "+raw)
+			}
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, request)
+			require.Equal(t, tc.status, response.Code, response.Body.String())
+			if tc.wantCatalog {
+				assert.Equal(t, beforeCalls+1, upstreamCalls)
+				assert.Contains(t, response.Body.String(), `"message":"success"`)
+				assert.Contains(t, response.Body.String(), `"id":"product-fixture"`)
+			} else {
+				assert.Equal(t, beforeCalls, upstreamCalls, "rejected requests must not use saved or supplied merchant credentials")
+				if tc.status == 200 {
+					errorMessage := tc.errorMessage
+					if errorMessage == "" {
+						errorMessage = "Invalid parameters"
+					}
+					var result struct {
+						Success    *bool  `json:"success"`
+						Message    string `json:"message"`
+						MessageKey string `json:"message_key"`
+						Data       string `json:"data"`
+					}
+					require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+					if assert.NotNil(t, result.Success) {
+						assert.False(t, *result.Success, "HTTP 200 business failures must be explicit for request audit consumers")
+					}
+					assert.Equal(t, "error", result.Message)
+					assert.Equal(t, errorMessage, result.MessageKey)
+					assert.Equal(t, errorMessage, result.Data)
+				}
+			}
+			assert.NotContains(t, accessLog.String(), "fixture-pancake-private-key-never-log")
+			assert.NotContains(t, accessLog.String(), "private_key")
+			assert.NotContains(t, accessLog.String(), url.QueryEscape(typedKeys.PrivateKey))
+			assert.NotContains(t, response.Body.String(), typedKeys.PrivateKey)
+			var audits []model.AuditLog
+			require.NoError(t, db.Where("request_id = ?", response.Header().Get(common.RequestIdKey)).Find(&audits).Error)
+			if tc.method == "POST" && tc.status == 200 {
+				require.NotEmpty(t, audits, "root POST keeps existing request audit behavior")
+			}
+			for _, audit := range audits {
+				assert.Equal(t, tc.wantCatalog, audit.Success, "request audit must distinguish a successful catalog response from HTTP 200 business rejection")
+				if audit.Category == model.AuditCategoryOperation {
+					require.NotNil(t, audit.Other.AuditInfo)
+					assert.Equal(t, tc.wantCatalog, audit.Other.AuditInfo.Success, "operation audit must preserve the actual request result")
+				}
+			}
+			encodedAudit, err := common.Marshal(audits)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encodedAudit), "fixture-pancake-private-key-never-log")
+			assert.NotContains(t, string(encodedAudit), "PRIVATE KEY")
+			assert.NotContains(t, accessLog.String(), credentials["root-read"])
+		})
+	}
+	assert.Equal(t, 4, upstreamCalls, "only the four valid credential/body/fallback scenarios contact the SDK transport")
+}
+
+func TestPaymentFailureResponsesPreserveAuditOutcome(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			var dialector gorm.Dialector
+			var admin *gorm.DB
+			databaseName := "newapi_pay_audit_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+			if dialect == "sqlite" {
+				dialector = sqlite.Open(filepath.Join(t.TempDir(), "payment-outcome.db"))
+			} else {
+				dsn := os.Getenv("TEST_" + strings.ToUpper(dialect) + "_DSN")
+				if dsn == "" {
+					t.Skip("isolated database DSN is not configured")
+				}
+				var adminDialector gorm.Dialector
+				if dialect == "mysql" {
+					configuration, err := sqlmysql.ParseDSN(dsn)
+					require.NoError(t, err)
+					host, _, err := net.SplitHostPort(configuration.Addr)
+					require.NoError(t, err)
+					require.True(t, net.ParseIP(host).IsLoopback(), "only isolated loopback databases are accepted")
+					adminDialector = mysql.Open(dsn)
+					configuration.DBName, configuration.ParseTime = databaseName, true
+					dialector = mysql.Open(configuration.FormatDSN())
+				} else {
+					configuration, err := url.Parse(dsn)
+					require.NoError(t, err)
+					require.True(t, net.ParseIP(configuration.Hostname()).IsLoopback(), "only isolated loopback databases are accepted")
+					adminDialector = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+					configuration.Path = "/" + databaseName
+					dialector = postgres.New(postgres.Config{DSN: configuration.String(), PreferSimpleProtocol: true})
+				}
+				var err error
+				admin, err = gorm.Open(adminDialector, &gorm.Config{})
+				require.NoError(t, err)
+				require.NoError(t, admin.Exec("CREATE DATABASE "+databaseName).Error)
+			}
+			db, err := gorm.Open(dialector, &gorm.Config{})
+			require.NoError(t, err)
+			previousDB, previousLogDB, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+			previousType, previousLogType := common.MainDatabaseType(), common.LogDatabaseType()
+			previousSecret, previousLimit, previousCritical := common.SessionSecret, common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable
+			previousClient, previousTransport := http.DefaultClient, http.DefaultTransport
+			previousPayment, previousGeneral := *operation_setting.GetPaymentSetting(), *operation_setting.GetGeneralSetting()
+			previousUnit, previousPrice, previousMin := common.QuotaPerUnit, operation_setting.Price, operation_setting.MinTopUp
+			previousWaffo, previousCreemTest := setting.WaffoEnabled, setting.CreemTestMode
+			previousOptions := common.OptionMap
+			settingFields := []*string{&setting.CreemApiKey, &setting.CreemProducts, &setting.CreemWebhookSecret,
+				&setting.WaffoPancakeMerchantID, &setting.WaffoPancakePrivateKey, &setting.WaffoPancakeProductID, &setting.WaffoPancakeStoreID, &setting.WaffoPancakeReturnURL}
+			previousSettings := make([]string, len(settingFields))
+			for i, field := range settingFields {
+				previousSettings[i] = *field
+				*field = ""
+			}
+			model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
+			common.SetDatabaseTypes(common.DatabaseType(dialect), common.DatabaseType(dialect))
+			// Use normal startup initialization for reserved-column quoting,
+			// without opening another database or running startup migrations.
+			t.Setenv("LOG_SQL_DSN", "")
+			previousMaster := common.IsMasterNode
+			common.IsMasterNode = false
+			initErr := model.InitLogDB()
+			common.IsMasterNode = previousMaster
+			require.NoError(t, initErr)
+			common.SessionSecret, common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable = "payment-outcome-isolated-session", false, false
+			common.OptionMap = map[string]string{}
+			common.QuotaPerUnit, operation_setting.Price, operation_setting.MinTopUp = 1, 1, 1
+			operation_setting.GetGeneralSetting().QuotaDisplayType = operation_setting.QuotaDisplayTypeUSD
+			operation_setting.GetPaymentSetting().ComplianceConfirmed = true
+			operation_setting.GetPaymentSetting().ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+			operation_setting.GetPaymentSetting().AmountDiscount = map[int]float64{}
+			setting.WaffoEnabled, setting.CreemTestMode = false, false
+			setting.CreemApiKey, setting.CreemWebhookSecret = "creem-isolated-test-key", "creem-isolated-webhook-key"
+			setting.CreemProducts = `[{"productId":"prod-audit","name":"Audit fixture","price":10,"currency":"USD","quota":100}]`
+			models := []any{&model.User{}, &model.UserSession{}, &model.UserAccessToken{}, &model.AuditLog{}, &model.Option{}, &model.TopUp{}, &model.SubscriptionOrder{}, &model.ReferralRebate{}}
+			t.Cleanup(func() {
+				connection, err := db.DB()
+				if err == nil {
+					assert.NoError(t, connection.Close())
+				}
+				if admin != nil {
+					assert.NoError(t, admin.Exec("DROP DATABASE "+databaseName).Error, "only remove this run's isolated database")
+					connection, err := admin.DB()
+					if err == nil {
+						assert.NoError(t, connection.Close())
+					}
+				}
+				model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+				common.SetDatabaseTypes(previousType, previousLogType)
+				common.IsMasterNode = false
+				assert.NoError(t, model.InitLogDB())
+				common.IsMasterNode, model.LOG_DB = previousMaster, previousLogDB
+				common.SetLogDatabaseType(previousLogType)
+				common.SessionSecret, common.GlobalApiRateLimitEnable, common.CriticalRateLimitEnable = previousSecret, previousLimit, previousCritical
+				http.DefaultClient, http.DefaultTransport = previousClient, previousTransport
+				*operation_setting.GetPaymentSetting(), *operation_setting.GetGeneralSetting() = previousPayment, previousGeneral
+				common.QuotaPerUnit, operation_setting.Price, operation_setting.MinTopUp = previousUnit, previousPrice, previousMin
+				setting.WaffoEnabled, setting.CreemTestMode, common.OptionMap = previousWaffo, previousCreemTest, previousOptions
+				for i, field := range settingFields {
+					*field = previousSettings[i]
+				}
+			})
+			require.NoError(t, db.AutoMigrate(models...))
+			versionQuery := "SELECT version()"
+			if dialect == "sqlite" {
+				versionQuery = "SELECT sqlite_version()"
+			}
+			var version string
+			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+			t.Logf("actual main and audit database: %s %s; isolated database: %s", dialect, version, databaseName)
+			user := model.User{Username: "payment-audit-root", AffCode: "payment-audit-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1, Group: "default", Email: "audit@example.invalid"}
+			require.NoError(t, db.Create(&user).Error)
+			rawToken := model.AccessTokenPrefix + strings.Repeat("p", 32) + "payment-audit"
+			token := model.UserAccessToken{Name: "payment-audit", TokenHash: model.AccessTokenFingerprint(rawToken), TokenHint: model.AccessTokenHint(rawToken)}
+			require.NoError(t, token.SetScopes([]string{"wallet:read", "wallet:write", "option:write"}))
+			require.NoError(t, model.CreateUserAccessToken(user.Id, &token, service.AccessTokenMaxPerUser))
+			bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "payment-audit-test")
+			require.NoError(t, err)
+			keys, err := waffoutils.GenerateKeyPair()
+			require.NoError(t, err)
+			pairBody, err := common.Marshal(map[string]string{"merchant_id": "MER_AbCdEfGhIjKlMnOpQrStUv", "private_key": keys.PrivateKey})
+			require.NoError(t, err)
+			saveBody, err := common.Marshal(map[string]string{"merchant_id": "MER_AbCdEfGhIjKlMnOpQrStUv", "private_key": keys.PrivateKey, "store_id": "STO_AbCdEfGhIjKlMnOpQrStUv", "product_id": "OTP_AbCdEfGhIjKlMnOpQrStUv"})
+			require.NoError(t, err)
+			engine := newAccessTokenScopeTestEngine(t, func(engine *gin.Engine) { engine.Use(middleware.RequestId()) })
+			for _, tc := range []struct {
+				name, path, body, key, fault string
+				admin, success               bool
+			}{
+				{name: "quote rejects malformed amount", path: "/api/user/amount", body: `{`, key: "Invalid parameters"},
+				{name: "quote success remains audited success", path: "/api/user/amount", body: `{"amount":10}`, success: true},
+				{name: "Epay rejects before checkout", path: "/api/user/pay", body: `{`, key: "Invalid parameters"},
+				{name: "Stripe rejects foreign payment method", path: "/api/user/stripe/pay", body: `{"payment_method":"foreign"}`, key: "Unsupported payment channel"},
+				{name: "Creem rejects foreign payment method", path: "/api/user/creem/pay", body: `{"payment_method":"foreign"}`, key: "Unsupported payment channel"},
+				{name: "Waffo disabled rejects checkout", path: "/api/user/waffo/pay", body: `{}`, key: "Waffo payment is not enabled"},
+				{name: "Pancake incomplete rejects checkout", path: "/api/user/waffo-pancake/pay", body: `{}`, key: "Waffo Pancake configuration is incomplete"},
+				{name: "Save rejects incomplete binding", path: "/api/option/waffo-pancake/save", body: `{}`, key: "Failed to save configuration", admin: true},
+				{name: "Pair rejects missing credentials", path: "/api/option/waffo-pancake/pair", body: `{}`, key: "Waffo Pancake credentials are not configured", admin: true},
+				{name: "Pair reports local SDK failure", path: "/api/option/waffo-pancake/pair", body: `{"merchant_id":"invalid-local-merchant","private_key":"invalid-local-key"}`, fault: "pair-local", admin: true},
+				{name: "Pair preserves orphan store on product failure", path: "/api/option/waffo-pancake/pair", body: string(pairBody), fault: "pair-orphan", admin: true},
+				{name: "Creem disconnect preserves unknown original order", path: "/api/user/creem/pay", body: `{"payment_method":"creem","product_id":"prod-audit"}`, fault: "creem-disconnect", key: "Payment request result is unknown. Check Order History before trying again."},
+				{name: "shared subscription reader error is failure", path: "/api/subscription/creem/pay", fault: "body-reader"},
+				{name: "Save success remains audited success", path: "/api/option/waffo-pancake/save", body: string(saveBody), admin: true, success: true},
+			} {
+				authMethods := []string{"access_token"}
+				if tc.admin {
+					authMethods = append(authMethods, "session")
+				}
+				for _, authMethod := range authMethods {
+					t.Run(tc.name+"/"+authMethod, func(t *testing.T) {
+						upstreamCalls := 0
+						http.DefaultClient = &http.Client{Transport: paymentRoutePancakeTransport(func(request *http.Request) (*http.Response, error) {
+							upstreamCalls++
+							require.Equal(t, "pair-orphan", tc.fault, "only orphan fixture may contact the Pancake SDK transport")
+							require.Equal(t, "api.waffo.ai", request.URL.Host)
+							if upstreamCalls == 1 {
+								assert.Equal(t, "/v1/actions/store/create-store", request.URL.Path)
+								return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"data":{"store":{"id":"STO_AbCdEfGhIjKlMnOpQrStUv","name":"fixture"}}}`))}, nil
+							}
+							assert.Equal(t, "/v1/actions/onetime-product/create-product", request.URL.Path)
+							return &http.Response{StatusCode: 400, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"errors":[{"message":"isolated product rejection"}]}`))}, nil
+						})}
+						var receivedTrade string
+						if tc.fault == "creem-disconnect" {
+							// Read the real HTTP request, then close its socket before any
+							// response. This proves unknown checkout at the transport boundary.
+							received := make(chan string, 1)
+							server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+								var body struct {
+									RequestID string `json:"request_id"`
+								}
+								assert.NoError(t, common.DecodeJson(request.Body, &body))
+								received <- body.RequestID
+								connection, _, err := writer.(http.Hijacker).Hijack()
+								if assert.NoError(t, err) {
+									assert.NoError(t, connection.Close())
+								}
+							}))
+							t.Cleanup(server.Close)
+							localURL, err := url.Parse(server.URL)
+							require.NoError(t, err)
+							transport := &http.Transport{Proxy: nil}
+							t.Cleanup(transport.CloseIdleConnections)
+							http.DefaultTransport = paymentRoutePancakeTransport(func(request *http.Request) (*http.Response, error) {
+								require.Equal(t, "https://api.creem.io/v1/checkouts", request.URL.String())
+								clone := request.Clone(request.Context())
+								clone.URL.Scheme, clone.URL.Host = localURL.Scheme, localURL.Host
+								response, err := transport.RoundTrip(clone)
+								receivedTrade = <-received
+								return response, err
+							})
+							t.Cleanup(func() { http.DefaultTransport = previousTransport })
+						}
+						var reader io.Reader = strings.NewReader(tc.body)
+						if tc.fault == "body-reader" {
+							reader = iotest.ErrReader(errors.New("isolated synthetic body read error"))
+						}
+						request := httptest.NewRequest(http.MethodPost, tc.path, reader)
+						request.Header.Set("Content-Type", "application/json")
+						credential := rawToken
+						if authMethod == "session" {
+							credential = bundle.AccessToken
+						}
+						request.Header.Set("Authorization", "Bearer "+credential)
+						response := httptest.NewRecorder()
+						engine.ServeHTTP(response, request)
+						require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+						var result map[string]any
+						require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+						if tc.success {
+							assert.Equal(t, "success", result["message"])
+						} else {
+							assert.Equal(t, false, result["success"], "HTTP 200 failure must explicitly inform response and audit consumers")
+							assert.Equal(t, "error", result["message"])
+							if tc.key != "" {
+								assert.Equal(t, tc.key, result["message_key"])
+								assert.NotEmpty(t, result["data"])
+							}
+						}
+						if tc.fault == "pair-orphan" {
+							require.Equal(t, 2, upstreamCalls, "real SDK completed Store and reached Product create")
+							data, ok := result["data"].(map[string]any)
+							require.True(t, ok)
+							assert.Equal(t, true, data["orphan_store"])
+							assert.Equal(t, "STO_AbCdEfGhIjKlMnOpQrStUv", data["store_id"])
+							assert.NotEmpty(t, data["error"])
+						} else {
+							assert.Zero(t, upstreamCalls)
+						}
+						if tc.fault == "creem-disconnect" {
+							require.NotEmpty(t, receivedTrade)
+							assert.Equal(t, receivedTrade, result["trade_no"], "unknown outcome retains the original provider-bound identity")
+							var order model.TopUp
+							require.NoError(t, db.Where("trade_no = ?", receivedTrade).First(&order).Error)
+							assert.Equal(t, common.TopUpStatusPending, order.Status)
+							assert.Equal(t, model.PaymentProviderCreem, order.PaymentProvider)
+							require.NotNil(t, order.CreditedQuota)
+							assert.Equal(t, 100, *order.CreditedQuota)
+							assert.Nil(t, order.SettlementAudit)
+						}
+						requestID := response.Header().Get(common.RequestIdKey)
+						require.NotEmpty(t, requestID)
+						var audits []model.AuditLog
+						require.NoError(t, db.Where("request_id = ?", requestID).Find(&audits).Error)
+						require.NotEmpty(t, audits, "authenticated request must reach the actual persisted audit path")
+						for _, audit := range audits {
+							assert.Equal(t, tc.success, audit.Success, audit.Category)
+							assert.Equal(t, user.Id, audit.UserId)
+							assert.Equal(t, authMethod, audit.AuthMethod)
+							if audit.Category == model.AuditCategoryOperation {
+								require.NotNil(t, audit.Other.AuditInfo)
+								require.NotNil(t, audit.Other.AdminInfo)
+								assert.Equal(t, tc.success, audit.Other.AuditInfo.Success)
+								assert.Equal(t, authMethod, audit.Other.AdminInfo.AuthMethod)
+								assert.Equal(t, user.Id, audit.Other.AdminInfo.AdminID)
+							}
+						}
+						encoded, err := common.Marshal(audits)
+						require.NoError(t, err)
+						assert.NotContains(t, string(encoded), credential)
+						assert.NotContains(t, string(encoded), keys.PrivateKey)
+						require.NoError(t, db.First(&user, user.Id).Error)
+						assert.Zero(t, user.Quota)
+						assert.Zero(t, user.AffQuota)
+						var rebates int64
+						require.NoError(t, db.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+						assert.Zero(t, rebates)
+					})
+				}
+			}
+		})
 	}
 }

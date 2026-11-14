@@ -94,8 +94,29 @@ func validatePasskeyRPIDWithTx(tx *gorm.DB, rpID string) error {
 // including unrelated keys from UpdateOptionsBulk. Preview rolls back even the
 // initial default rows and never publishes a local configuration change.
 func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirmation string) (*PasskeyDomainChange, error) {
+	var policySnapshot *RequestPolicySnapshot
+	for key := range values {
+		if IsRequestPolicyOption(key) {
+			requestPolicyOptionMutex.Lock()
+			defer requestPolicyOptionMutex.Unlock()
+			options := maps.Clone(CurrentRequestPolicy().Options)
+			for key, value := range values {
+				if IsRequestPolicyOption(key) {
+					options[key] = value
+				}
+			}
+			var err error
+			policySnapshot, err = BuildRequestPolicy(options)
+			if err != nil {
+				return nil, err
+			}
+			break
+		}
+	}
 	passkeyOptionMutex.Lock()
 	defer passkeyOptionMutex.Unlock()
+	walletPaymentOptionMutex.Lock()
+	defer walletPaymentOptionMutex.Unlock()
 	values = maps.Clone(values)
 	for key, value := range values {
 		if err := validateOptionValue(key, value); err != nil {
@@ -106,6 +127,9 @@ func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirma
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		settings, serverAddress, err := lockPasskeyDomainSettings(tx)
 		if err != nil {
+			return err
+		}
+		if err := lockEpaySigningOptions(tx, values); err != nil {
 			return err
 		}
 		previous := settings.WithDefaults(serverAddress)
@@ -240,21 +264,25 @@ func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirma
 	if err != nil {
 		return change, err
 	}
-	BumpSyncTopic(SyncTopicOptions)
-	applyPasskeyDomainOptions(values)
+	common.OptionMapRWMutex.Lock()
+	applyPasskeyDomainOptionsLocked(values)
+	var publicationError error
 	for key, value := range values {
 		if !IsPasskeyDomainOption(key) {
-			if err := updateOptionMap(key, value); err != nil {
-				return change, err
-			}
+			publicationError = errors.Join(publicationError, updateOptionMapLocked(key, value))
 		}
 	}
-	return change, nil
+	common.OptionMapRWMutex.Unlock()
+	if policySnapshot != nil {
+		requestPolicySnapshot.Store(policySnapshot)
+	}
+	BumpSyncTopic(SyncTopicOptions)
+	return change, publicationError
 }
 
-func applyPasskeyDomainOptions(values map[string]string) {
-	common.OptionMapRWMutex.Lock()
-	defer common.OptionMapRWMutex.Unlock()
+// applyPasskeyDomainOptionsLocked publishes domain settings together with any
+// other options in the same save or reload. The caller holds OptionMapRWMutex.
+func applyPasskeyDomainOptionsLocked(values map[string]string) {
 	if common.OptionMap == nil {
 		common.OptionMap = make(map[string]string)
 	}

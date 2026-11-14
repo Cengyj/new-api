@@ -46,6 +46,36 @@ export function getPaymentErrorTranslation(
   return getServerMessage(body)
 }
 
+export function isValidTopupAmount(amount: number): boolean {
+  return Number.isSafeInteger(amount) && amount > 0
+}
+
+export function isSafePaymentUrl(
+  value: unknown,
+  allowDeepLink = false
+): value is string {
+  if (typeof value !== 'string' || !value.trim()) return false
+  try {
+    const url = new URL(value)
+    if (url.protocol === 'http:' || url.protocol === 'https:') return true
+    // Waffo explicitly supports provider DEEPLINK actions. Preserve payment
+    // app protocols while rejecting targets that execute or load local code.
+    return (
+      allowDeepLink &&
+      ![
+        'javascript:',
+        'data:',
+        'vbscript:',
+        'file:',
+        'blob:',
+        'about:',
+      ].includes(url.protocol)
+    )
+  } catch {
+    return false
+  }
+}
+
 /**
  * Check if browser is Safari
  */
@@ -63,6 +93,7 @@ export function submitPaymentForm(
   url: string,
   params: Record<string, unknown>
 ): void {
+  if (!isSafePaymentUrl(url)) throw new Error('Invalid payment redirect URL')
   const form = document.createElement('form')
   form.action = url
   form.method = 'POST'
@@ -70,6 +101,7 @@ export function submitPaymentForm(
   // Don't open in new tab for Safari
   if (!isSafariBrowser()) {
     form.target = '_blank'
+    form.rel = 'noopener noreferrer'
   }
 
   // Add form parameters
@@ -190,6 +222,22 @@ export function getMinTopupAmount(topupInfo: TopupInfo | null): number {
   }
 
   return DEFAULT_MIN_TOPUP
+}
+
+/** Keep each checkout's minimum independent of other enabled providers. */
+export function getPaymentMethodMinTopup(
+  topupInfo: TopupInfo | null,
+  method: PaymentMethod
+): number {
+  let minimum = topupInfo?.min_topup ?? DEFAULT_MIN_TOPUP
+  if (isStripePayment(method.type)) {
+    minimum = topupInfo?.stripe_min_topup ?? DEFAULT_MIN_TOPUP
+  } else if (isWaffoPayment(method.type)) {
+    minimum = topupInfo?.waffo_min_topup ?? DEFAULT_MIN_TOPUP
+  } else if (isWaffoPancakePayment(method.type)) {
+    minimum = topupInfo?.waffo_pancake_min_topup ?? DEFAULT_MIN_TOPUP
+  }
+  return Math.max(minimum, method.min_topup || 0)
 }
 
 /**

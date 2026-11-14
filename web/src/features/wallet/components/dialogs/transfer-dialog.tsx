@@ -21,18 +21,18 @@ import { useState, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { Dialog } from '@/components/dialog'
+import { ErrorState } from '@/components/error-state'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import {
-  formatQuota,
-  parseQuotaFromDollars,
-  quotaUnitsToDollars,
-} from '@/lib/format'
+import { formatQuota, quotaUnitsToDollars } from '@/lib/format'
 import {
   DEFAULT_CURRENCY_CONFIG,
   useSystemConfigStore,
 } from '@/stores/system-config-store'
+
+import { parseAffiliateTransferQuota } from '../../lib/affiliate'
+import { ReferralQuota } from '../referral-quota'
 
 interface TransferDialogProps {
   open: boolean
@@ -40,6 +40,14 @@ interface TransferDialogProps {
   onConfirm: (amount: number) => Promise<boolean>
   availableQuota: number
   transferring: boolean
+  pending?: { request_id: string; quota: number } | null
+  checkedAbsent?: boolean
+  onVerify?: () => Promise<boolean>
+  complianceConfirmed?: boolean
+  storageError?: boolean
+  onRetryStorage?: () => void
+  confirmed?: boolean
+  rejected?: boolean
 }
 
 export function TransferDialog({
@@ -48,6 +56,14 @@ export function TransferDialog({
   onConfirm,
   availableQuota,
   transferring,
+  pending,
+  checkedAbsent,
+  onVerify,
+  complianceConfirmed = true,
+  storageError = false,
+  onRetryStorage,
+  confirmed = false,
+  rejected = false,
 }: TransferDialogProps) {
   const { t } = useTranslation()
   const currencyConfig = useSystemConfigStore((state) => state.config.currency)
@@ -58,19 +74,45 @@ export function TransferDialog({
   )
   const minimumAmount = quotaUnitsToDollars(minimumQuota)
   const maximumAmount = quotaUnitsToDollars(availableQuota)
-  const [amount, setAmount] = useState(minimumAmount)
-  const transferQuota = parseQuotaFromDollars(amount)
+  const [amount, setAmount] = useState(String(minimumAmount))
+  const transferQuota = pending?.quota ?? parseAffiliateTransferQuota(amount)
+  const pendingAmount = pending ? quotaUnitsToDollars(pending.quota) : 0
+  // Recovery must show the original amount even when a safe integer loses a
+  // quota unit during currency conversion. Never round-trip that display into
+  // a replacement operation.
+  const needsExactPendingAmount =
+    pending &&
+    parseAffiliateTransferQuota(String(pendingAmount)) !== pending.quota
   const canTransfer =
-    Number.isFinite(amount) &&
+    complianceConfirmed &&
+    !storageError &&
+    !confirmed &&
+    !rejected &&
+    Number.isFinite(Number(amount)) &&
+    Number.isSafeInteger(transferQuota) &&
+    (!pending || checkedAbsent === true) &&
     transferQuota >= minimumQuota &&
     transferQuota <= availableQuota
 
   useEffect(() => {
     if (open) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      setAmount(minimumAmount)
+      setAmount(String(minimumAmount))
     }
   }, [minimumAmount, open])
+
+  let resultDescription = t(
+    'Transfer result is unknown. Check the original operation before retrying.'
+  )
+  if (confirmed) {
+    resultDescription = t(
+      'Transfer succeeded, but the saved operation could not be cleared. Check the original operation before starting another transfer.'
+    )
+  } else if (rejected) {
+    resultDescription = t(
+      'Transfer was rejected. No balance was moved. Restore browser storage before starting another transfer.'
+    )
+  }
 
   const handleConfirm = async () => {
     if (!canTransfer) return
@@ -84,7 +126,9 @@ export function TransferDialog({
   return (
     <Dialog
       open={open}
-      onOpenChange={onOpenChange}
+      onOpenChange={(next) => {
+        if (!transferring) onOpenChange(next)
+      }}
       title={t('Transfer Rewards')}
       description={t('Move affiliate rewards to your main balance')}
       contentClassName='max-sm:w-[calc(100vw-1.5rem)] sm:max-w-md'
@@ -99,19 +143,59 @@ export function TransferDialog({
             onClick={() => onOpenChange(false)}
             disabled={transferring}
           >
-            {t('Cancel')}
+            {pending ? t('Close') : t('Cancel')}
           </Button>
           <Button
             onClick={handleConfirm}
             disabled={transferring || !canTransfer}
           >
             {transferring && <Loader2 className='mr-2 h-4 w-4 animate-spin' />}
-            {t('Transfer')}
+            {pending ? t('Retry original transfer') : t('Transfer')}
           </Button>
         </>
       }
     >
       <div className='space-y-4 py-3 sm:space-y-6 sm:py-4'>
+        {storageError && (
+          <ErrorState
+            className='min-h-0'
+            description={t(
+              'Saved transfer details are unavailable or invalid. Restore browser storage and retry before starting another transfer.'
+            )}
+            onRetry={onRetryStorage}
+          />
+        )}
+        {pending && (
+          <div role='status' className='space-y-2 text-sm'>
+            <p>{resultDescription}</p>
+            <p className='font-mono text-xs break-all'>{pending.request_id}</p>
+            {checkedAbsent && (
+              <p>
+                {t(
+                  'No completed result was found. A request may still be processing; retry only this original transfer.'
+                )}
+              </p>
+            )}
+            {!rejected && (
+              <Button
+                variant='outline'
+                disabled={transferring}
+                onClick={async () => {
+                  if (await onVerify?.()) onOpenChange(false)
+                }}
+              >
+                {t('Check transfer result')}
+              </Button>
+            )}
+          </div>
+        )}
+        {!complianceConfirmed && (
+          <p className='text-destructive text-xs'>
+            {t(
+              'Referral reward transfer is disabled until the administrator confirms compliance terms.'
+            )}
+          </p>
+        )}
         <div className='space-y-2'>
           <Label className='text-muted-foreground text-xs font-medium tracking-wider uppercase'>
             {t('Available Rewards')}
@@ -128,19 +212,23 @@ export function TransferDialog({
           >
             {t('Transfer Amount')}
           </Label>
-          <Input
-            id='transfer-amount'
-            type='number'
-            value={amount}
-            onChange={(e) => setAmount(Number(e.target.value))}
-            min={minimumAmount}
-            max={maximumAmount}
-            step={minimumAmount}
-            className='font-mono text-lg'
-          />
-          <p className='text-muted-foreground text-xs'>
-            {t('Minimum:')} {formatQuota(minimumQuota)}
-          </p>
+          {needsExactPendingAmount ? (
+            <output id='transfer-amount' className='block text-lg'>
+              <ReferralQuota value={String(pending.quota)} />
+            </output>
+          ) : (
+            <Input
+              id='transfer-amount'
+              type='number'
+              value={pending ? pendingAmount : amount}
+              disabled={!!pending || transferring}
+              onChange={(e) => setAmount(e.target.value)}
+              min={minimumAmount}
+              max={maximumAmount}
+              step={minimumAmount}
+              className='font-mono text-lg'
+            />
+          )}
         </div>
       </div>
     </Dialog>

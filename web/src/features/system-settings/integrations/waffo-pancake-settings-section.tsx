@@ -28,6 +28,7 @@ import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { getPaymentErrorTranslation } from '@/features/wallet/lib/payment'
 import { handleServerError } from '@/lib/handle-server-error'
+import { authenticationIdentity } from '@/lib/http-client'
 
 import { removeTrailingSlash } from './utils'
 import {
@@ -148,11 +149,17 @@ export function WaffoPancakeSettingsSection({
       privateKey: string,
       preselect?: { storeID?: string; productID?: string }
     ) => {
+      const authIdentity = authenticationIdentity()
       const serial = ++fetchSerialRef.current
       let stores: CatalogStore[]
       try {
         const body = await listWaffoPancakeCatalog(merchantID, privateKey)
-        if (serial !== fetchSerialRef.current) return
+        if (
+          serial !== fetchSerialRef.current ||
+          authIdentity !== authenticationIdentity()
+        ) {
+          return
+        }
         if (
           body?.message === 'success' &&
           typeof body.data === 'object' &&
@@ -174,7 +181,12 @@ export function WaffoPancakeSettingsSection({
           return
         }
       } catch (err) {
-        if (serial !== fetchSerialRef.current) return
+        if (
+          serial !== fetchSerialRef.current ||
+          authIdentity !== authenticationIdentity()
+        ) {
+          return
+        }
         handleServerError(
           err,
           `${t('Credentials verification failed')}: ${
@@ -230,7 +242,9 @@ export function WaffoPancakeSettingsSection({
     if (!m || !k) return
     const signature = `${m}|${k}`
     if (signature === lastVerifiedSignature.current) return
+    const authIdentity = authenticationIdentity()
     const timer = setTimeout(() => {
+      if (!authIdentity || authIdentity !== authenticationIdentity()) return
       lastVerifiedSignature.current = signature
       setPhase('verifying')
       void verifyAndFetchCatalog(m, k)
@@ -246,7 +260,9 @@ export function WaffoPancakeSettingsSection({
     if (initialLoadRef.current) return
     if (!defaultValues.WaffoPancakeMerchantID.trim()) return
     initialLoadRef.current = true
+    const authIdentity = authenticationIdentity()
     const timer = window.setTimeout(() => {
+      if (!authIdentity || authIdentity !== authenticationIdentity()) return
       setPhase('verifying')
       void verifyAndFetchCatalog('', '')
     }, 0)
@@ -269,6 +285,8 @@ export function WaffoPancakeSettingsSection({
   // The minted product's SuccessURL is pinned to the current Return URL
   // field, so we prompt before creating when that field is empty.
   const handleCreatePair = async () => {
+    const authIdentity = authenticationIdentity()
+    if (!authIdentity) return
     if (!credsReady) {
       toast.error(
         t('Fill in both Merchant ID and API Private Key before creating.')
@@ -295,6 +313,7 @@ export function WaffoPancakeSettingsSection({
         privateKey,
         returnURL: trimmedReturn,
       })
+      if (authIdentity !== authenticationIdentity()) return
       if (
         body?.message === 'success' &&
         typeof body.data === 'object' &&
@@ -308,6 +327,7 @@ export function WaffoPancakeSettingsSection({
           storeID: created.store_id,
           productID: created.product_id,
         })
+        if (authIdentity !== authenticationIdentity()) return
         toast.success(
           `${t('Store + product created')}: ${created.store_id} / ${created.product_id}`
         )
@@ -323,6 +343,7 @@ export function WaffoPancakeSettingsSection({
           storeID: errData.store_id,
           productID: '',
         })
+        if (authIdentity !== authenticationIdentity()) return
       }
       const reason =
         errData?.error ??
@@ -334,12 +355,13 @@ export function WaffoPancakeSettingsSection({
           : t('Creation failed'),
       })
     } catch (err) {
+      if (authIdentity !== authenticationIdentity()) return
       handleServerError(
         err,
         `${t('Creation failed')}: ${err instanceof Error ? err.message : String(err)}`
       )
     } finally {
-      setCreatingPair(false)
+      if (authIdentity === authenticationIdentity()) setCreatingPair(false)
     }
   }
 

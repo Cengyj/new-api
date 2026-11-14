@@ -271,19 +271,17 @@ func Register(c *gin.Context) {
 		common.ApiErrorT(c, "Username already exists or has been deleted")
 		return
 	}
-	affCode := user.AffCode // this code is the inviter's code, not the user's own code
-	inviterId, _ := model.GetUserIdByAffCode(affCode)
 	cleanUser := model.User{
-		Username:    user.Username,
-		Password:    user.Password,
-		DisplayName: user.Username,
-		InviterId:   inviterId,
-		Role:        common.RoleCommonUser, // 明确设置角色为普通用户
+		Username:            user.Username,
+		Password:            user.Password,
+		DisplayName:         user.Username,
+		RegistrationAffCode: user.AffCode,
+		Role:                common.RoleCommonUser, // 明确设置角色为普通用户
 	}
 	if common.EmailVerificationEnabled {
 		cleanUser.Email = user.Email
 	}
-	if err := cleanUser.Insert(inviterId); err != nil {
+	if err := cleanUser.Insert(0); err != nil {
 		if errors.Is(err, model.ErrEmailAlreadyTaken) {
 			common.ApiErrorT(c, "Email address is already in use")
 			return
@@ -410,56 +408,67 @@ func GetUser(c *gin.Context) {
 }
 
 type TransferAffQuotaRequest struct {
-	Quota int `json:"quota" binding:"required"`
+	Quota     int    `json:"quota" binding:"required"`
+	RequestID string `json:"request_id" binding:"required"`
 }
 
 func TransferAffQuota(c *gin.Context) {
-	if !requirePaymentCompliance(c) {
+	var request TransferAffQuotaRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-
-	id := c.GetInt("id")
-	user, err := model.GetUserById(id, true)
+	user := model.User{Id: c.GetInt("id")}
+	result, err := user.TransferAffQuotaToQuota(request.Quota, request.RequestID)
 	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	tran := TransferAffQuotaRequest{}
-	if err := c.ShouldBindJSON(&tran); err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	err = user.TransferAffQuotaToQuota(tran.Quota)
-	var message *common.Message
-	if errors.As(err, &message) {
-		common.ApiError(c, err)
-		return
-	}
-	if err != nil {
-		common.ApiErrorT(c, "Transfer failed {{error}}", map[string]any{"error": err.Error()})
-		return
-	}
-	common.ApiSuccessT(c, "Transfer successful", nil)
-}
-
-func GetAffCode(c *gin.Context) {
-	id := c.GetInt("id")
-	user, err := model.GetUserById(id, true)
-	if err != nil {
-		common.ApiError(c, err)
-		return
-	}
-	if user.AffCode == "" {
-		user.AffCode = common.GetRandomString(4)
-		if err := user.Update(false); err != nil {
+		var rejected *model.AffiliateTransferRejectedError
+		if errors.As(err, &rejected) {
+			common.ApiErrorStatus(c, http.StatusOK, err, gin.H{"data": gin.H{
+				"transfer_status": "rejected", "request_id": request.RequestID, "quota": request.Quota,
+				"result_persisted": rejected.Persisted,
+			}})
+			return
+		}
+		var message *common.Message
+		if errors.As(err, &message) {
 			common.ApiError(c, err)
 			return
 		}
+		common.SysError(common.LogText("invitation reward transfer failed: %s", err.Error()))
+		common.ApiErrorT(c, "Database error, please contact the administrator")
+		return
+	}
+	common.ApiSuccessT(c, "Transfer successful", result)
+}
+
+func GetAffTransfer(c *gin.Context) {
+	result, err := model.GetAffiliateTransfer(c.GetInt("id"), c.Param("request_id"))
+	if err != nil {
+		var rejected *model.AffiliateTransferRejectedError
+		var message *common.Message
+		if result != nil && errors.As(err, &rejected) && rejected.Persisted && errors.As(err, &message) {
+			rejection := message.Fields()
+			rejection["request_id"], rejection["quota"] = result.RequestID, result.Quota
+			// A separate result preserves old clients' found == credited contract.
+			common.ApiSuccessT(c, "", gin.H{"found": false, "transfer": nil, "rejection": rejection})
+			return
+		}
+		common.ApiError(c, err)
+		return
+	}
+	common.ApiSuccessT(c, "", gin.H{"found": result != nil, "transfer": result})
+}
+
+func GetAffCode(c *gin.Context) {
+	code, err := model.GetOrCreateAffiliateCode(c.GetInt("id"))
+	if err != nil {
+		common.ApiError(c, err)
+		return
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    user.AffCode,
+		"data":    code,
 	})
 	return
 }

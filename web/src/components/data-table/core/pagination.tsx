@@ -39,6 +39,7 @@ import { cn, getPageNumbers } from '@/lib/utils'
 type DataTablePaginationProps<TData> = {
   table: Table<TData>
   compact?: boolean
+  disabled?: boolean
 }
 
 const PAGE_SIZE_OPTIONS = [10, 20, 30, 40, 50, 100] as const
@@ -50,6 +51,7 @@ const PAGE_SIZE_SELECT_ITEMS = PAGE_SIZE_OPTIONS.map((pageSize) => ({
 export function DataTablePagination<TData>({
   table,
   compact = false,
+  disabled = false,
 }: DataTablePaginationProps<TData>) {
   const { t } = useTranslation()
   const pagination = table.getState().pagination
@@ -79,12 +81,12 @@ export function DataTablePagination<TData>({
             className='size-11'
             aria-label={t('Go to previous page')}
             onClick={() => table.previousPage()}
-            disabled={!table.getCanPreviousPage()}
+            disabled={disabled || !table.getCanPreviousPage()}
           >
             <ChevronLeftIcon />
           </Button>
           <span className='tabular-nums' aria-live='polite'>
-            {currentPage} / {Math.max(1, totalPages)}
+            {currentPage} / {totalPages < 0 ? '—' : Math.max(1, totalPages)}
           </span>
           <Button
             variant='outline'
@@ -92,7 +94,7 @@ export function DataTablePagination<TData>({
             className='size-11'
             aria-label={t('Go to next page')}
             onClick={() => table.nextPage()}
-            disabled={!table.getCanNextPage()}
+            disabled={disabled || !table.getCanNextPage()}
           >
             <ChevronRightIcon />
           </Button>
@@ -102,7 +104,8 @@ export function DataTablePagination<TData>({
   }
 
   return (
-    <div
+    <nav
+      aria-label={t('Page')}
       className={cn(
         '@container/pagination flex min-w-0 items-center justify-end overflow-clip'
       )}
@@ -121,9 +124,11 @@ export function DataTablePagination<TData>({
             {t('Rows per page')}
           </p>
           <Select
+            disabled={disabled}
             items={PAGE_SIZE_SELECT_ITEMS}
             value={`${pageSize}`}
             onValueChange={(value) => {
+              if (disabled) return
               table.setPageSize(Number(value))
             }}
           >
@@ -147,7 +152,7 @@ export function DataTablePagination<TData>({
             variant='outline'
             className='text-muted-foreground hover:text-foreground disabled:text-muted-foreground/50 size-8 p-0 @max-lg/pagination:hidden'
             onClick={() => table.setPageIndex(0)}
-            disabled={!table.getCanPreviousPage()}
+            disabled={disabled || !table.getCanPreviousPage()}
           >
             <span className='sr-only'>{t('Go to first page')}</span>
             <DoubleArrowLeftIcon className='h-4 w-4' />
@@ -156,7 +161,7 @@ export function DataTablePagination<TData>({
             variant='outline'
             className='text-muted-foreground hover:text-foreground disabled:text-muted-foreground/50 size-8 p-0'
             onClick={() => table.previousPage()}
-            disabled={!table.getCanPreviousPage()}
+            disabled={disabled || !table.getCanPreviousPage()}
           >
             <span className='sr-only'>{t('Go to previous page')}</span>
             <ChevronLeftIcon className='h-4 w-4' />
@@ -178,6 +183,8 @@ export function DataTablePagination<TData>({
                       : 'text-muted-foreground hover:text-foreground'
                   )}
                   onClick={() => table.setPageIndex((pageNumber as number) - 1)}
+                  aria-current={currentPage === pageNumber ? 'page' : undefined}
+                  disabled={disabled}
                 >
                   <span className='sr-only'>
                     {t('Go to page {{page}}', { page: pageNumber })}
@@ -192,7 +199,7 @@ export function DataTablePagination<TData>({
             variant='outline'
             className='text-muted-foreground hover:text-foreground disabled:text-muted-foreground/50 size-8 p-0'
             onClick={() => table.nextPage()}
-            disabled={!table.getCanNextPage()}
+            disabled={disabled || !table.getCanNextPage()}
           >
             <span className='sr-only'>{t('Go to next page')}</span>
             <ChevronRightIcon className='h-4 w-4' />
@@ -201,13 +208,13 @@ export function DataTablePagination<TData>({
             variant='outline'
             className='text-muted-foreground hover:text-foreground disabled:text-muted-foreground/50 size-8 p-0 @max-lg/pagination:hidden'
             onClick={() => table.setPageIndex(table.getPageCount() - 1)}
-            disabled={!table.getCanNextPage()}
+            disabled={disabled || totalPages < 1 || !table.getCanNextPage()}
           >
             <span className='sr-only'>{t('Go to last page')}</span>
             <DoubleArrowRightIcon className='h-4 w-4' />
           </Button>
         </div>
       </div>
-    </div>
+    </nav>
   )
 }

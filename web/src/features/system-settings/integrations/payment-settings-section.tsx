@@ -57,7 +57,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import { getPaymentErrorTranslation } from '@/features/wallet/lib/payment'
 import { handleServerError } from '@/lib/handle-server-error'
+import { authenticationIdentity } from '@/lib/http-client'
 import { cn } from '@/lib/utils'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { confirmPaymentCompliance } from '../api'
 import {
@@ -227,7 +229,16 @@ function parseWaffoPayMethods(value: string): PayMethod[] {
   }
 }
 
-export function PaymentSettingsSection({
+export function PaymentSettingsSection(props: PaymentSettingsSectionProps) {
+  const identity = useAuthStore(
+    (state) =>
+      `${state.auth.user?.id ?? ''}:${state.auth.session?.sid ?? ''}:${state.auth.user?.role ?? ''}`
+  )
+  // Draft credentials and child catalog selections belong to this login.
+  return <PaymentSettingsForm key={identity} {...props} />
+}
+
+function PaymentSettingsForm({
   defaultValues,
   waffoDefaultValues,
   waffoPancakeDefaultValues,
@@ -421,16 +432,23 @@ export function PaymentSettingsSection({
   React.useEffect(() => {
     const parsedDefaults = JSON.parse(defaultsSignature) as PaymentFormValues
     initialRef.current = parsedDefaults
-    form.reset({
-      ...parsedDefaults,
-      PayMethods: formatJsonForEditor(parsedDefaults.PayMethods),
-      AmountOptions: formatJsonForEditor(parsedDefaults.AmountOptions),
-      AmountDiscount: formatJsonForEditor(parsedDefaults.AmountDiscount),
-      CreemProducts: formatJsonForEditor(parsedDefaults.CreemProducts),
-    })
+    // Each saved option can refetch a partial configuration while later
+    // writes are pending or fail. Preserve edits that have not been saved.
+    form.reset(
+      {
+        ...parsedDefaults,
+        PayMethods: formatJsonForEditor(parsedDefaults.PayMethods),
+        AmountOptions: formatJsonForEditor(parsedDefaults.AmountOptions),
+        AmountDiscount: formatJsonForEditor(parsedDefaults.AmountDiscount),
+        CreemProducts: formatJsonForEditor(parsedDefaults.CreemProducts),
+      },
+      { keepDirtyValues: true }
+    )
   }, [defaultsSignature, form])
 
   const onSubmit = async (values: PaymentFormValues) => {
+    const authIdentity = authenticationIdentity()
+    if (!authIdentity) return
     const sanitized = {
       PayAddress: removeTrailingSlash(values.PayAddress),
       EpayId: values.EpayId.trim(),
@@ -758,8 +776,13 @@ export function PaymentSettingsSection({
       return
     }
 
-    for (const update of updates) {
-      await updateOption.mutateAsync(update)
+    try {
+      for (const update of updates) {
+        await updateOption.mutateAsync({ ...update, authIdentity })
+      }
+    } catch {
+      // The mutation reports failures; a changed login also ends this save.
+      return
     }
 
     if (!hasWaffoPancakeChanges) {
@@ -777,13 +800,17 @@ export function PaymentSettingsSection({
     }
 
     try {
-      const body = await saveWaffoPancakeConfig({
-        merchantID: sanitized.WaffoPancakeMerchantID,
-        privateKey: sanitized.WaffoPancakePrivateKey,
-        returnURL: sanitized.WaffoPancakeReturnURL,
-        storeID: waffoPancakeSelection.storeID,
-        productID: waffoPancakeSelection.productID,
-      })
+      const body = await saveWaffoPancakeConfig(
+        {
+          merchantID: sanitized.WaffoPancakeMerchantID,
+          privateKey: sanitized.WaffoPancakePrivateKey,
+          returnURL: sanitized.WaffoPancakeReturnURL,
+          storeID: waffoPancakeSelection.storeID,
+          productID: waffoPancakeSelection.productID,
+        },
+        authIdentity
+      )
+      if (authIdentity !== authenticationIdentity()) return
 
       if (
         body?.message === 'success' &&

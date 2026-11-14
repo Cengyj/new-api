@@ -4,13 +4,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/relaykit/dto"
-	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/bytedance/gopkg/util/gopool"
 	"gorm.io/gorm"
@@ -112,6 +112,14 @@ type User struct {
 	LastLoginAt          int64                      `json:"last_login_at" gorm:"default:0;column:last_login_at"`
 	AuthVersion          int64                      `json:"-" gorm:"type:bigint;not null;default:1;column:auth_version"`
 	AdminPermissions     map[string]map[string]bool `json:"admin_permissions,omitempty" gorm:"-:all"`
+
+	ReferralRateBPS     int    `json:"-" gorm:"type:int;default:0"`
+	ReferralExpiresAt   int64  `json:"-" gorm:"type:bigint;default:0"`
+	RegistrationAffCode string `json:"-" gorm:"-:all"`
+
+	registrationNewUserQuota int
+	registrationInviteeQuota int
+	registrationInviterQuota int
 }
 
 func (user *User) ToBaseUser() *UserBase {
@@ -540,6 +548,34 @@ func GetSelfUserById(id int) (*User, error) {
 	return &profile.User, err
 }
 
+// GetOrCreateAffiliateCode only changes an unset invitation code. A full user
+// update here could restore credentials or permissions changed since the read.
+// The conditional write lets concurrent first requests share the winning code.
+func GetOrCreateAffiliateCode(userID int) (string, error) {
+	if userID <= 0 {
+		return "", common.NewMessage("ID is empty!")
+	}
+	var user User
+	if err := DB.Select("id", "aff_code").First(&user, userID).Error; err != nil {
+		return "", err
+	}
+	if user.AffCode != "" {
+		return user.AffCode, nil
+	}
+	code := common.GetRandomString(4)
+	result := DB.Model(&User{}).Where("id = ? AND (aff_code = ? OR aff_code IS NULL)", userID, "").UpdateColumn("aff_code", code)
+	if result.Error != nil {
+		return "", result.Error
+	}
+	if result.RowsAffected == 1 {
+		return code, nil
+	}
+	if err := DB.Select("id", "aff_code").First(&user, userID).Error; err != nil {
+		return "", err
+	}
+	return user.AffCode, nil
+}
+
 func GetUserIdByAffCode(affCode string) (int, error) {
 	if affCode == "" {
 		return 0, errors.New("affiliate code is empty")
@@ -567,58 +603,6 @@ func HardDeleteUserById(id int) (int64, error) {
 	}
 	user := User{Id: id}
 	return user.HardDelete()
-}
-
-func inviteUser(inviterId int) error {
-	result := DB.Model(&User{}).Where("id = ?", inviterId).Updates(map[string]any{
-		"aff_count":   gorm.Expr("aff_count + ?", 1),
-		"aff_quota":   gorm.Expr("aff_quota + ?", common.QuotaForInviter),
-		"aff_history": gorm.Expr("aff_history + ?", common.QuotaForInviter),
-	})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
-}
-
-func (user *User) TransferAffQuotaToQuota(quota int) error {
-	// 检查quota是否小于最小额度
-	if float64(quota) < common.QuotaPerUnit {
-		return common.NewMessage("Minimum transfer quota is {{min}}!", map[string]any{"min": logger.FormatQuota(common.QuotaFromFloat(common.QuotaPerUnit))})
-	}
-
-	// 开始数据库事务
-	tx := DB.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
-	defer tx.Rollback() // 确保在函数退出时事务能回滚
-
-	// 加锁查询用户以确保数据一致性
-	err := lockForUpdate(tx).First(user, user.Id).Error
-	if err != nil {
-		return err
-	}
-
-	// 再次检查用户的AffQuota是否足够
-	if user.AffQuota < quota {
-		return common.NewMessage("Invitation quota is insufficient!")
-	}
-
-	// 更新用户额度
-	user.AffQuota -= quota
-	user.Quota += quota
-
-	// 保存用户状态
-	if err := tx.Save(user).Error; err != nil {
-		return err
-	}
-
-	// 提交事务
-	return tx.Commit().Error
 }
 
 func (user *User) prepareForInsert(tx *gorm.DB) error {
@@ -674,59 +658,25 @@ func ensureEmailAvailableWithTx(tx *gorm.DB, email string, excludeUserID int) er
 
 func (user *User) Insert(inviterId int) error {
 	if err := DB.Transaction(func(tx *gorm.DB) error {
-		return withNormalizedEmailLock(tx, user.Email, func(tx *gorm.DB) error {
-			if err := user.prepareForInsert(tx); err != nil {
-				return err
-			}
-			user.Quota = common.QuotaForNewUser
-			user.AffCode = common.GetRandomString(4)
-
-			// 初始化用户设置，包括默认的边栏配置
-			if user.Setting == "" {
-				defaultSetting := dto.UserSetting{}
-				// 这里暂时不设置SidebarModules，因为需要在用户创建后根据角色设置
-				user.SetSetting(defaultSetting)
-			}
-
-			return tx.Create(user).Error
-		})
+		return user.InsertWithTx(tx, inviterId)
 	}); err != nil {
 		return err
 	}
-
 	user.finishInsert(inviterId)
 	return nil
 }
 
-func (user *User) finishInsert(inviterId int) {
-	// 用户创建成功后，根据角色初始化边栏配置
-	// 需要重新获取用户以确保有正确的ID和Role
-	var createdUser User
-	if err := DB.Where("username = ?", user.Username).First(&createdUser).Error; err == nil {
-		// 生成基于角色的默认边栏配置
-		defaultSidebarConfig := generateDefaultSidebarConfigForRole(createdUser.Role)
-		if defaultSidebarConfig != "" {
-			currentSetting := createdUser.GetSetting()
-			currentSetting.SidebarModules = defaultSidebarConfig
-			createdUser.SetSetting(currentSetting)
-			createdUser.Update(false)
-			common.SysLog(common.LogText("initialized the sidebar config for new user %s (role: %d)", createdUser.Username, createdUser.Role))
-		}
+// finishInsert contains only non-financial effects. Re-running it can never
+// mint a registration reward or change the registration snapshot.
+func (user *User) finishInsert(_ int) {
+	if user.registrationNewUserQuota > 0 {
+		RecordLog(user.Id, LogTypeSystem, common.NewMessage("New user sign-up bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(user.registrationNewUserQuota)}))
 	}
-
-	if common.QuotaForNewUser > 0 {
-		RecordLog(user.Id, LogTypeSystem, common.NewMessage("New user sign-up bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForNewUser)}))
+	if user.registrationInviteeQuota > 0 {
+		RecordLog(user.Id, LogTypeSystem, common.NewMessage("Invitation code bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(user.registrationInviteeQuota)}))
 	}
-	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
-		if common.QuotaForInvitee > 0 {
-			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)
-			RecordLog(user.Id, LogTypeSystem, common.NewMessage("Invitation code bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForInvitee)}))
-		}
-		if common.QuotaForInviter > 0 {
-			//_ = IncreaseUserQuota(inviterId, common.QuotaForInviter)
-			RecordLog(inviterId, LogTypeSystem, common.NewMessage("Bonus for inviting a user {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForInviter)}))
-			_ = inviteUser(inviterId)
-		}
+	if user.registrationInviterQuota > 0 {
+		RecordLog(user.InviterId, LogTypeSystem, common.NewMessage("Bonus for inviting a user {{quota}}", map[string]any{"quota": logger.FormatQuota(user.registrationInviterQuota)}))
 	}
 }
 
@@ -734,56 +684,87 @@ func (user *User) FinishInsert(inviterId int) {
 	user.finishInsert(inviterId)
 }
 
-// InsertWithTx inserts a new user within an existing transaction.
-// This is used for OAuth registration where user creation and binding need to be atomic.
-// Post-creation tasks (sidebar config, logs, inviter rewards) are handled after the transaction commits.
+// InsertWithTx keeps user creation, its immutable invitation relationship,
+// qualification and fixed registration rewards in the caller's transaction.
+// OAuth identity association therefore rolls all of them back on failure.
 func (user *User) InsertWithTx(tx *gorm.DB, inviterId int) error {
 	return withNormalizedEmailLock(tx, user.Email, func(tx *gorm.DB) error {
 		if err := user.prepareForInsert(tx); err != nil {
 			return err
 		}
-		user.Quota = common.QuotaForNewUser
-		user.AffCode = common.GetRandomString(4)
-
-		// 初始化用户设置
-		if user.Setting == "" {
-			defaultSetting := dto.UserSetting{}
-			user.SetSetting(defaultSetting)
+		user.InviterId = inviterId
+		if user.RegistrationAffCode != "" {
+			var inviter User
+			err := tx.Select("id").Where("aff_code = ?", user.RegistrationAffCode).First(&inviter).Error
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			user.InviterId = inviter.Id
 		}
-
+		if user.InviterId != 0 && user.Id == user.InviterId {
+			user.InviterId = 0
+		}
+		// This acquires the rule lock before the inviter lock, and records
+		// server time only after waiting for concurrent rule/account changes.
+		if err := PrepareReferralRegistrationTx(tx, user); err != nil {
+			return err
+		}
+		// Fixed gifts use one configuration snapshot for validation, credit and
+		// post-commit logging. Never hold the option lock across database work.
+		common.OptionMapRWMutex.RLock()
+		user.registrationNewUserQuota = common.QuotaForNewUser
+		inviteeQuota, inviterQuota := common.QuotaForInvitee, common.QuotaForInviter
+		common.OptionMapRWMutex.RUnlock()
+		user.Quota = user.registrationNewUserQuota
+		user.AffQuota, user.AffHistoryQuota, user.AffCount = 0, 0, 0
+		user.registrationInviteeQuota, user.registrationInviterQuota = 0, 0
+		if err := common.ValidateWalletQuota(user.Quota); err != nil {
+			return err
+		}
+		if user.InviterId > 0 && paymentComplianceConfirmed() {
+			var inviter User
+			err := lockForUpdate(tx).First(&inviter, user.InviterId).Error
+			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			if err == nil {
+				if inviteeQuota > 0 {
+					if inviteeQuota > common.MaxWalletQuota || user.Quota > common.MaxWalletQuota-inviteeQuota {
+						return ErrWalletQuotaLimitExceeded
+					}
+					user.registrationInviteeQuota = inviteeQuota
+					user.Quota += user.registrationInviteeQuota
+				}
+				if inviterQuota > 0 {
+					if inviterQuota > common.MaxWalletQuota || inviter.AffQuota < 0 || inviter.AffHistoryQuota < 0 ||
+						inviter.AffQuota > common.MaxWalletQuota-inviterQuota || inviter.AffHistoryQuota > common.MaxWalletQuota-inviterQuota || inviter.AffCount >= math.MaxInt {
+						return ErrReferralRewardLimit
+					}
+					user.registrationInviterQuota = inviterQuota
+					if err := tx.Model(&User{}).Where("id = ?", inviter.Id).Updates(map[string]any{
+						"aff_count":   gorm.Expr("aff_count + ?", 1),
+						"aff_quota":   gorm.Expr("aff_quota + ?", user.registrationInviterQuota),
+						"aff_history": gorm.Expr("aff_history + ?", user.registrationInviterQuota),
+					}).Error; err != nil {
+						return err
+					}
+				}
+			}
+		}
+		user.AffCode = common.GetRandomString(4)
+		if user.Setting == "" {
+			role := user.Role
+			if role == 0 {
+				role = common.RoleCommonUser
+			}
+			user.SetSetting(dto.UserSetting{SidebarModules: generateDefaultSidebarConfigForRole(role)})
+		}
 		return tx.Create(user).Error
 	})
 }
 
-// FinalizeOAuthUserCreation performs post-transaction tasks for OAuth user creation.
-// This should be called after the transaction commits successfully.
 func (user *User) FinalizeOAuthUserCreation(inviterId int) {
-	// 用户创建成功后，根据角色初始化边栏配置
-	var createdUser User
-	if err := DB.Where("id = ?", user.Id).First(&createdUser).Error; err == nil {
-		defaultSidebarConfig := generateDefaultSidebarConfigForRole(createdUser.Role)
-		if defaultSidebarConfig != "" {
-			currentSetting := createdUser.GetSetting()
-			currentSetting.SidebarModules = defaultSidebarConfig
-			createdUser.SetSetting(currentSetting)
-			createdUser.Update(false)
-			common.SysLog(common.LogText("initialized the sidebar config for new user %s (role: %d)", createdUser.Username, createdUser.Role))
-		}
-	}
-
-	if common.QuotaForNewUser > 0 {
-		RecordLog(user.Id, LogTypeSystem, common.NewMessage("New user sign-up bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForNewUser)}))
-	}
-	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
-		if common.QuotaForInvitee > 0 {
-			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)
-			RecordLog(user.Id, LogTypeSystem, common.NewMessage("Invitation code bonus {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForInvitee)}))
-		}
-		if common.QuotaForInviter > 0 {
-			RecordLog(inviterId, LogTypeSystem, common.NewMessage("Bonus for inviting a user {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaForInviter)}))
-			_ = inviteUser(inviterId)
-		}
-	}
+	user.finishInsert(inviterId)
 }
 
 func (user *User) Update(updatePassword bool) error {
@@ -840,6 +821,10 @@ func (user *User) UpdateWithTx(tx *gorm.DB, updatePassword bool) error {
 		"aff_count",
 		"aff_quota",
 		"aff_history",
+		"inviter_id",
+		"created_at",
+		"referral_rate_bps",
+		"referral_expires_at",
 		"auth_version",
 	).Updates(newUser).Error; err != nil {
 		return err

@@ -17,42 +17,52 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import i18next from 'i18next'
-import { useState, useCallback } from 'react'
+import { useCallback } from 'react'
 import { toast } from 'sonner'
 
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { requestCreemPayment, isApiSuccess } from '../api'
+import { isSafePaymentUrl } from '../lib/payment'
+import { usePaymentOperation } from './use-payment-operation'
 
-/**
- * Hook for handling Creem payment processing
- */
-export function useCreemPayment() {
-  const [processing, setProcessing] = useState(false)
-
-  const processCreemPayment = useCallback(async (productId: string) => {
-    setProcessing(true)
-    try {
-      const response = await requestCreemPayment({
-        product_id: productId,
-        payment_method: 'creem',
-      })
-
-      if (isApiSuccess(response) && response.data?.checkout_url) {
-        window.open(response.data.checkout_url, '_blank')
-        toast.success(i18next.t('Redirecting to Creem checkout...'))
-        return true
+export function useCreemPayment(onUnknownCheckout?: () => void) {
+  const { processing, runPayment } = usePaymentOperation(onUnknownCheckout)
+  const processCreemPayment = useCallback(
+    async (productId: string) => {
+      if (!productId.trim()) {
+        toast.error(i18next.t('Payment request failed'))
+        return false
       }
-
-      handleServerError(response, i18next.t('Payment request failed'))
-      return false
-    } catch (_error) {
-      handleServerError(_error, i18next.t('Payment request failed'))
-      return false
-    } finally {
-      setProcessing(false)
-    }
-  }, [])
-
+      return runPayment(
+        (signal) =>
+          requestCreemPayment(
+            {
+              product_id: productId,
+              payment_method: 'creem',
+            },
+            signal
+          ),
+        (response) => {
+          if (!isApiSuccess(response)) {
+            handleServerError(response, i18next.t('Payment request failed'))
+            return false
+          }
+          if (!isSafePaymentUrl(response.data?.checkout_url)) {
+            toast.error(i18next.t('Invalid payment redirect URL'))
+            return false
+          }
+          window.open(
+            response.data.checkout_url,
+            '_blank',
+            'noopener,noreferrer'
+          )
+          toast.success(i18next.t('Redirecting to Creem checkout...'))
+          return true
+        }
+      )
+    },
+    [runPayment]
+  )
   return { processing, processCreemPayment }
 }

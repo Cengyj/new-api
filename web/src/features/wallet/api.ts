@@ -55,8 +55,13 @@ export function isApiSuccess(response: ApiResponse): boolean {
 /**
  * Get topup configuration info
  */
-export async function getTopupInfo(): Promise<TopupInfoResponse> {
-  const res = await api.get('/api/user/topup/info')
+export async function getTopupInfo(
+  signal?: AbortSignal
+): Promise<TopupInfoResponse> {
+  const res = await api.get('/api/user/topup/info', {
+    signal,
+    disableDuplicate: true,
+  })
   return res.data
 }
 
@@ -110,10 +115,14 @@ export async function calculateWaffoAmount(
  * Request regular payment
  */
 export async function requestPayment(
-  request: PaymentRequest
+  request: PaymentRequest,
+  signal?: AbortSignal
 ): Promise<PaymentResponse> {
   const res = await api.post('/api/user/pay', request, {
+    signal,
     skipBusinessError: true,
+    skipAuthRefresh: true,
+    skipErrorHandler: true,
   } as Record<string, unknown>)
   return {
     ...res.data,
@@ -125,10 +134,14 @@ export async function requestPayment(
  * Request Stripe payment
  */
 export async function requestStripePayment(
-  request: PaymentRequest
+  request: PaymentRequest,
+  signal?: AbortSignal
 ): Promise<StripePaymentResponse> {
   const res = await api.post('/api/user/stripe/pay', request, {
+    signal,
     skipBusinessError: true,
+    skipAuthRefresh: true,
+    skipErrorHandler: true,
   } as Record<string, unknown>)
   return res.data
 }
@@ -137,10 +150,14 @@ export async function requestStripePayment(
  * Request Creem payment
  */
 export async function requestCreemPayment(
-  request: CreemPaymentRequest
+  request: CreemPaymentRequest,
+  signal?: AbortSignal
 ): Promise<CreemPaymentResponse> {
   const res = await api.post('/api/user/creem/pay', request, {
+    signal,
     skipBusinessError: true,
+    skipAuthRefresh: true,
+    skipErrorHandler: true,
   } as Record<string, unknown>)
   return res.data
 }
@@ -149,10 +166,14 @@ export async function requestCreemPayment(
  * Request Waffo payment
  */
 export async function requestWaffoPayment(
-  request: WaffoPaymentRequest
+  request: WaffoPaymentRequest,
+  signal?: AbortSignal
 ): Promise<WaffoPaymentResponse> {
   const res = await api.post('/api/user/waffo/pay', request, {
+    signal,
     skipBusinessError: true,
+    skipAuthRefresh: true,
+    skipErrorHandler: true,
   } as Record<string, unknown>)
   return res.data
 }
@@ -173,10 +194,14 @@ export async function calculateWaffoPancakeAmount(
  * Request Waffo Pancake payment
  */
 export async function requestWaffoPancakePayment(
-  request: WaffoPancakePaymentRequest
+  request: WaffoPancakePaymentRequest,
+  signal?: AbortSignal
 ): Promise<WaffoPancakePaymentResponse> {
   const res = await api.post('/api/user/waffo-pancake/pay', request, {
+    signal,
     skipBusinessError: true,
+    skipAuthRefresh: true,
+    skipErrorHandler: true,
   } as Record<string, unknown>)
   return res.data
 }
@@ -195,7 +220,9 @@ export async function getAffiliateCode(): Promise<AffiliateCodeResponse> {
 export async function transferAffiliateQuota(
   request: AffiliateTransferRequest
 ): Promise<AffiliateTransferResponse> {
-  const res = await api.post('/api/user/aff_transfer', request)
+  const res = await api.post('/api/user/aff_transfer', request, {
+    skipAuthRefresh: true,
+  })
   return res.data
 }
 
@@ -205,7 +232,8 @@ export async function transferAffiliateQuota(
 export async function getUserBillingHistory(
   page: number,
   pageSize: number,
-  keyword?: string
+  keyword?: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<BillingHistoryResponse>> {
   const params = new URLSearchParams({
     p: page.toString(),
@@ -214,7 +242,11 @@ export async function getUserBillingHistory(
   if (keyword) {
     params.append('keyword', keyword)
   }
-  const res = await api.get(`/api/user/topup/self?${params.toString()}`)
+  const res = await api.get(`/api/user/topup/self?${params.toString()}`, {
+    signal,
+    disableDuplicate: true,
+    skipErrorHandler: true,
+  })
   return res.data
 }
 
@@ -224,7 +256,8 @@ export async function getUserBillingHistory(
 export async function getAllBillingHistory(
   page: number,
   pageSize: number,
-  keyword?: string
+  keyword?: string,
+  signal?: AbortSignal
 ): Promise<ApiResponse<BillingHistoryResponse>> {
   const params = new URLSearchParams({
     p: page.toString(),
@@ -233,7 +266,11 @@ export async function getAllBillingHistory(
   if (keyword) {
     params.append('keyword', keyword)
   }
-  const res = await api.get(`/api/user/topup?${params.toString()}`)
+  const res = await api.get(`/api/user/topup?${params.toString()}`, {
+    signal,
+    disableDuplicate: true,
+    skipErrorHandler: true,
+  })
   return res.data
 }
 
@@ -241,8 +278,13 @@ export async function getAllBillingHistory(
  * Complete a pending order (admin only)
  */
 export async function completeOrder(
-  request: CompleteOrderRequest
+  request: CompleteOrderRequest,
+  signal?: AbortSignal
 ): Promise<ApiResponse> {
-  const res = await api.post('/api/user/topup/complete', request)
+  const res = await api.post('/api/user/topup/complete', request, {
+    signal,
+    skipAuthRefresh: true,
+    skipErrorHandler: true,
+  })
   return res.data
 }

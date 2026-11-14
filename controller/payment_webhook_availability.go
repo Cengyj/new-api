@@ -34,6 +34,7 @@ func isCreemTopUpEnabled() bool {
 	}
 	products := strings.TrimSpace(setting.CreemProducts)
 	return strings.TrimSpace(setting.CreemApiKey) != "" &&
+		isCreemWebhookConfigured() &&
 		products != "" &&
 		products != "[]"
 }
@@ -43,7 +44,7 @@ func isCreemWebhookConfigured() bool {
 }
 
 func isCreemWebhookEnabled() bool {
-	return isCreemTopUpEnabled() && isCreemWebhookConfigured()
+	return isCreemTopUpEnabled()
 }
 
 func isWaffoTopUpEnabled() bool {
@@ -103,11 +104,16 @@ func isEpayWebhookConfigured() bool {
 	if strings.TrimSpace(operation_setting.PayAddress) == "" || strings.TrimSpace(operation_setting.EpayId) == "" {
 		return false
 	}
-	if paymentSetting := operation_setting.GetPaymentSetting(); paymentSetting.EpaySignType == operation_setting.EpaySignTypeRSA {
+	paymentSetting := operation_setting.GetPaymentSetting()
+	switch paymentSetting.EpaySignType {
+	case operation_setting.EpaySignTypeRSA:
 		return strings.TrimSpace(paymentSetting.EpayMerchantPrivateKey) != "" &&
 			strings.TrimSpace(paymentSetting.EpayPlatformPublicKey) != ""
+	case "", operation_setting.EpaySignTypeMD5:
+		return strings.TrimSpace(operation_setting.EpayKey) != ""
+	default:
+		return false
 	}
-	return strings.TrimSpace(operation_setting.EpayKey) != ""
 }
 
 func isEpayWebhookEnabled() bool {

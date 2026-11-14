@@ -57,37 +57,45 @@ func IsPaymentComplianceConfirmed() bool {
 		paymentSetting.ComplianceTermsVersion == CurrentComplianceTermsVersion
 }
 
-// ValidateEpaySignOption checks a change to the Epay signing settings against
-// the saved ones. While RSA is active, both keys must parse; under MD5 only a
-// newly entered key is checked.
+// ValidateEpaySignOption validates a single setting against the active keys.
 func ValidateEpaySignOption(key, value string) error {
-	if key != EpaySignTypeOptionKey && key != EpayMerchantPrivateKeyOptionKey && key != EpayPlatformPublicKeyOptionKey {
+	return ValidateEpaySignOptions(map[string]string{key: value})
+}
+
+// ValidateEpaySignOptions validates the complete proposed signing configuration.
+// A batch can enable RSA with both keys, or switch to MD5 while clearing them.
+// Callers serialize this validation with payment configuration publication.
+func ValidateEpaySignOptions(values map[string]string) error {
+	signValue, signChanged := values[EpaySignTypeOptionKey]
+	privateValue, privateChanged := values[EpayMerchantPrivateKeyOptionKey]
+	publicValue, publicChanged := values[EpayPlatformPublicKeyOptionKey]
+	if !signChanged && !privateChanged && !publicChanged {
 		return nil
 	}
-	// Saved values are written under OptionMapRWMutex by the option update path.
 	common.OptionMapRWMutex.RLock()
 	signType := paymentSetting.EpaySignType
 	privateKey := paymentSetting.EpayMerchantPrivateKey
 	publicKey := paymentSetting.EpayPlatformPublicKey
 	common.OptionMapRWMutex.RUnlock()
-	switch key {
-	case EpaySignTypeOptionKey:
-		if value != EpaySignTypeMD5 && value != EpaySignTypeRSA {
+	if signChanged {
+		if signValue != EpaySignTypeMD5 && signValue != EpaySignTypeRSA {
 			return common.NewMessage("Epay signature type must be MD5 or RSA")
 		}
-		signType = value
-	case EpayMerchantPrivateKeyOptionKey:
-		privateKey = value
-	case EpayPlatformPublicKeyOptionKey:
-		publicKey = value
+		signType = signValue
+	}
+	if privateChanged {
+		privateKey = privateValue
+	}
+	if publicChanged {
+		publicKey = publicValue
 	}
 	rsaActive := signType == EpaySignTypeRSA
-	if rsaActive || (key == EpayMerchantPrivateKeyOptionKey && strings.TrimSpace(value) != "") {
+	if rsaActive || (privateChanged && strings.TrimSpace(privateValue) != "") {
 		if _, err := epay.ParseRSAPrivateKey(privateKey); err != nil {
 			return common.NewMessage("The Epay merchant private key is missing or invalid")
 		}
 	}
-	if rsaActive || (key == EpayPlatformPublicKeyOptionKey && strings.TrimSpace(value) != "") {
+	if rsaActive || (publicChanged && strings.TrimSpace(publicValue) != "") {
 		if _, err := epay.ParseRSAPublicKey(publicKey); err != nil {
 			return common.NewMessage("The Epay platform public key is missing or invalid")
 		}

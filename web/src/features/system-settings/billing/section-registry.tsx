@@ -25,6 +25,7 @@ import { PaymentSettingsSection } from '../integrations/payment-settings-section
 import { RatioSettingsCard } from '../models/ratio-settings-card'
 import type { BillingSettings } from '../types'
 import { createSectionRegistry } from '../utils/section-registry'
+import { ReferralRebateSection } from './referral-rebate-section'
 
 const getModelDefaults = (settings: BillingSettings) => ({
   ModelPrice: settings.ModelPrice,
@@ -78,6 +79,11 @@ const BILLING_SECTIONS = [
         }
       />
     ),
+  },
+  {
+    id: 'referral-rebate',
+    titleKey: 'Invitation top-up rebates',
+    build: () => <ReferralRebateSection />,
   },
   {
     id: 'currency',

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"database/sql"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -49,7 +50,7 @@ func getUserVerificationState(tx *gorm.DB, userID int, forUpdate bool) (*UserVer
 // the resulting session together. The user lock serializes credential changes
 // and session issuance, including the per-user session limits. validate runs
 // inside the transaction and may write through tx.
-func CreateUserSessionFromLoginFlow(token string, session *UserSession, validate func(*gorm.DB, *AuthFlow, *UserVerificationState) error) error {
+func CreateUserSessionFromLoginFlow(token string, session *UserSession, validate func(*gorm.DB, *AuthFlow, *UserVerificationState) error, options ...*sql.TxOptions) error {
 	if session == nil || validate == nil {
 		return ErrUserSessionInvalid
 	}
@@ -82,7 +83,7 @@ func CreateUserSessionFromLoginFlow(token string, session *UserSession, validate
 			return ErrUserSessionIssuanceLimit
 		}
 		return createUserSessionWithTx(tx, session)
-	})
+	}, options...)
 	if err != nil {
 		return err
 	}

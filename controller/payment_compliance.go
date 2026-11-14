@@ -18,7 +18,10 @@ type PaymentComplianceRequest struct {
 }
 
 func requirePaymentCompliance(c *gin.Context) bool {
-	if !operation_setting.IsPaymentComplianceConfirmed() {
+	common.OptionMapRWMutex.RLock()
+	confirmed := operation_setting.IsPaymentComplianceConfirmed()
+	common.OptionMapRWMutex.RUnlock()
+	if !confirmed {
 		common.ApiErrorT(c, "Payment, redemption, subscription, and invitation reward features are disabled. The administrator must confirm compliance terms before enabling them.")
 		return false
 	}
@@ -56,11 +59,9 @@ func ConfirmPaymentCompliance(c *gin.Context) {
 		"payment_setting.compliance_confirmed_ip":  clientIP,
 	}
 
-	for key, value := range updates {
-		if err := model.UpdateOption(key, value); err != nil {
-			common.ApiError(c, err)
-			return
-		}
+	if err := model.UpdateOptionsBulk(updates); err != nil {
+		common.ApiError(c, err)
+		return
 	}
 
 	logger.LogInfo(c.Request.Context(), common.LogText(

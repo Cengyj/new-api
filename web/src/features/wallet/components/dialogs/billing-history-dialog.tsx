@@ -20,18 +20,10 @@ import { Search, Copy, Check, ChevronLeft, ChevronRight } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Dialog } from '@/components/dialog'
+import { ErrorState } from '@/components/error-state'
 import { StatusBadge } from '@/components/status-badge'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -45,10 +37,16 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
-import { formatCurrencyFromUSD } from '@/lib/currency'
+import { toIntlLocale } from '@/i18n/languages'
+import { formatCurrencyFromUSD, formatQuotaWithCurrency } from '@/lib/currency'
 import { formatNumber } from '@/lib/format'
+import { useAuthStore } from '@/stores/auth-store'
+import { useSystemConfigStore } from '@/stores/system-config-store'
 
-import { useBillingHistory } from '../../hooks/use-billing-history'
+import {
+  billingHistoryIdentity,
+  useBillingHistory,
+} from '../../hooks/use-billing-history'
 import {
   getStatusConfig,
   getPaymentMethodName,
@@ -57,14 +55,28 @@ import {
 
 interface BillingHistoryDialogProps {
   open: boolean
+  initialKeyword?: string
   onOpenChange: (open: boolean) => void
 }
 
-export function BillingHistoryDialog({
+export function BillingHistoryDialog(props: BillingHistoryDialogProps) {
+  const identity = useAuthStore(billingHistoryIdentity)
+  return (
+    <BillingHistoryContent
+      key={`${identity}:${props.initialKeyword ?? ''}:${props.open}`}
+      {...props}
+    />
+  )
+}
+
+function BillingHistoryContent({
   open,
   onOpenChange,
+  initialKeyword,
 }: BillingHistoryDialogProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
+  const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+  const currency = useSystemConfigStore((state) => state.config.currency)
   const {
     records,
     total,
@@ -72,13 +84,15 @@ export function BillingHistoryDialog({
     pageSize,
     keyword,
     loading,
+    loadFailed,
     completing,
     isAdmin,
     handlePageChange,
     handlePageSizeChange,
     handleSearch,
     handleCompleteOrder,
-  } = useBillingHistory()
+    refresh,
+  } = useBillingHistory({ initialKeyword, enabled: open })
 
   const [confirmTradeNo, setConfirmTradeNo] = useState<string | null>(null)
   const { copyToClipboard, copiedText } = useCopyToClipboard({ notify: false })
@@ -98,7 +112,9 @@ export function BillingHistoryDialog({
     <>
       <Dialog
         open={open}
-        onOpenChange={onOpenChange}
+        onOpenChange={(open) => {
+          if (open || !completing) onOpenChange(open)
+        }}
         title={t('Billing History')}
         description={t(
           'View your topup transaction records and payment history'
@@ -172,7 +188,14 @@ export function BillingHistoryDialog({
                 )}
               </div>
             )}
-            {!loading && records.length === 0 && (
+            {!loading && loadFailed && (
+              <ErrorState
+                className='min-h-40'
+                description={t('Failed to load billing history')}
+                onRetry={() => void refresh()}
+              />
+            )}
+            {!loading && !loadFailed && records.length === 0 && (
               <div className='text-muted-foreground flex min-h-40 flex-col items-center justify-center py-10 text-center'>
                 <p className='text-sm font-medium'>
                   {t('No billing records found')}
@@ -184,10 +207,29 @@ export function BillingHistoryDialog({
                 </p>
               </div>
             )}
-            {!loading && records.length > 0 && (
+            {!loading && !loadFailed && records.length > 0 && (
               <div className='space-y-3'>
                 {records.map((record) => {
                   const statusConfig = getStatusConfig(record.status)
+                  // Frozen quota is authoritative. Only legacy orders need
+                  // the provider's historical Amount units (Creem uses quota).
+                  const creditedQuota = record.credited_quota
+                  const formatAmount =
+                    creditedQuota != null || record.payment_provider === 'creem'
+                      ? formatQuotaWithCurrency
+                      : formatCurrencyFromUSD
+                  // Token display must not lose integer quota units in a
+                  // quota -> USD -> quota floating-point round trip.
+                  const displayAmount =
+                    creditedQuota != null &&
+                    currency.quotaDisplayType === 'TOKENS'
+                      ? formatNumber(creditedQuota, locale)
+                      : formatAmount(creditedQuota ?? record.amount, {
+                          digitsLarge: 2,
+                          digitsSmall: 2,
+                          abbreviate: false,
+                          locale,
+                        })
                   return (
                     <div
                       key={record.id}
@@ -195,7 +237,7 @@ export function BillingHistoryDialog({
                     >
                       {/* Header Row */}
                       <div className='flex items-start justify-between gap-2'>
-                        <div className='flex-1 space-y-1'>
+                        <div className='min-w-0 flex-1 space-y-1'>
                           <div className='flex min-w-0 items-center gap-2'>
                             <code className='text-foreground truncate font-mono text-sm'>
                               {record.trade_no}
@@ -203,7 +245,7 @@ export function BillingHistoryDialog({
                             <Button
                               variant='ghost'
                               size='sm'
-                              className='h-5 w-5 p-0'
+                              className='h-5 w-5 shrink-0 p-0'
                               onClick={() => copyToClipboard(record.trade_no)}
                             >
                               {copiedText === record.trade_no ? (
@@ -226,6 +268,7 @@ export function BillingHistoryDialog({
                           </div>
                         </div>
                         <StatusBadge
+                          className='shrink-0'
                           label={t(statusConfig.label)}
                           variant={statusConfig.variant}
                           showDot
@@ -248,11 +291,7 @@ export function BillingHistoryDialog({
                             {t('Amount')}
                           </Label>
                           <div className='text-sm font-semibold'>
-                            {formatCurrencyFromUSD(record.amount, {
-                              digitsLarge: 2,
-                              digitsSmall: 2,
-                              abbreviate: false,
-                            })}
+                            {displayAmount}
                           </div>
                         </div>
                         <div className='space-y-1'>
@@ -260,7 +299,7 @@ export function BillingHistoryDialog({
                             {t('Payment')}
                           </Label>
                           <div className='text-sm font-semibold text-red-600'>
-                            {formatNumber(record.money)}
+                            {formatNumber(record.money, locale)}
                           </div>
                         </div>
                       </div>
@@ -286,7 +325,7 @@ export function BillingHistoryDialog({
           </div>
 
           {/* Pagination */}
-          {!loading && records.length > 0 && (
+          {!loading && !loadFailed && records.length > 0 && (
             <div className='flex flex-col items-center gap-3 border-t pt-4 sm:flex-row sm:items-center sm:justify-between'>
               <div className='text-muted-foreground text-xs sm:text-sm'>
                 {t('Showing')} {(page - 1) * pageSize + 1}-
@@ -323,32 +362,17 @@ export function BillingHistoryDialog({
       </Dialog>
 
       {/* Confirm Complete Order Dialog */}
-      <AlertDialog
+      <ConfirmDialog
         open={!!confirmTradeNo}
-        onOpenChange={(open) => !open && setConfirmTradeNo(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>{t('Complete Order')}</AlertDialogTitle>
-            <AlertDialogDescription>
-              {t(
-                'Are you sure you want to manually complete this order? The user will be credited with the corresponding quota.'
-              )}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={completing}>
-              {t('Cancel')}
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleConfirmComplete}
-              disabled={completing}
-            >
-              {completing ? t('Processing...') : t('Confirm')}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => !open && !completing && setConfirmTradeNo(null)}
+        title={t('Complete Order')}
+        desc={t(
+          'Are you sure you want to manually complete this order? The user will be credited with the corresponding quota.'
+        )}
+        handleConfirm={handleConfirmComplete}
+        isLoading={completing}
+        confirmText={completing ? t('Processing...') : t('Confirm')}
+      />
     </>
   )
 }

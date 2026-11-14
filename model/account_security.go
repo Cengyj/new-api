@@ -1,6 +1,7 @@
 package model
 
 import (
+	"database/sql"
 	"errors"
 
 	"github.com/QuantumNous/new-api/common"
@@ -14,6 +15,44 @@ var (
 	ErrAccountBindingChanged  = errors.New("Account bindings have changed. Start this operation again.")
 	ErrCannotDeleteRootUser   = errors.New("The root account cannot be deleted.")
 )
+
+// OAuthIdentityTransactionOptions makes missing-key locks independent of the
+// server default: MySQL needs repeatable reads for gap locks; PostgreSQL needs
+// a fresh snapshot after waiting for an advisory lock. Other authentication
+// transactions retain their existing isolation level.
+func OAuthIdentityTransactionOptions(column string) *sql.TxOptions {
+	if column != "github_id" && column != "discord_id" && column != "oidc_id" && column != "linux_do_id" {
+		return nil
+	}
+	switch {
+	case common.UsingMainDatabase(common.DatabaseTypeMySQL):
+		return &sql.TxOptions{Isolation: sql.LevelRepeatableRead}
+	case common.UsingMainDatabase(common.DatabaseTypePostgreSQL):
+		return &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+	}
+	return nil
+}
+
+// LockOAuthIdentityWithTx serializes registration and binding of the same
+// built-in provider identity. It returns current owners, including deleted
+// users, so callers can retain their existing account-deletion policy. Callers
+// must start the transaction with OAuthIdentityTransactionOptions. MySQL's
+// indexed locking read also protects an identity that has no owner yet.
+// SQLite's transaction snapshot rejects a racing write instead of duplicating
+// an identity. Custom providers already have a unique provider/subject index.
+func LockOAuthIdentityWithTx(tx *gorm.DB, column, subject string) ([]User, error) {
+	if tx == nil || subject == "" || (column != "github_id" && column != "discord_id" && column != "oidc_id" && column != "linux_do_id") {
+		return nil, ErrAccountBindingChanged
+	}
+	if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?), hashtext(?))", column, subject).Error; err != nil {
+			return nil, err
+		}
+	}
+	var owners []User
+	err := lockForUpdate(tx.Unscoped()).Where(map[string]any{column: subject}).Order("id ASC").Find(&owners).Error
+	return owners, err
+}
 
 // ChangeUserPassword rechecks the authorized session, password state and current
 // password under the same user lock as the credential update. Only self-profile
@@ -116,17 +155,30 @@ func UpdateUserBindColumnForSessionWithTx(tx *gorm.DB, identity AuthSessionIdent
 	if !userBindColumns[column] || value == "" {
 		return ErrAccountBindingChanged
 	}
-	if err := ValidateAuthSessionWithTx(tx, identity); err != nil {
-		return err
-	}
-	// Preserve the existing ownership check within the transaction and update
-	// only the chosen binding column, never a complete user snapshot.
-	var count int64
-	if err := tx.Model(&User{}).Where(column+" = ? AND id <> ?", value, identity.UserID).Count(&count).Error; err != nil {
-		return err
-	}
-	if count != 0 {
-		return ErrExternalIdentityAlreadyClaimed
+	if column != "wechat_id" {
+		owners, err := LockOAuthIdentityWithTx(tx, column, value)
+		if err != nil {
+			return err
+		}
+		for _, owner := range owners {
+			if !owner.DeletedAt.Valid && owner.Id != identity.UserID {
+				return ErrExternalIdentityAlreadyClaimed
+			}
+		}
+		if err := ValidateAuthSessionWithTx(tx, identity); err != nil {
+			return err
+		}
+	} else {
+		if err := ValidateAuthSessionWithTx(tx, identity); err != nil {
+			return err
+		}
+		var count int64
+		if err := tx.Model(&User{}).Where("wechat_id = ? AND id <> ?", value, identity.UserID).Count(&count).Error; err != nil {
+			return err
+		}
+		if count != 0 {
+			return ErrExternalIdentityAlreadyClaimed
+		}
 	}
 	return tx.Model(&User{}).Where("id = ?", identity.UserID).Update(column, value).Error
 }
@@ -158,12 +210,14 @@ func MigrateLegacyGitHubBindingWithTx(tx *gorm.DB, userID int, legacyID, gitHubI
 	if userID <= 0 || legacyID == "" || gitHubID == "" {
 		return false, ErrAccountBindingChanged
 	}
-	var count int64
-	if err := tx.Model(&User{}).Where("github_id = ? AND id <> ?", gitHubID, userID).Count(&count).Error; err != nil {
+	owners, err := LockOAuthIdentityWithTx(tx, "github_id", gitHubID)
+	if err != nil {
 		return false, err
 	}
-	if count != 0 {
-		return false, ErrExternalIdentityAlreadyClaimed
+	for _, owner := range owners {
+		if !owner.DeletedAt.Valid && owner.Id != userID {
+			return false, ErrExternalIdentityAlreadyClaimed
+		}
 	}
 	result := tx.Model(&User{}).Where("id = ? AND github_id = ?", userID, legacyID).Update("github_id", gitHubID)
 	if result.Error != nil {

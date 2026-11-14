@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -8,7 +9,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -20,10 +24,149 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
+
+func TestModelPricingReloadCannotOverwriteConcurrentSave(t *testing.T) {
+	for _, dialect := range []struct{ kind, env string }{{"sqlite", ""}, {"mysql", "TEST_MYSQL_DSN"}, {"postgres", "TEST_POSTGRES_DSN"}} {
+		t.Run(dialect.kind, func(t *testing.T) {
+			if dialect.env != "" && os.Getenv(dialect.env) == "" {
+				t.Skip("set " + dialect.env + " to run this database")
+			}
+			db := modelManagementDB(t, dialect.kind, os.Getenv(dialect.env))
+			require.NoError(t, db.AutoMigrate(&model.SystemTask{}))
+			const initial = `{"concurrent-price-model":1.25}`
+			const latest = `{"concurrent-price-model":3}`
+			require.NoError(t, model.UpdateOption("ImageRatio", initial))
+			read, release := make(chan struct{}), make(chan struct{})
+			var blocked atomic.Bool
+			require.NoError(t, db.Callback().Query().After("gorm:after_query").Register("fixture:pricing_reload", func(tx *gorm.DB) {
+				if _, ok := tx.Statement.Dest.(*[]*model.Option); ok && blocked.CompareAndSwap(false, true) {
+					close(read)
+					<-release
+				}
+			}))
+			t.Cleanup(func() { require.NoError(t, db.Callback().Query().Remove("fixture:pricing_reload")) })
+			var workers sync.WaitGroup
+			defer func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+				workers.Wait()
+			}()
+			reloadDone, saveDone := make(chan error, 1), make(chan error, 1)
+			workers.Go(func() { reloadDone <- model.LoadOptionsFromDatabase() })
+			select {
+			case <-read:
+			case <-time.After(5 * time.Second):
+				t.Fatal("reload did not reach the controlled database read")
+			}
+			workers.Go(func() { saveDone <- model.UpdateOption("ImageRatio", latest) })
+			saved := false
+			select {
+			case err := <-saveDone:
+				require.NoError(t, err)
+				saved = true
+			case <-time.After(time.Second):
+				// A serialized save must wait for the deliberately paused reload.
+			}
+			close(release)
+			require.NoError(t, <-reloadDone)
+			if !saved {
+				require.NoError(t, <-saveDone)
+			}
+			var stored model.Option
+			require.NoError(t, db.Where(&model.Option{Key: "ImageRatio"}).First(&stored).Error)
+			assert.JSONEq(t, latest, stored.Value)
+			common.OptionMapRWMutex.RLock()
+			published := common.OptionMap["ImageRatio"]
+			common.OptionMapRWMutex.RUnlock()
+			assert.JSONEq(t, stored.Value, published)
+			assert.Equal(t, map[string]float64{"concurrent-price-model": 3}, ratio_setting.GetImageRatioCopy())
+		})
+	}
+}
+
+func TestUpdateOptionRatioPublicationDatabaseMatrix(t *testing.T) {
+	const previous = `{"ratio-publication-model":1.25}`
+	const replacement = `{"ratio-publication-model":3}`
+	for _, dialect := range []struct{ kind, env string }{{"sqlite", ""}, {"mysql", "TEST_MYSQL_DSN"}, {"postgres", "TEST_POSTGRES_DSN"}} {
+		t.Run(dialect.kind, func(t *testing.T) {
+			if dialect.env != "" && os.Getenv(dialect.env) == "" {
+				t.Skip("set " + dialect.env + " to run this database")
+			}
+			db := modelManagementDB(t, dialect.kind, os.Getenv(dialect.env))
+			for _, option := range []struct {
+				key     string
+				current func() map[string]float64
+			}{
+				{"ImageRatio", ratio_setting.GetImageRatioCopy},
+				{"AudioRatio", ratio_setting.GetAudioRatioCopy},
+				{"AudioCompletionRatio", ratio_setting.GetAudioCompletionRatioCopy},
+				{"CreateCacheRatio", ratio_setting.GetCreateCacheRatioCopy},
+			} {
+				t.Run(option.key, func(t *testing.T) {
+					require.NoError(t, model.UpdateOption(option.key, previous))
+					expected := map[string]float64{"ratio-publication-model": 1.25}
+					t.Run("failed persistence", func(t *testing.T) {
+						writes := 0
+						require.NoError(t, db.Callback().Update().Before("gorm:update").Register("ratio_publication_failure", func(tx *gorm.DB) {
+							if tx.Statement.Table == "options" {
+								writes++
+								assert.Equal(t, expected, option.current(), "pending prices must not be published before the transaction commits")
+								tx.AddError(errors.New("injected ratio persistence failure"))
+							}
+						}))
+						t.Cleanup(func() { require.NoError(t, db.Callback().Update().Remove("ratio_publication_failure")) })
+						var response struct{ Success bool }
+						recorder := modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: option.key, Value: replacement}, &response)
+						assert.False(t, response.Success)
+						assert.Contains(t, recorder.Body.String(), "injected ratio persistence failure")
+						assert.Equal(t, 1, writes)
+						assert.Equal(t, expected, option.current())
+						assert.JSONEq(t, previous, common.OptionMap[option.key])
+						var saved model.Option
+						require.NoError(t, db.Where(&model.Option{Key: option.key}).First(&saved).Error)
+						assert.JSONEq(t, previous, saved.Value)
+					})
+					for _, invalid := range []string{
+						`{"ratio-publication-model":4,"other":"invalid"}`, `[]`, `null`,
+						`{"ratio-publication-model":-1}`, `{"ratio-publication-model":1e309}`,
+					} {
+						t.Run("invalid "+invalid, func(t *testing.T) {
+							require.NoError(t, model.UpdateOption(option.key, previous))
+							var response struct{ Success bool }
+							modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: option.key, Value: invalid}, &response)
+							assert.False(t, response.Success)
+							assert.Equal(t, expected, option.current())
+							assert.JSONEq(t, previous, common.OptionMap[option.key])
+							var saved model.Option
+							require.NoError(t, db.Where(&model.Option{Key: option.key}).First(&saved).Error)
+							assert.JSONEq(t, previous, saved.Value)
+						})
+					}
+					t.Run("successful persistence", func(t *testing.T) {
+						const accepted = `{"ratio-publication-model":0,"other":2.5}`
+						var response struct{ Success bool }
+						modelManagementRequest(t, UpdateOption, http.MethodPut, "/api/option/", OptionUpdateRequest{Key: option.key, Value: accepted}, &response)
+						assert.True(t, response.Success)
+						assert.Equal(t, map[string]float64{"ratio-publication-model": 0, "other": 2.5}, option.current())
+						assert.JSONEq(t, accepted, common.OptionMap[option.key])
+						var saved model.Option
+						require.NoError(t, db.Where(&model.Option{Key: option.key}).First(&saved).Error)
+						assert.JSONEq(t, accepted, saved.Value)
+					})
+				})
+			}
+		})
+	}
+}
 
 func TestUpdateOptionRejectsInvalidTaskBillingExpressions(t *testing.T) {
 	const pluginKey = "billing-save-probe"

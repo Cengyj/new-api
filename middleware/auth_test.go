@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	miniredisserver "github.com/alicebob/miniredis/v2/server"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/golang-jwt/jwt/v5"
@@ -161,7 +162,16 @@ func TestDashboardAuthRejectsRedisRoleTampering(t *testing.T) {
 		t.Run(fmt.Sprintf("role_%d", role), func(t *testing.T) {
 			setupDashboardAuthMiddlewareTest(t)
 			gin.SetMode(gin.TestMode)
-			_, redisClient := useRateLimitMiniRedis(t)
+			redisServer, redisClient := useRateLimitMiniRedis(t)
+			// miniredis lacks INFO server; provide only the stable server identity
+			// required by wallet cache validation. Signing and authorization stay real.
+			redisServer.Server().SetPreHook(func(peer *miniredisserver.Peer, command string, args ...string) bool {
+				if command == "INFO" && len(args) == 1 && args[0] == "server" {
+					peer.WriteBulk("# Server\r\nrun_id:0123456789abcdef0123456789abcdef01234567\r\n")
+					return true
+				}
+				return false
+			})
 			legacy := "cache-integrity-legacy"
 			user := createMiddlewarePATUser(t, "cache-integrity", legacy)
 			require.NoError(t, model.DB.Model(user).Update("role", role).Error)

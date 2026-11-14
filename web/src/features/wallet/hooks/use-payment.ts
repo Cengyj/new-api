@@ -17,10 +17,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import i18next from 'i18next'
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { toast } from 'sonner'
 
 import { handleServerError } from '@/lib/handle-server-error'
+import { useAuthStore } from '@/stores/auth-store'
 
 import {
   calculateAmount,
@@ -37,126 +38,139 @@ import {
   isWaffoPancakePayment,
   submitPaymentForm,
 } from '../lib'
-import type { AmountRequest, AmountResponse } from '../types'
-
-// ============================================================================
-// Payment Hook
-// ============================================================================
+import { isSafePaymentUrl, isValidTopupAmount } from '../lib/payment'
+import type { AmountRequest, AmountResponse, PaymentResponse } from '../types'
+import { usePaymentOperation } from './use-payment-operation'
 
 type AmountCalculator = (request: AmountRequest) => Promise<AmountResponse>
-
 export interface PaymentAmountCalculators {
   regular: AmountCalculator
   stripe: AmountCalculator
   waffo: AmountCalculator
   waffoPancake: AmountCalculator
 }
-
 const defaultPaymentAmountCalculators: PaymentAmountCalculators = {
   regular: calculateAmount,
   stripe: calculateStripeAmount,
   waffo: calculateWaffoAmount,
   waffoPancake: calculateWaffoPancakeAmount,
 }
-
 export async function requestPaymentAmount(
   topupAmount: number,
   paymentType: string,
   calculators: PaymentAmountCalculators = defaultPaymentAmountCalculators
 ): Promise<number> {
+  if (!isValidTopupAmount(topupAmount)) return 0
   let calculator = calculators.regular
-  if (isStripePayment(paymentType)) {
-    calculator = calculators.stripe
-  } else if (isWaffoPayment(paymentType)) {
-    calculator = calculators.waffo
-  } else if (isWaffoPancakePayment(paymentType)) {
+  if (isStripePayment(paymentType)) calculator = calculators.stripe
+  else if (isWaffoPayment(paymentType)) calculator = calculators.waffo
+  else if (isWaffoPancakePayment(paymentType)) {
     calculator = calculators.waffoPancake
   }
-
   const response = await calculator({ amount: topupAmount })
-  if (!isApiSuccess(response) || !response.data) {
-    return 0
-  }
-
-  return Number.parseFloat(response.data)
+  if (!isApiSuccess(response) || !response.data) return 0
+  const amount = Number(response.data)
+  return Number.isFinite(amount) && amount > 0 ? amount : 0
 }
 
-export function usePayment() {
-  const [amount, setAmount] = useState<number>(0)
+export function usePayment(onUnknownCheckout?: () => void) {
+  const [amount, setAmount] = useState(0)
   const [calculating, setCalculating] = useState(false)
-  const [processing, setProcessing] = useState(false)
+  const { processing, runPayment } = usePaymentOperation(onUnknownCheckout)
+  const quoteVersion = useRef(0)
+  useEffect(() => {
+    let auth = useAuthStore.getState().auth
+    const unsubscribe = useAuthStore.subscribe((state) => {
+      if (
+        state.auth.user?.id !== auth.user?.id ||
+        state.auth.session?.sid !== auth.session?.sid
+      ) {
+        quoteVersion.current += 1
+        setAmount(0)
+        setCalculating(false)
+      }
+      auth = state.auth
+    })
+    return () => {
+      quoteVersion.current += 1
+      unsubscribe()
+    }
+  }, [])
 
-  // Calculate payment amount
   const calculatePaymentAmount = useCallback(
     async (topupAmount: number, paymentType: string) => {
+      const version = ++quoteVersion.current
+      setAmount(0)
+      setCalculating(true)
       try {
-        setCalculating(true)
-        const calculatedAmount = await requestPaymentAmount(
-          topupAmount,
-          paymentType
-        )
-        setAmount(calculatedAmount)
-        return calculatedAmount
+        const calculated = await requestPaymentAmount(topupAmount, paymentType)
+        if (version !== quoteVersion.current) return 0
+        setAmount(calculated)
+        return calculated
       } catch {
-        setAmount(0)
+        if (version === quoteVersion.current) setAmount(0)
         return 0
       } finally {
-        setCalculating(false)
+        if (version === quoteVersion.current) setCalculating(false)
       }
     },
     []
   )
 
-  // Process payment
   const processPayment = useCallback(
     async (topupAmount: number, paymentType: string) => {
-      try {
-        setProcessing(true)
-
-        const isStripe = isStripePayment(paymentType)
-        const amount = Math.floor(topupAmount)
-
-        const response = isStripe
-          ? await requestStripePayment({
-              amount,
-              payment_method: 'stripe',
-            })
-          : await requestPayment({
-              amount,
-              payment_method: paymentType,
-            })
-
-        if (!isApiSuccess(response)) {
-          handleServerError(response, i18next.t('Payment request failed'))
-          return false
-        }
-
-        // Handle Stripe payment
-        if (isStripe && response.data?.pay_link) {
-          window.open(response.data.pay_link as string, '_blank')
+      if (!isValidTopupAmount(topupAmount)) {
+        toast.error(i18next.t('Invalid top-up amount'))
+        return false
+      }
+      const stripe = isStripePayment(paymentType)
+      return runPayment<PaymentResponse>(
+        (signal) =>
+          stripe
+            ? requestStripePayment(
+                {
+                  amount: topupAmount,
+                  payment_method: 'stripe',
+                },
+                signal
+              )
+            : requestPayment(
+                {
+                  amount: topupAmount,
+                  payment_method: paymentType,
+                },
+                signal
+              ),
+        (response) => {
+          if (!isApiSuccess(response)) {
+            handleServerError(response, i18next.t('Payment request failed'))
+            return false
+          }
+          const url = stripe
+            ? response.data?.pay_link
+            : (response as { url?: string }).url
+          if (!isSafePaymentUrl(url)) {
+            toast.error(i18next.t('Invalid payment redirect URL'))
+            return false
+          }
+          if (stripe) {
+            window.open(url, '_blank', 'noopener,noreferrer')
+          } else if (response.data && typeof response.data === 'object') {
+            submitPaymentForm(url, response.data)
+          } else {
+            toast.error(
+              i18next.t(
+                'Payment request result is unknown. Check Order History before trying again.'
+              )
+            )
+            return false
+          }
           toast.success(i18next.t('Redirecting to payment page...'))
           return true
         }
-
-        // Handle non-Stripe payment
-        if (!isStripe && response.data) {
-          const url = (response as unknown as { url?: string }).url
-          if (url) {
-            submitPaymentForm(url, response.data)
-            toast.success(i18next.t('Redirecting to payment page...'))
-            return true
-          }
-        }
-
-        return false
-      } catch (error) {
-        handleServerError(error, i18next.t('Payment request failed'))
-        return false
-      } finally {
-        setProcessing(false)
-      }
+      )
     },
-    []
+    [runPayment]
   )
 
   return {

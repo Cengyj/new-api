@@ -170,14 +170,22 @@ test('saving sends only the log export settings that changed', async () => {
   await user.click(screen.getByRole('button', { name: 'Save log settings' }))
 
   await waitFor(() => expect(api.put).toHaveBeenCalledTimes(2))
-  expect(api.put).toHaveBeenCalledWith('/api/option/', {
-    key: 'log_setting.user_export_enabled',
-    value: false,
-  })
-  expect(api.put).toHaveBeenCalledWith('/api/option/', {
-    key: 'log_setting.max_range_days',
-    value: 90,
-  })
+  expect(api.put).toHaveBeenCalledWith(
+    '/api/option/',
+    {
+      key: 'log_setting.user_export_enabled',
+      value: false,
+    },
+    expect.objectContaining({ skipAuthRefresh: true })
+  )
+  expect(api.put).toHaveBeenCalledWith(
+    '/api/option/',
+    {
+      key: 'log_setting.max_range_days',
+      value: 90,
+    },
+    expect.objectContaining({ skipAuthRefresh: true })
+  )
 })
 
 test('a time range under one day shows a field error and is not saved', async () => {
@@ -207,8 +215,12 @@ test('the task retention saves whole days and rejects less than one day', async 
   fireEvent.change(retention, { target: { value: '7' } })
   await user.click(save)
   await waitFor(() => expect(api.put).toHaveBeenCalledTimes(1))
-  expect(api.put).toHaveBeenCalledWith('/api/option/', {
-    key: 'system_task_setting.retention_days',
-    value: 7,
-  })
+  expect(api.put).toHaveBeenCalledWith(
+    '/api/option/',
+    {
+      key: 'system_task_setting.retention_days',
+      value: 7,
+    },
+    expect.objectContaining({ skipAuthRefresh: true })
+  )
 })

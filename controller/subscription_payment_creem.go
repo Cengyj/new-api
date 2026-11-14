@@ -30,7 +30,7 @@ func SubscriptionRequestCreemPay(c *gin.Context) {
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Creem failed to read subscription payment request error=%q", err.Error()))
-		c.JSON(http.StatusOK, gin.H{"message": "error", "data": "read query error"})
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": "error", "data": "read query error"})
 		return
 	}
 	c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))

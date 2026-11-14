@@ -27,7 +27,6 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
-	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
 	"github.com/gorilla/websocket"
@@ -40,6 +39,7 @@ var responsesWSTestUserSequence atomic.Int64
 
 func setupResponsesWSRequestTest(t *testing.T) (*model.User, *model.Token) {
 	t.Helper()
+	require.NoError(t, i18n.Init())
 	previousDB := model.DB
 	previousLogDB := model.LOG_DB
 	previousType := common.MainDatabaseType()
@@ -250,7 +250,7 @@ func TestResponsesWSRequestRunnerUsesExistingMemoryRateLimit(t *testing.T) {
 
 func TestResponsesWSRequestRunnerSharesRedisSuccessLimitWithHTTP(t *testing.T) {
 	_, token := setupResponsesWSRequestTest(t)
-	redisServer := miniredis.RunT(t)
+	redisServer := newControllerUserCacheMiniRedis(t)
 	client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	common.RedisEnabled = true
@@ -361,7 +361,7 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 	require.NoError(t, model.DB.Model(token).Update("remain_quota", 3000).Error)
 
 	fixture := &responsesWSBillingTest{user: user, token: token, done: make(chan struct{}), upstreamDone: make(chan struct{}), httpDone: make(chan struct{}, 1)}
-	redisServer := miniredis.RunT(t)
+	redisServer := newControllerUserCacheMiniRedis(t)
 	redisClient := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
 	common.RDB, common.RedisEnabled = redisClient, true
 	t.Cleanup(func() { require.NoError(t, redisClient.Close()) })

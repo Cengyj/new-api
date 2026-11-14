@@ -16,7 +16,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { CanceledError } from 'axios'
+
 import { api } from '@/lib/api'
+import { authenticationIdentity } from '@/lib/http-client'
 
 // Catalog / pair / save admin endpoints. Match
 // controller/topup_waffo_pancake.go: empty body creds make the backend
@@ -62,12 +65,17 @@ export type SaveResponse = BackendBody<{ product_id: string; store_id: string }>
 
 export async function listWaffoPancakeCatalog(
   merchantID: string,
-  privateKey: string
+  privateKey: string,
+  authIdentity = authenticationIdentity()
 ): Promise<CatalogResponse> {
-  const res = await api.get<CatalogResponse>(
+  const res = await api.post<CatalogResponse>(
     '/api/option/waffo-pancake/catalog',
-    { params: { merchant_id: merchantID, private_key: privateKey } }
+    { merchant_id: merchantID, private_key: privateKey },
+    { authIdentity, skipAuthRefresh: true }
   )
+  if (authIdentity !== authenticationIdentity()) {
+    throw new CanceledError('Authentication changed')
+  }
   return res.data
 }
 
@@ -76,27 +84,45 @@ export async function createWaffoPancakePair(params: {
   privateKey: string
   returnURL: string
 }): Promise<PairResponse> {
-  const res = await api.post<PairResponse>('/api/option/waffo-pancake/pair', {
-    merchant_id: params.merchantID,
-    private_key: params.privateKey,
-    return_url: params.returnURL,
-  })
+  const authIdentity = authenticationIdentity()
+  const res = await api.post<PairResponse>(
+    '/api/option/waffo-pancake/pair',
+    {
+      merchant_id: params.merchantID,
+      private_key: params.privateKey,
+      return_url: params.returnURL,
+    },
+    { authIdentity, skipAuthRefresh: true }
+  )
+  if (authIdentity !== authenticationIdentity()) {
+    throw new CanceledError('Authentication changed')
+  }
   return res.data
 }
 
-export async function saveWaffoPancakeConfig(params: {
-  merchantID: string
-  privateKey: string
-  returnURL: string
-  storeID: string
-  productID: string
-}): Promise<SaveResponse> {
-  const res = await api.post<SaveResponse>('/api/option/waffo-pancake/save', {
-    merchant_id: params.merchantID,
-    private_key: params.privateKey,
-    return_url: params.returnURL,
-    store_id: params.storeID,
-    product_id: params.productID,
-  })
+export async function saveWaffoPancakeConfig(
+  params: {
+    merchantID: string
+    privateKey: string
+    returnURL: string
+    storeID: string
+    productID: string
+  },
+  authIdentity = authenticationIdentity()
+): Promise<SaveResponse> {
+  const res = await api.post<SaveResponse>(
+    '/api/option/waffo-pancake/save',
+    {
+      merchant_id: params.merchantID,
+      private_key: params.privateKey,
+      return_url: params.returnURL,
+      store_id: params.storeID,
+      product_id: params.productID,
+    },
+    { authIdentity, skipAuthRefresh: true }
+  )
+  if (authIdentity !== authenticationIdentity()) {
+    throw new CanceledError('Authentication changed')
+  }
   return res.data
 }

@@ -83,10 +83,14 @@ test('the default threshold shows as an amount and is not saved again when only 
   await user.click(screen.getByRole('switch', { name: 'Force AUTH LOGIN' }))
   await user.click(screen.getByRole('button', { name: 'Save Changes' }))
   await waitFor(() =>
-    expect(api.put).toHaveBeenCalledWith('/api/option/', {
-      key: 'SMTPForceAuthLogin',
-      value: true,
-    })
+    expect(api.put).toHaveBeenCalledWith(
+      '/api/option/',
+      {
+        key: 'SMTPForceAuthLogin',
+        value: true,
+      },
+      expect.objectContaining({ skipAuthRefresh: true })
+    )
   )
   expect(api.put).toHaveBeenCalledTimes(1)
 })
@@ -101,10 +105,14 @@ test('an edited default threshold is saved in quota units', async () => {
   await user.type(input, '1')
   await user.click(screen.getByRole('button', { name: 'Save Changes' }))
   await waitFor(() =>
-    expect(api.put).toHaveBeenCalledWith('/api/option/', {
-      key: 'QuotaRemindThreshold',
-      value: '500000',
-    })
+    expect(api.put).toHaveBeenCalledWith(
+      '/api/option/',
+      {
+        key: 'QuotaRemindThreshold',
+        value: '500000',
+      },
+      expect.objectContaining({ skipAuthRefresh: true })
+    )
   )
   expect(api.put).toHaveBeenCalledTimes(1)
 })
@@ -120,10 +128,14 @@ test('turning the reminder off hides the default threshold and saves the switch'
   ).not.toBeInTheDocument()
   await user.click(screen.getByRole('button', { name: 'Save Changes' }))
   await waitFor(() =>
-    expect(api.put).toHaveBeenCalledWith('/api/option/', {
-      key: 'QuotaRemindEnabled',
-      value: false,
-    })
+    expect(api.put).toHaveBeenCalledWith(
+      '/api/option/',
+      {
+        key: 'QuotaRemindEnabled',
+        value: false,
+      },
+      expect.objectContaining({ skipAuthRefresh: true })
+    )
   )
   expect(api.put).toHaveBeenCalledTimes(1)
 })
