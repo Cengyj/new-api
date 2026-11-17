@@ -23,10 +23,17 @@ type WaffoPancakePriceSnapshot struct {
 	TaxCategory string
 }
 
+// WaffoPancakeCheckoutConfig binds a request to one merchant configuration.
+// Nil in session params retains the existing shared caller behavior.
+type WaffoPancakeCheckoutConfig struct {
+	MerchantID, PrivateKey, StoreID string
+}
+
 // WaffoPancakeCreateSessionParams is the input to CreateWaffoPancakeCheckoutSession.
 // BuyerIdentity must be stable per user (see WaffoPancakeBuyerIdentityFromUserID).
 // OrderMerchantExternalID = our trade_no; Pancake echoes it back in webhooks.
 type WaffoPancakeCreateSessionParams struct {
+	Config                  *WaffoPancakeCheckoutConfig
 	ProductID               string
 	BuyerIdentity           string
 	PriceSnapshot           *WaffoPancakePriceSnapshot
@@ -151,10 +158,15 @@ func CreateWaffoPancakeCheckoutSession(ctx context.Context, params *WaffoPancake
 	if strings.TrimSpace(params.OrderMerchantExternalID) == "" {
 		return nil, fmt.Errorf("%w: missing order merchant external id", ErrWaffoPancakeCheckoutNotStarted)
 	}
-	common.OptionMapRWMutex.RLock()
-	storeID := setting.WaffoPancakeStoreID
-	merchantID, privateKey := setting.WaffoPancakeMerchantID, setting.WaffoPancakePrivateKey
-	common.OptionMapRWMutex.RUnlock()
+	var snapshot WaffoPancakeCheckoutConfig
+	if params.Config != nil {
+		snapshot = *params.Config
+	} else {
+		common.OptionMapRWMutex.RLock()
+		snapshot = WaffoPancakeCheckoutConfig{MerchantID: setting.WaffoPancakeMerchantID, PrivateKey: setting.WaffoPancakePrivateKey, StoreID: setting.WaffoPancakeStoreID}
+		common.OptionMapRWMutex.RUnlock()
+	}
+	storeID, merchantID, privateKey := snapshot.StoreID, snapshot.MerchantID, snapshot.PrivateKey
 	if strings.TrimSpace(storeID) == "" {
 		return nil, fmt.Errorf("%w: missing Waffo Pancake store id", ErrWaffoPancakeCheckoutNotStarted)
 	}

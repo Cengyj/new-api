@@ -122,6 +122,9 @@ export const usePaymentRecoveryStore = create<PaymentRecoveryState>(
           },
         }
       })
+      // Resolving a known order does not resolve unreadable records that were
+      // excluded from orders. Recheck durable storage before clearing warnings.
+      if (!storageError) get().restore(userId)
     },
   })
 )

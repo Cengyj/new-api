@@ -1,6 +1,9 @@
 package common
 
-import "sync"
+import (
+	"maps"
+	"sync"
+)
 
 var topupGroupRatio = map[string]float64{
 	"default": 1,
@@ -8,6 +11,13 @@ var topupGroupRatio = map[string]float64{
 	"svip":    1,
 }
 var topupGroupRatioMutex sync.RWMutex
+
+// GetTopupGroupRatios returns an immutable request snapshot for wallet pricing.
+func GetTopupGroupRatios() map[string]float64 {
+	topupGroupRatioMutex.RLock()
+	defer topupGroupRatioMutex.RUnlock()
+	return maps.Clone(topupGroupRatio)
+}
 
 func TopupGroupRatio2JSONString() string {
 	topupGroupRatioMutex.RLock()

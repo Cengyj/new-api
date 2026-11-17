@@ -969,9 +969,17 @@ func TestInvitationOAuthConcurrentRegistrationDoesNotDuplicateRewards(t *testing
 			require.NoError(t, err)
 			sqlDB.SetMaxOpenConns(4)
 			if common.UsingMainDatabase(common.DatabaseTypeMySQL) {
-				var isolation string
-				require.NoError(t, model.DB.Raw("SELECT @@session.tx_isolation").Scan(&isolation).Error)
-				t.Logf("MySQL session default isolation: %s", isolation)
+				// MySQL 8 removed the tx_isolation alias used by older 5.7
+				// releases. SHOW tolerates either name without hiding errors.
+				var isolation []struct {
+					Value string
+				}
+				require.NoError(t, model.DB.Raw("SHOW SESSION VARIABLES WHERE Variable_name IN ('transaction_isolation', 'tx_isolation')").Scan(&isolation).Error)
+				require.NotEmpty(t, isolation)
+				for _, row := range isolation {
+					assert.NotEmpty(t, row.Value)
+					t.Logf("MySQL session default isolation: %s", row.Value)
+				}
 			} else if common.UsingMainDatabase(common.DatabaseTypePostgreSQL) {
 				var isolation string
 				require.NoError(t, model.DB.Raw("SHOW default_transaction_isolation").Scan(&isolation).Error)

@@ -6,14 +6,18 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +37,185 @@ import (
 // Only the disposable integration deployment uses this key. Every process
 // sharing its signed user cache must use the same effective configuration.
 const referralProcessCacheSecret = "new-api-isolated-referral-process-cache"
+
+// The proxy forwards actual PostgreSQL wire messages, except one successful
+// COMMIT CommandComplete response. No driver or transaction method is mocked.
+// Authentication payloads pass through without being logged or interpreted.
+func postgresCommitReplyLossProxy(t *testing.T, target string) (string, *atomic.Bool, <-chan struct{}) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	var armed atomic.Bool
+	dropped := make(chan struct{}, 1)
+	var connections sync.Map
+	var workers sync.WaitGroup
+	workers.Go(func() {
+		for {
+			client, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			connections.Store(client, true)
+			workers.Go(func() {
+				defer client.Close()
+				defer connections.Delete(client)
+				server, err := net.DialTimeout("tcp", target, 5*time.Second)
+				if err != nil {
+					return
+				}
+				defer server.Close()
+				connections.Store(server, true)
+				defer connections.Delete(server)
+				workers.Go(func() {
+					_, _ = io.Copy(server, client)
+					_ = server.Close()
+				})
+				for {
+					var header [5]byte
+					if _, err := io.ReadFull(server, header[:]); err != nil {
+						return
+					}
+					length := binary.BigEndian.Uint32(header[1:])
+					if length < 4 || length > 16*1024*1024 {
+						return
+					}
+					payload := make([]byte, int(length)-4)
+					if _, err := io.ReadFull(server, payload); err != nil {
+						return
+					}
+					if header[0] == 'C' && string(payload) == "COMMIT\x00" && armed.CompareAndSwap(true, false) {
+						dropped <- struct{}{}
+						return // Close both sockets before the client receives COMMIT.
+					}
+					if _, err := client.Write(append(header[:], payload...)); err != nil {
+						return
+					}
+				}
+			})
+		}
+	})
+	t.Cleanup(func() {
+		_ = listener.Close()
+		connections.Range(func(key, _ any) bool {
+			_ = key.(net.Conn).Close()
+			return true
+		})
+		workers.Wait()
+	})
+	return listener.Addr().String(), &armed, dropped
+}
+
+func TestReferralWalletRecoversLostPostgresCommitReply(t *testing.T) {
+	address := os.Getenv("NEW_API_REFERRAL_REDIS_ADDR")
+	if address == "" {
+		t.Skip("set isolated Redis and PostgreSQL DSN for the wire-level COMMIT test")
+	}
+	db, dsn := newReferralIntegrationDatabase(t, "postgres")
+	previousDB, previousLogDB, previousClient := DB, LOG_DB, common.RDB
+	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+	previousRedis, previousBatch, previousUnit, previousSecret := common.RedisEnabled, common.BatchUpdateEnabled, common.QuotaPerUnit, common.CryptoSecret
+	previousPayment := *operation_setting.GetPaymentSetting()
+	client := redis.NewClient(&redis.Options{Addr: address, DB: 14, MaxRetries: -1})
+	t.Cleanup(func() {
+		DB, LOG_DB, common.RDB = previousDB, previousLogDB, previousClient
+		common.SetDatabaseTypes(previousMain, previousLog)
+		common.RedisEnabled, common.BatchUpdateEnabled, common.QuotaPerUnit, common.CryptoSecret = previousRedis, previousBatch, previousUnit, previousSecret
+		*operation_setting.GetPaymentSetting() = previousPayment
+		assert.NoError(t, client.Close())
+	})
+	common.SetDatabaseTypes(common.DatabaseTypePostgreSQL, common.DatabaseTypePostgreSQL)
+	DB, LOG_DB = db, db
+	common.RedisEnabled, common.BatchUpdateEnabled, common.QuotaPerUnit, common.CryptoSecret = true, false, 1, referralProcessCacheSecret
+	operation_setting.GetPaymentSetting().ComplianceConfirmed = true
+	operation_setting.GetPaymentSetting().ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+	require.NoError(t, client.Ping(t.Context()).Err())
+	common.RDB = client
+	require.NoError(t, db.AutoMigrate(&User{}, &TopUp{}, &Option{}, &ReferralRebate{}, &SubscriptionOrder{}, &AffiliateTransfer{}, &Log{}))
+	require.NoError(t, InitializeReferralRebateRule(db))
+	require.NoError(t, SaveReferralRebateRule(ReferralRebateRule{Enabled: true, RateBPS: 1000, ValidDays: 1}))
+	inviter := User{Username: "wire-loss-inviter", AffCode: "wire-loss-inviter", Status: common.UserStatusEnabled, AffQuota: 50, AffHistoryQuota: 50}
+	require.NoError(t, db.Create(&inviter).Error)
+	invitee := User{Username: "wire-loss-invitee", AffCode: "wire-loss-invitee", Status: common.UserStatusEnabled, InviterId: inviter.Id, CreatedAt: time.Now().Unix(), ReferralRateBPS: 1000, ReferralExpiresAt: time.Now().Unix() + 86400, Quota: 7}
+	require.NoError(t, db.Create(&invitee).Error)
+	var ownedKeys []string
+	for _, user := range []User{inviter, invitee} {
+		ownedKeys = append(ownedKeys, getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id), getWalletCacheFillKey(user.Id))
+	}
+	exists, err := client.Exists(t.Context(), ownedKeys...).Result()
+	require.NoError(t, err)
+	require.Zero(t, exists, "never overwrite another Redis fixture")
+	t.Cleanup(func() { assert.NoError(t, client.Del(context.Background(), ownedKeys...).Err()) })
+	for _, user := range []User{inviter, invitee} {
+		require.NoError(t, populateUserCache(user))
+	}
+	credit := 100
+	order := TopUp{UserId: invitee.Id, TradeNo: "wire-loss-original-order", PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending, CreditedQuota: &credit}
+	require.NoError(t, order.Insert())
+	configuration, err := url.Parse(dsn)
+	require.NoError(t, err)
+	proxyAddress, armed, dropped := postgresCommitReplyLossProxy(t, configuration.Host)
+	configuration.Host = proxyAddress
+	query := configuration.Query()
+	query.Set("sslmode", "disable") // Only the dedicated loopback test proxy.
+	configuration.RawQuery = query.Encode()
+	proxied, err := gorm.Open(postgres.New(postgres.Config{DSN: configuration.String(), PreferSimpleProtocol: true}), newGormConfig(false))
+	require.NoError(t, err)
+	connection, err := proxied.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, connection.Close()) })
+	DB = proxied
+	for _, operation := range []string{"topup", "transfer"} {
+		t.Run(operation, func(t *testing.T) {
+			armed.Store(true)
+			if operation == "topup" {
+				duplicate, err := RechargeEpay(order.TradeNo, "alipay", "127.0.0.1")
+				require.NoError(t, err)
+				assert.True(t, duplicate, "the successful original order is recovered after the lost acknowledgement")
+			} else {
+				result, err := inviter.TransferAffQuotaToQuota(25, "wire-loss-original-transfer")
+				require.NoError(t, err)
+				assert.Equal(t, 25, result.Quota)
+			}
+			select {
+			case <-dropped:
+				t.Log("proxy received PostgreSQL COMMIT success and closed the client socket without forwarding it")
+			default:
+				t.Fatal("the COMMIT response was not lost on the network")
+			}
+		})
+	}
+	var firstOrder TopUp
+	require.NoError(t, db.First(&firstOrder, order.Id).Error)
+	require.Equal(t, common.TopUpStatusSuccess, firstOrder.Status)
+	require.NotZero(t, firstOrder.CompleteTime)
+	require.NotNil(t, firstOrder.SettlementAudit)
+	duplicate, err := RechargeEpay(order.TradeNo, "alipay", "127.0.0.1")
+	require.NoError(t, err)
+	assert.True(t, duplicate)
+	transfer, err := GetAffiliateTransfer(inviter.Id, "wire-loss-original-transfer")
+	require.NoError(t, err)
+	require.NotNil(t, transfer)
+	replayed, err := inviter.TransferAffQuotaToQuota(25, transfer.RequestID)
+	require.NoError(t, err)
+	assert.Equal(t, transfer.ID, replayed.ID)
+	var finalOrder TopUp
+	require.NoError(t, db.First(&finalOrder, order.Id).Error)
+	assert.Equal(t, firstOrder, finalOrder, "replay preserves first settlement time and responsibility")
+	require.NoError(t, db.First(&inviter, inviter.Id).Error)
+	require.NoError(t, db.First(&invitee, invitee.Id).Error)
+	assert.Equal(t, 107, invitee.Quota)
+	assert.Equal(t, 25, inviter.Quota)
+	assert.Equal(t, 35, inviter.AffQuota)
+	assert.Equal(t, 60, inviter.AffHistoryQuota)
+	var facts int64
+	require.NoError(t, db.Model(&ReferralRebate{}).Where("top_up_id = ?", order.Id).Count(&facts).Error)
+	assert.EqualValues(t, 1, facts)
+	for _, user := range []User{inviter, invitee} {
+		cached, err := cacheGetUserBase(user.Id)
+		require.NoError(t, err)
+		assert.Equal(t, user.Quota, cached.Quota)
+	}
+}
 
 func insertUserForPaymentGuardTest(t *testing.T, id int, quota int) *User {
 	t.Helper()
@@ -278,6 +461,58 @@ func createEpayTestOrder(t *testing.T, userId int, tradeNo string, provider stri
 	return topUp
 }
 
+func TestTopUpLogQuotaUsesCompleteDisplayConfiguration(t *testing.T) {
+	oldOptions, oldQuota, oldExchange := common.OptionMap, common.QuotaPerUnit, operation_setting.USDExchangeRate
+	oldGeneral := *operation_setting.GetGeneralSetting()
+	common.OptionMap = make(map[string]string)
+	t.Cleanup(func() {
+		common.OptionMap, common.QuotaPerUnit, operation_setting.USDExchangeRate = oldOptions, oldQuota, oldExchange
+		*operation_setting.GetGeneralSetting() = oldGeneral
+	})
+	for _, tc := range []struct {
+		display, before, after string
+	}{
+		{operation_setting.QuotaDisplayTypeUSD, "＄100.000000", "＄10.000000"},
+		{operation_setting.QuotaDisplayTypeCNY, "¥700.000000", "¥20.000000"},
+		{operation_setting.QuotaDisplayTypeCustom, "¤500.000000", "#30.000000"},
+		{operation_setting.QuotaDisplayTypeTokens, "1000", "1000"},
+	} {
+		t.Run(tc.display, func(t *testing.T) {
+			for key, value := range map[string]string{
+				"QuotaPerUnit": "10", "USDExchangeRate": "7",
+				"general_setting.quota_display_type":            tc.display,
+				"general_setting.custom_currency_exchange_rate": "5",
+				"general_setting.custom_currency_symbol":        "¤",
+			} {
+				require.NoError(t, updateOptionMap(key, value))
+			}
+			assert.Equal(t, tc.before, formatTopUpLogQuota(1000))
+			start, done := make(chan struct{}), make(chan error, 1)
+			go func() {
+				<-start
+				common.OptionMapRWMutex.Lock()
+				defer common.OptionMapRWMutex.Unlock()
+				for key, value := range map[string]string{
+					"QuotaPerUnit": "100", "USDExchangeRate": "2",
+					"general_setting.custom_currency_exchange_rate": "3",
+					"general_setting.custom_currency_symbol":        "#",
+				} {
+					if err := updateOptionMapLocked(key, value); err != nil {
+						done <- err
+						return
+					}
+				}
+				done <- nil
+			}()
+			close(start)
+			formatted := formatTopUpLogQuota(1000)
+			require.NoError(t, <-done)
+			assert.Contains(t, []string{tc.before, tc.after}, formatted)
+			assert.Equal(t, tc.after, formatTopUpLogQuota(1000))
+		})
+	}
+}
+
 func TestRechargeEpayCreditsQuotaExactlyOnce(t *testing.T) {
 	truncateTables(t)
 
@@ -484,6 +719,12 @@ func TestReferralCrossProcessWorker(t *testing.T) {
 	common.QuotaPerUnit = 1
 	payment := operation_setting.GetPaymentSetting()
 	payment.ComplianceConfirmed, payment.ComplianceTermsVersion = true, operation_setting.CurrentComplianceTermsVersion
+	if os.Getenv("REFERRAL_PROCESS_REDIS") == "1" {
+		client := redis.NewClient(&redis.Options{Addr: os.Getenv("NEW_API_REFERRAL_REDIS_ADDR"), DB: 14, MaxRetries: -1})
+		require.NoError(t, client.Ping(t.Context()).Err())
+		defer client.Close()
+		common.RDB, common.RedisEnabled, common.CryptoSecret = client, true, referralProcessCacheSecret
+	}
 	if mode == "cache_fill" || mode == "cache_credit" || os.Getenv("REFERRAL_PROCESS_INTERRUPT") != "" {
 		common.CryptoSecret = referralProcessCacheSecret
 	}
@@ -748,6 +989,30 @@ func TestReferralWalletSettlementAndTransferAcrossProcesses(t *testing.T) {
 			invitee := User{Id: 2, Username: "race-invitee", AffCode: "race-invitee-code", InviterId: 1, ReferralRateBPS: 1000, CreatedAt: time.Now().Unix() - 1, ReferralExpiresAt: time.Now().Unix() + 86400, Status: common.UserStatusEnabled}
 			require.NoError(t, db.Create(&owner).Error)
 			require.NoError(t, db.Create(&invitee).Error)
+			if address := os.Getenv("NEW_API_REFERRAL_REDIS_ADDR"); address != "" {
+				previousClient, previousSecret := common.RDB, common.CryptoSecret
+				client := redis.NewClient(&redis.Options{Addr: address, DB: 14, MaxRetries: -1})
+				t.Cleanup(func() {
+					common.RDB, common.CryptoSecret = previousClient, previousSecret
+					assert.NoError(t, client.Close())
+				})
+				require.NoError(t, client.Ping(t.Context()).Err())
+				var keys []string
+				for _, userID := range []int{1, 2, 3} {
+					keys = append(keys, getUserCacheKey(userID), getUserAuthFenceKey(userID), getUserAuthVersionKey(userID), getWalletCacheFillKey(userID))
+				}
+				exists, err := client.Exists(t.Context(), keys...).Result()
+				require.NoError(t, err)
+				require.Zero(t, exists, "never overwrite another Redis fixture")
+				t.Cleanup(func() {
+					assert.NoError(t, client.Del(context.Background(), keys...).Err())
+				})
+				common.RDB, common.RedisEnabled, common.CryptoSecret = client, true, referralProcessCacheSecret
+				t.Setenv("REFERRAL_PROCESS_REDIS", "1")
+				require.NoError(t, populateUserCache(owner))
+				require.NoError(t, populateUserCache(invitee))
+			}
+			t.Logf("independent-process settlement and transfer: dialect=%s RedisEnabled=%t", dialect, common.RedisEnabled)
 			quota := 100
 			order := TopUp{UserId: invitee.Id, TradeNo: "cross-process-order", Amount: 100, Money: 90, CreditedQuota: &quota, PaymentProvider: PaymentProviderEpay, PaymentMethod: "alipay", Status: common.TopUpStatusPending, CreateTime: time.Now().Unix()}
 			require.NoError(t, order.Insert())
@@ -971,9 +1236,31 @@ func TestReferralWalletSettlementAndTransferAcrossProcesses(t *testing.T) {
 			assert.EqualValues(t, 40, rewarded)
 			assert.Equal(t, -5+transferred, owner.Quota)
 			assert.Equal(t, 100+int(rewarded)-transferred, owner.AffQuota)
+			if common.RedisEnabled {
+				for _, user := range []User{owner, invitee, secondInvitee} {
+					cached, err := GetUserCache(user.Id)
+					require.NoError(t, err)
+					assert.Equal(t, user.Quota, cached.Quota, "independent processes must preserve each wallet cache increment")
+				}
+			}
 			assert.Equal(t, 200+int(rewarded), owner.AffHistoryQuota)
 		})
 	}
+}
+
+// MySQL 8 moved the InnoDB lock-wait view into Performance Schema. Select the
+// supported monitor rather than treating a missing 5.7 view as a lock failure.
+func referralLockWaitQuery(t *testing.T, db *gorm.DB, dialect string) string {
+	t.Helper()
+	if dialect == "postgres" {
+		return "SELECT COUNT(*) FROM pg_stat_activity WHERE pid = ? AND wait_event_type = 'Lock'"
+	}
+	var modernMonitor int64
+	require.NoError(t, db.Raw("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'performance_schema' AND table_name = 'data_lock_waits'").Scan(&modernMonitor).Error)
+	if modernMonitor != 0 {
+		return "SELECT COUNT(*) FROM performance_schema.data_lock_waits w JOIN performance_schema.threads t ON t.THREAD_ID = w.REQUESTING_THREAD_ID WHERE t.PROCESSLIST_ID = ?"
+	}
+	return "SELECT COUNT(*) FROM information_schema.innodb_lock_waits w JOIN information_schema.innodb_trx t ON t.trx_id = w.requesting_trx_id WHERE t.trx_mysql_thread_id = ?"
 }
 
 func TestReferralRuleSaveOrdersConcurrentSettlement(t *testing.T) {
@@ -1018,10 +1305,9 @@ func TestReferralRuleSaveOrdersConcurrentSettlement(t *testing.T) {
 			release := sync.OnceFunc(func() { close(releaseReader) })
 			var readerOnce sync.Once
 			backendQuery := "SELECT CONNECTION_ID()"
-			waitQuery := "SELECT COUNT(*) FROM information_schema.innodb_lock_waits w JOIN information_schema.innodb_trx t ON t.trx_id = w.requesting_trx_id WHERE t.trx_mysql_thread_id = ?"
+			waitQuery := referralLockWaitQuery(t, db, dialect)
 			if dialect == "postgres" {
 				backendQuery = "SELECT pg_backend_pid()"
-				waitQuery = "SELECT COUNT(*) FROM pg_stat_activity WHERE pid = ? AND wait_event_type = 'Lock'"
 			}
 			require.NoError(t, db.Callback().Query().Before("gorm:query").Register("referral_rule_writer_ready", func(tx *gorm.DB) {
 				locking, ok := tx.Statement.Clauses["FOR"].Expression.(clause.Locking)
@@ -1154,11 +1440,10 @@ func TestReferralSettlementRechecksEligibilityAfterUserLockWait(t *testing.T) {
 				DB, LOG_DB = db.WithContext(ctx), db
 				databaseType := common.DatabaseTypeMySQL
 				backendQuery := "SELECT CONNECTION_ID()"
-				waitQuery := "SELECT COUNT(*) FROM information_schema.innodb_lock_waits w JOIN information_schema.innodb_trx t ON t.trx_id = w.requesting_trx_id WHERE t.trx_mysql_thread_id = ?"
+				waitQuery := referralLockWaitQuery(t, db, dialect)
 				if dialect == "postgres" {
 					databaseType = common.DatabaseTypePostgreSQL
 					backendQuery = "SELECT pg_backend_pid()"
-					waitQuery = "SELECT COUNT(*) FROM pg_stat_activity WHERE pid = ? AND wait_event_type = 'Lock'"
 				}
 				common.SetDatabaseTypes(databaseType, databaseType)
 				common.RedisEnabled, common.BatchUpdateEnabled = false, false
@@ -1606,10 +1891,7 @@ func TestReferralColdCacheAndWalletCreditAcrossProcesses(t *testing.T) {
 						t.Logf("independent SQLite writer rejected before holder release: %s", waiterResult.Error)
 					} else {
 						require.NotEqual(t, holderID, waiterID)
-						waitQuery := "SELECT COUNT(*) FROM information_schema.innodb_lock_waits w JOIN information_schema.innodb_trx t ON t.trx_id = w.requesting_trx_id WHERE t.trx_mysql_thread_id = ?"
-						if dialect == "postgres" {
-							waitQuery = "SELECT COUNT(*) FROM pg_stat_activity WHERE pid = ? AND wait_event_type = 'Lock'"
-						}
+						waitQuery := referralLockWaitQuery(t, db, dialect)
 						ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 						defer cancel()
 						// MySQL 5.7 caches the InnoDB information-schema snapshot;

@@ -37,8 +37,11 @@ func RequestWaffoPancakeAmount(c *gin.Context) {
 		return
 	}
 
-	displayType, quotaPerUnit := walletTopUpUnits()
-	minTopup := getWaffoPancakeMinTopup()
+	common.OptionMapRWMutex.RLock()
+	pricing := walletTopUpPricingLocked(setting.WaffoPancakeUnitPrice, setting.WaffoPancakeMinTopUp)
+	common.OptionMapRWMutex.RUnlock()
+	displayType, quotaPerUnit := pricing.displayType, pricing.quotaPerUnit
+	minTopup := pricing.minTopUp
 	if req.Amount < minTopup {
 		paymentError(c, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": minTopup}))
 		return
@@ -54,7 +57,7 @@ func RequestWaffoPancakeAmount(c *gin.Context) {
 		return
 	}
 
-	payMoney := getWaffoPancakePayMoney(req.Amount, group, displayType, quotaPerUnit)
+	payMoney := pricing.payMoney(req.Amount, group)
 	if err := validateTopUpPaymentAmount(payMoney); err != nil {
 		paymentError(c, err)
 		return
@@ -64,31 +67,11 @@ func RequestWaffoPancakeAmount(c *gin.Context) {
 }
 
 func getWaffoPancakePayMoney(amount int64, group, displayType string, quotaPerUnit float64) float64 {
-	dAmount := decimal.NewFromInt(amount)
-	if displayType == operation_setting.QuotaDisplayTypeTokens {
-		dAmount = dAmount.Div(decimal.NewFromFloat(quotaPerUnit))
-	}
-
 	common.OptionMapRWMutex.RLock()
-	topupGroupRatio := common.GetTopupGroupRatio(group)
-	unitPrice := setting.WaffoPancakeUnitPrice
-	configuredDiscount := operation_setting.GetPaymentSetting().AmountDiscount[int(amount)]
+	pricing := walletTopUpPricingLocked(setting.WaffoPancakeUnitPrice, setting.WaffoPancakeMinTopUp)
 	common.OptionMapRWMutex.RUnlock()
-	if topupGroupRatio == 0 {
-		topupGroupRatio = 1
-	}
-
-	discount := 1.0
-	if configuredDiscount > 0 {
-		discount = configuredDiscount
-	}
-
-	payMoney := dAmount.
-		Mul(decimal.NewFromFloat(unitPrice)).
-		Mul(decimal.NewFromFloat(topupGroupRatio)).
-		Mul(decimal.NewFromFloat(discount))
-
-	return payMoney.InexactFloat64()
+	pricing.displayType, pricing.quotaPerUnit = displayType, quotaPerUnit
+	return pricing.payMoney(amount, group)
 }
 
 func normalizeWaffoPancakeTopUpAmount(amount int64, displayType string, quotaPerUnit float64) int64 {
@@ -378,6 +361,11 @@ func RequestWaffoPancakePay(c *gin.Context) {
 	common.OptionMapRWMutex.RLock()
 	enabled := isWaffoPancakeTopUpEnabled()
 	productID := setting.WaffoPancakeProductID
+	pricing := walletTopUpPricingLocked(setting.WaffoPancakeUnitPrice, setting.WaffoPancakeMinTopUp)
+	checkoutConfig := &service.WaffoPancakeCheckoutConfig{
+		MerchantID: setting.WaffoPancakeMerchantID, PrivateKey: setting.WaffoPancakePrivateKey,
+		StoreID: setting.WaffoPancakeStoreID,
+	}
 	common.OptionMapRWMutex.RUnlock()
 	if !enabled {
 		paymentError(c, common.NewMessage("Waffo Pancake configuration is incomplete"))
@@ -389,8 +377,8 @@ func RequestWaffoPancakePay(c *gin.Context) {
 		paymentError(c, common.NewMessage("Invalid parameters"))
 		return
 	}
-	displayType, quotaPerUnit := walletTopUpUnits()
-	minTopup := getWaffoPancakeMinTopup()
+	displayType, quotaPerUnit := pricing.displayType, pricing.quotaPerUnit
+	minTopup := pricing.minTopUp
 	if req.Amount < minTopup {
 		paymentError(c, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": minTopup}))
 		return
@@ -413,7 +401,7 @@ func RequestWaffoPancakePay(c *gin.Context) {
 		return
 	}
 
-	payMoney := getWaffoPancakePayMoney(req.Amount, group, displayType, quotaPerUnit)
+	payMoney := pricing.payMoney(req.Amount, group)
 	if err := validateTopUpPaymentAmount(payMoney); err != nil {
 		paymentError(c, err)
 		return
@@ -440,6 +428,7 @@ func RequestWaffoPancakePay(c *gin.Context) {
 	expiresInSeconds := 45 * 60
 	session, err := service.CreateWaffoPancakeCheckoutSession(c.Request.Context(), &service.WaffoPancakeCreateSessionParams{
 		ProductID:     productID,
+		Config:        checkoutConfig,
 		BuyerIdentity: getWaffoPancakeBuyerIdentity(user),
 		PriceSnapshot: &service.WaffoPancakePriceSnapshot{
 			Amount:      formatWaffoPancakeAmount(payMoney),

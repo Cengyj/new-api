@@ -6,16 +6,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 	"github.com/thanhpk/randstr"
@@ -27,33 +30,33 @@ import (
 	"gorm.io/gorm"
 )
 
-func getWaffoSDK() (*waffo.Waffo, error) {
-	common.OptionMapRWMutex.RLock()
-	merchantID := setting.WaffoMerchantId
-	common.OptionMapRWMutex.RUnlock()
-	return getWaffoSDKForMerchant(merchantID)
+type waffoConfigSnapshot struct {
+	merchantID, apiKey, privateKey, publicKey string
+	environment                               config.Environment
 }
 
-func getWaffoSDKForMerchant(merchantID string) (*waffo.Waffo, error) {
-	common.OptionMapRWMutex.RLock()
-	env := config.Sandbox
-	apiKey := setting.WaffoSandboxApiKey
-	privateKey := setting.WaffoSandboxPrivateKey
-	publicKey := setting.WaffoSandboxPublicCert
+func waffoConfigLocked() waffoConfigSnapshot {
+	snapshot := waffoConfigSnapshot{merchantID: setting.WaffoMerchantId, environment: config.Sandbox,
+		apiKey: setting.WaffoSandboxApiKey, privateKey: setting.WaffoSandboxPrivateKey, publicKey: setting.WaffoSandboxPublicCert}
 	if !setting.WaffoSandbox {
-		env = config.Production
-		apiKey = setting.WaffoApiKey
-		privateKey = setting.WaffoPrivateKey
-		publicKey = setting.WaffoPublicCert
+		snapshot.environment = config.Production
+		snapshot.apiKey, snapshot.privateKey, snapshot.publicKey = setting.WaffoApiKey, setting.WaffoPrivateKey, setting.WaffoPublicCert
 	}
+	return snapshot
+}
+
+func getWaffoSDK() (*waffo.Waffo, error) {
+	common.OptionMapRWMutex.RLock()
+	snapshot := waffoConfigLocked()
 	common.OptionMapRWMutex.RUnlock()
-	builder := config.NewConfigBuilder().
-		APIKey(apiKey).
-		PrivateKey(privateKey).
-		WaffoPublicKey(publicKey).
-		Environment(env)
-	if merchantID != "" {
-		builder = builder.MerchantID(merchantID)
+	return snapshot.newSDK()
+}
+
+func (snapshot waffoConfigSnapshot) newSDK() (*waffo.Waffo, error) {
+	builder := config.NewConfigBuilder().APIKey(snapshot.apiKey).PrivateKey(snapshot.privateKey).
+		WaffoPublicKey(snapshot.publicKey).Environment(snapshot.environment)
+	if snapshot.merchantID != "" {
+		builder = builder.MerchantID(snapshot.merchantID)
 	}
 	cfg, err := builder.Build()
 	if err != nil {
@@ -107,23 +110,23 @@ func formatWaffoAmount(amount float64, currency string) string {
 // Waffo only accepts USD, so this function handles the conversion from different
 // display types (USD/CNY/TOKENS) to the actual USD amount to charge.
 func getWaffoPayMoney(amount float64, group, displayType string, quotaPerUnit float64) float64 {
-	originalAmount := amount
-	if displayType == operation_setting.QuotaDisplayTypeTokens {
-		amount = amount / quotaPerUnit
-	}
 	common.OptionMapRWMutex.RLock()
-	topupGroupRatio := common.GetTopupGroupRatio(group)
-	unitPrice := setting.WaffoUnitPrice
-	configuredDiscount := operation_setting.GetPaymentSetting().AmountDiscount[int(originalAmount)]
+	pricing := walletTopUpPricingLocked(setting.WaffoUnitPrice, setting.WaffoMinTopUp)
 	common.OptionMapRWMutex.RUnlock()
-	if topupGroupRatio == 0 {
-		topupGroupRatio = 1
+	pricing.displayType, pricing.quotaPerUnit = displayType, quotaPerUnit
+	return pricing.waffoPayMoney(amount, group)
+}
+
+// Keep Waffo's established floating-point pricing and provider rounding.
+func (pricing walletTopUpPricing) waffoPayMoney(amount float64, group string) float64 {
+	discount := pricing.discounts[int(amount)]
+	if discount <= 0 {
+		discount = 1
 	}
-	discount := 1.0
-	if configuredDiscount > 0 {
-		discount = configuredDiscount
+	if pricing.displayType == operation_setting.QuotaDisplayTypeTokens {
+		amount /= pricing.quotaPerUnit
 	}
-	return amount * unitPrice * topupGroupRatio * discount
+	return amount * pricing.unitPrice * pricing.groupRatio(group) * discount
 }
 
 type WaffoPayRequest struct {
@@ -146,8 +149,12 @@ func RequestWaffoAmount(c *gin.Context) {
 		return
 	}
 
-	displayType, quotaPerUnit := walletTopUpUnits()
-	waffoMinTopup := getWaffoMinTopup()
+	common.OptionMapRWMutex.RLock()
+	pricing := walletTopUpPricingLocked(setting.WaffoUnitPrice, setting.WaffoMinTopUp)
+	currency := setting.WaffoCurrency
+	common.OptionMapRWMutex.RUnlock()
+	displayType, quotaPerUnit := pricing.displayType, pricing.quotaPerUnit
+	waffoMinTopup := pricing.minTopUp
 	if req.Amount < waffoMinTopup {
 		paymentError(c, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": waffoMinTopup}))
 		return
@@ -163,13 +170,18 @@ func RequestWaffoAmount(c *gin.Context) {
 		return
 	}
 
-	payMoney := getWaffoPayMoney(float64(req.Amount), group, displayType, quotaPerUnit)
+	payMoney := pricing.waffoPayMoney(float64(req.Amount), group)
 	if err := validateTopUpPaymentAmount(payMoney); err != nil {
 		paymentError(c, err)
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "success", "data": strconv.FormatFloat(payMoney, 'f', 2, 64)})
+	paymentAmount := formatWaffoAmount(payMoney, currency)
+	if paymentAmount == "0" || paymentAmount == "0.00" {
+		paymentError(c, common.NewMessage("Payment amount is too low"))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "success", "data": paymentAmount})
 }
 
 // RequestWaffoPay 创建 Waffo 支付订单
@@ -191,8 +203,16 @@ func RequestWaffoPay(c *gin.Context) {
 		paymentError(c, common.NewMessage("Invalid parameters"))
 		return
 	}
-	displayType, quotaPerUnit := walletTopUpUnits()
-	waffoMinTopup := getWaffoMinTopup()
+	common.OptionMapRWMutex.RLock()
+	pricing := walletTopUpPricingLocked(setting.WaffoUnitPrice, setting.WaffoMinTopUp)
+	sdkConfig := waffoConfigLocked()
+	methodsConfig := common.OptionMap["WaffoPayMethods"]
+	configuredNotifyURL, configuredReturnURL := setting.WaffoNotifyUrl, setting.WaffoReturnUrl
+	callbackAddress, serverAddress := operation_setting.CustomCallbackAddress, system_setting.ServerAddress
+	currency := setting.WaffoCurrency
+	common.OptionMapRWMutex.RUnlock()
+	displayType, quotaPerUnit := pricing.displayType, pricing.quotaPerUnit
+	waffoMinTopup := pricing.minTopUp
 	if req.Amount < waffoMinTopup {
 		paymentError(c, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": waffoMinTopup}))
 		return
@@ -211,7 +231,10 @@ func RequestWaffoPay(c *gin.Context) {
 
 	// 从服务端配置查找支付方式，客户端只传索引或旧字段
 	var resolvedPayMethodType, resolvedPayMethodName string
-	methods := setting.GetWaffoPayMethods()
+	var methods []constant.WaffoPayMethod
+	if methodsConfig == "" || common.UnmarshalJsonStr(methodsConfig, &methods) != nil {
+		methods = slices.Clone(constant.DefaultWaffoPayMethods)
+	}
 	if req.PayMethodIndex != nil {
 		// 新协议：按索引查找
 		idx := *req.PayMethodIndex
@@ -259,9 +282,15 @@ func RequestWaffoPay(c *gin.Context) {
 		paymentError(c, common.NewMessage("Failed to get the user group"))
 		return
 	}
-	payMoney := getWaffoPayMoney(float64(req.Amount), group, displayType, quotaPerUnit)
+	payMoney := pricing.waffoPayMoney(float64(req.Amount), group)
 	if err := validateTopUpPaymentAmount(payMoney); err != nil {
 		paymentError(c, err)
+		return
+	}
+
+	paymentAmount := formatWaffoAmount(payMoney, currency)
+	if paymentAmount == "0" || paymentAmount == "0.00" {
+		paymentError(c, common.NewMessage("Payment amount is too low"))
 		return
 	}
 
@@ -277,10 +306,7 @@ func RequestWaffoPay(c *gin.Context) {
 	}
 
 	// Freeze the merchant sent to this checkout, including SDK auto-injection.
-	common.OptionMapRWMutex.RLock()
-	merchantID := setting.WaffoMerchantId
-	configuredNotifyURL, configuredReturnURL := setting.WaffoNotifyUrl, setting.WaffoReturnUrl
-	common.OptionMapRWMutex.RUnlock()
+	merchantID := sdkConfig.merchantID
 	// 创建本地订单
 	topUp := &model.TopUp{
 		UserId:          id,
@@ -300,7 +326,7 @@ func RequestWaffoPay(c *gin.Context) {
 		return
 	}
 
-	sdk, err := getWaffoSDKForMerchant(merchantID)
+	sdk, err := sdkConfig.newSDK()
 	if err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Waffo SDK initialization failed user_id=%d trade_no=%s error=%q", id, merchantOrderId, err.Error()))
 		topUp.Status = common.TopUpStatusFailed
@@ -309,22 +335,26 @@ func RequestWaffoPay(c *gin.Context) {
 		return
 	}
 
-	callbackAddr := service.GetCallbackAddress()
-	notifyUrl := callbackAddr + "/api/waffo/webhook"
+	if callbackAddress == "" {
+		callbackAddress = serverAddress
+	}
+	notifyUrl := strings.TrimRight(callbackAddress, "/") + "/api/waffo/webhook"
 	if configuredNotifyURL != "" {
 		notifyUrl = configuredNotifyURL
 	}
-	returnUrl := paymentReturnPath("/wallet?show_history=true")
+	returnUrl := strings.TrimRight(serverAddress, "/") + "/wallet?show_history=true"
 	if configuredReturnURL != "" {
 		returnUrl = configuredReturnURL
 	}
 
-	currency := getWaffoCurrency()
+	if currency == "" {
+		currency = "USD"
+	}
 	goodsInfo := buildWaffoTopUpGoodsInfo(req.Amount)
 	createParams := &order.CreateOrderParams{
 		PaymentRequestID: paymentRequestId,
 		MerchantOrderID:  merchantOrderId,
-		OrderAmount:      formatWaffoAmount(payMoney, currency),
+		OrderAmount:      paymentAmount,
 		OrderCurrency:    currency,
 		OrderDescription: goodsInfo.GoodsName,
 		OrderRequestedAt: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),

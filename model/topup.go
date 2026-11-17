@@ -397,12 +397,20 @@ func settleWalletTopUp(tradeNo, expectedProvider, actualMethod, customerID, cust
 	return &topUp, quota, alreadyDone, err
 }
 
+// Format the committed credit with one complete display configuration. Keep
+// the option lock around formatting only, never around settlement or log I/O.
+func formatTopUpLogQuota(quota int) string {
+	common.OptionMapRWMutex.RLock()
+	defer common.OptionMapRWMutex.RUnlock()
+	return logger.FormatQuota(quota)
+}
+
 func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (bool, error) {
 	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, PaymentProviderEpay, actualPaymentMethod, "", "", TopUpSettlementAudit{Source: "payment"})
 	if topUp == nil || alreadyDone {
 		return alreadyDone, err
 	}
-	RecordTopupLog(topUp.UserId, common.NewMessage("Online top-up succeeded, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"quota": logger.FormatQuota(quota), "amount": fmt.Sprintf("%f", topUp.Money)}), callerIp, topUp.PaymentMethod, PaymentProviderEpay)
+	RecordTopupLog(topUp.UserId, common.NewMessage("Online top-up succeeded, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"quota": formatTopUpLogQuota(quota), "amount": fmt.Sprintf("%f", topUp.Money)}), callerIp, topUp.PaymentMethod, PaymentProviderEpay)
 	return false, err
 }
 
@@ -411,7 +419,7 @@ func Recharge(referenceId string, customerId string, callerIp string) error {
 	if topUp == nil || alreadyDone {
 		return err
 	}
-	RecordTopupLog(topUp.UserId, common.NewMessage("Online top-up succeeded, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"quota": logger.FormatQuota(quota), "amount": topUp.Amount}), callerIp, topUp.PaymentMethod, PaymentMethodStripe)
+	RecordTopupLog(topUp.UserId, common.NewMessage("Online top-up succeeded, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"quota": formatTopUpLogQuota(quota), "amount": topUp.Amount}), callerIp, topUp.PaymentMethod, PaymentMethodStripe)
 	return err
 }
 
@@ -622,7 +630,7 @@ func ManualCompleteTopUp(tradeNo string, callerIp string, operator TopUpSettleme
 	if topUp == nil || alreadyDone {
 		return err
 	}
-	RecordTopupLog(topUp.UserId, common.NewMessage("Administrator completed the order, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"quota": logger.FormatQuota(quota), "amount": fmt.Sprintf("%f", topUp.Money)}), callerIp, topUp.PaymentMethod, "admin")
+	RecordTopupLog(topUp.UserId, common.NewMessage("Administrator completed the order, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"quota": formatTopUpLogQuota(quota), "amount": fmt.Sprintf("%f", topUp.Money)}), callerIp, topUp.PaymentMethod, "admin")
 	return err
 }
 
@@ -640,7 +648,7 @@ func RechargeWaffo(tradeNo string, callerIp string) error {
 	if topUp == nil || alreadyDone {
 		return err
 	}
-	RecordTopupLog(topUp.UserId, common.NewMessage("{{provider}} top-up succeeded, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"provider": "Waffo", "quota": logger.FormatQuota(quota), "amount": fmt.Sprintf("%.2f", topUp.Money)}), callerIp, topUp.PaymentMethod, PaymentMethodWaffo)
+	RecordTopupLog(topUp.UserId, common.NewMessage("{{provider}} top-up succeeded, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"provider": "Waffo", "quota": formatTopUpLogQuota(quota), "amount": fmt.Sprintf("%.2f", topUp.Money)}), callerIp, topUp.PaymentMethod, PaymentMethodWaffo)
 	return err
 }
 
@@ -649,6 +657,6 @@ func RechargeWaffoPancake(tradeNo string) error {
 	if topUp == nil || alreadyDone {
 		return err
 	}
-	RecordLog(topUp.UserId, LogTypeTopup, common.NewMessage("{{provider}} top-up succeeded, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"provider": "Waffo Pancake", "quota": logger.FormatQuota(quota), "amount": fmt.Sprintf("%.2f", topUp.Money)}))
+	RecordLog(topUp.UserId, LogTypeTopup, common.NewMessage("{{provider}} top-up succeeded, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"provider": "Waffo Pancake", "quota": formatTopUpLogQuota(quota), "amount": fmt.Sprintf("%.2f", topUp.Money)}))
 	return err
 }

@@ -72,6 +72,7 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 	common.OptionMapRWMutex.RLock()
 	webhookConfigured := isCreemWebhookConfigured()
 	productConfig := setting.CreemProducts
+	checkoutConfig := creemCheckoutConfig{apiKey: setting.CreemApiKey, testMode: setting.CreemTestMode}
 	common.OptionMapRWMutex.RUnlock()
 	if !webhookConfigured {
 		paymentError(c, common.NewMessage("Creem webhook is not configured"))
@@ -140,7 +141,7 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 	}
 
 	// 创建支付链接，传入用户邮箱
-	checkoutUrl, err := genCreemLink(c.Request.Context(), referenceId, selectedProduct, user.Email, user.Username)
+	checkoutUrl, err := checkoutConfig.link(c.Request.Context(), referenceId, selectedProduct, user.Email, user.Username)
 	if err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Creem failed to create payment link user_id=%d trade_no=%s product_id=%s error_type=%T", id, referenceId, selectedProduct.ProductId, err))
 		if errors.Is(err, errCreemCheckoutNotCreated) {
@@ -384,10 +385,20 @@ type CreemCheckoutResponse struct {
 	Id          string `json:"id"`
 }
 
+type creemCheckoutConfig struct {
+	apiKey   string
+	testMode bool
+}
+
 func genCreemLink(ctx context.Context, referenceId string, product *CreemProduct, email string, username string) (string, error) {
 	common.OptionMapRWMutex.RLock()
-	apiKey, testMode := setting.CreemApiKey, setting.CreemTestMode
+	config := creemCheckoutConfig{apiKey: setting.CreemApiKey, testMode: setting.CreemTestMode}
 	common.OptionMapRWMutex.RUnlock()
+	return config.link(ctx, referenceId, product, email, username)
+}
+
+func (config creemCheckoutConfig) link(ctx context.Context, referenceId string, product *CreemProduct, email, username string) (string, error) {
+	apiKey, testMode := config.apiKey, config.testMode
 	if apiKey == "" {
 		return "", fmt.Errorf("%w: API key is not configured", errCreemCheckoutNotCreated)
 	}

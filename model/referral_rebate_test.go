@@ -981,52 +981,84 @@ func TestReferralRuleRejectsGenericOptionAliasesAcrossDatabases(t *testing.T) {
 				common.OptionMapRWMutex.Unlock()
 			})
 			require.NoError(t, db.AutoMigrate(&Option{}))
+			var version, keyCollation string
+			versionQuery := "SELECT version()"
+			collationQuery := "SELECT collation_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'options' AND column_name = 'key'"
+			switch dialect {
+			case "sqlite":
+				versionQuery = "SELECT sqlite_version()"
+				collationQuery = "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'options'"
+			case "postgres":
+				collationQuery = "SELECT c.collname FROM pg_attribute a JOIN pg_collation c ON c.oid = a.attcollation WHERE a.attrelid = 'options'::regclass AND a.attname = 'key'"
+			}
+			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
+			require.NoError(t, db.Raw(collationQuery).Scan(&keyCollation).Error)
+			t.Logf("rule key comparison: database=%s key collation/DDL=%s", version, keyCollation)
 			require.NoError(t, InitializeReferralRebateRule(db))
 			expected := ReferralRebateRule{Enabled: true, RateBPS: 1000, ValidDays: 1}
 			require.NoError(t, SaveReferralRebateRule(expected))
 			const ordinaryKey = "referral-regression-unrelated-option"
-			for _, method := range []string{"single", "bulk"} {
-				for _, alias := range []string{ReferralRebateOptionKey, "referralrebaterule", "REFERRALREBATERULE", "ReferralRebateRule ", "ReferrálRebateRule", "ＲeferralRebateRule"} {
-					t.Run(method+"/"+alias, func(t *testing.T) {
-						require.NoError(t, UpdateOption(ordinaryKey, "before"))
-						var resolved Option
-						lookupErr := db.Where(&Option{Key: alias}).First(&resolved).Error
-						require.True(t, lookupErr == nil || errors.Is(lookupErr, gorm.ErrRecordNotFound))
-						protected := alias == ReferralRebateOptionKey || lookupErr == nil && resolved.Key == ReferralRebateOptionKey
-						var err error
-						if method == "single" {
-							err = UpdateOption(alias, "null")
-						} else {
-							err = UpdateOptionsBulk(map[string]string{ordinaryKey: "after", alias: "null"})
-						}
-						if protected {
-							assert.ErrorIs(t, err, ErrInvalidReferralRule)
-						} else {
-							require.NoError(t, err, "distinct database keys retain generic option behavior")
-						}
-						actual, err := GetReferralRebateRule()
-						require.NoError(t, err)
-						assert.Equal(t, expected, actual, "generic writes must preserve the complete validated rule")
-						var ordinary Option
-						require.NoError(t, db.Where(&Option{Key: ordinaryKey}).First(&ordinary).Error)
-						expectedValue := "before"
-						if method == "bulk" && !protected {
-							expectedValue = "after"
-						}
-						assert.Equal(t, expectedValue, ordinary.Value)
-						common.OptionMapRWMutex.RLock()
-						published := common.OptionMap[ordinaryKey]
-						common.OptionMapRWMutex.RUnlock()
-						assert.Equal(t, expectedValue, published, "rejection must not publish partial configuration")
-						if protected && method == "bulk" {
-							// Bulk passkey dispatch accepts other supplied options; protection must
-							// run before delegation, without changing authentication configuration.
-							assert.ErrorIs(t, UpdateOptionsBulk(map[string]string{"ServerAddress": "https://unused.invalid", alias: "null"}), ErrInvalidReferralRule)
-							var domains int64
-							require.NoError(t, db.Model(&Option{}).Where(&Option{Key: "ServerAddress"}).Count(&domains).Error)
-							assert.Zero(t, domains)
-						}
-					})
+			for _, state := range []string{"present", "missing"} {
+				for _, method := range []string{"single", "bulk"} {
+					for _, alias := range []string{ReferralRebateOptionKey, "referralrebaterule", "REFERRALREBATERULE", "ReferralRebateRule ", "ReferrálRebateRule", "ＲeferralRebateRule"} {
+						t.Run(state+"/"+method+"/"+alias, func(t *testing.T) {
+							require.NoError(t, InitializeReferralRebateRule(db))
+							require.NoError(t, SaveReferralRebateRule(expected))
+							var resolved Option
+							lookupErr := db.Where(&Option{Key: alias}).First(&resolved).Error
+							require.True(t, lookupErr == nil || errors.Is(lookupErr, gorm.ErrRecordNotFound))
+							protected := alias == ReferralRebateOptionKey || lookupErr == nil && resolved.Key == ReferralRebateOptionKey
+							if state == "missing" {
+								// Determine equality using the actual key column, then remove
+								// the rule before the generic write attempts to bypass validation.
+								require.NoError(t, db.Where(&Option{Key: ReferralRebateOptionKey}).Delete(&Option{}).Error)
+							}
+							require.NoError(t, UpdateOption(ordinaryKey, "before"), "a missing rule must not block unrelated option writes")
+							var err error
+							if method == "single" {
+								err = UpdateOption(alias, "null")
+							} else {
+								err = UpdateOptionsBulk(map[string]string{ordinaryKey: "after", alias: "null"})
+							}
+							if protected {
+								assert.ErrorIs(t, err, ErrInvalidReferralRule)
+							} else {
+								require.NoError(t, err, "distinct database keys retain generic option behavior")
+							}
+							expectedRule := expected
+							if state == "missing" {
+								var rules int64
+								require.NoError(t, db.Model(&Option{}).Where(&Option{Key: ReferralRebateOptionKey}).Count(&rules).Error)
+								assert.Zero(t, rules, "generic writes must not initialize the missing rule")
+								_, err := GetReferralRebateRule()
+								assert.ErrorIs(t, err, ErrInvalidReferralRule)
+								require.NoError(t, InitializeReferralRebateRule(db))
+								expectedRule = ReferralRebateRule{RateBPS: 500, ValidDays: 7}
+							}
+							actual, err := GetReferralRebateRule()
+							require.NoError(t, err)
+							assert.Equal(t, expectedRule, actual, "generic writes must preserve the rule or allow its safe first initialization")
+							var ordinary Option
+							require.NoError(t, db.Where(&Option{Key: ordinaryKey}).First(&ordinary).Error)
+							expectedValue := "before"
+							if method == "bulk" && !protected {
+								expectedValue = "after"
+							}
+							assert.Equal(t, expectedValue, ordinary.Value)
+							common.OptionMapRWMutex.RLock()
+							published := common.OptionMap[ordinaryKey]
+							common.OptionMapRWMutex.RUnlock()
+							assert.Equal(t, expectedValue, published, "rejection must not publish partial configuration")
+							if protected && method == "bulk" {
+								// Bulk passkey dispatch accepts other supplied options; protection must
+								// run before delegation, without changing authentication configuration.
+								assert.ErrorIs(t, UpdateOptionsBulk(map[string]string{"ServerAddress": "https://unused.invalid", alias: "null"}), ErrInvalidReferralRule)
+								var domains int64
+								require.NoError(t, db.Model(&Option{}).Where(&Option{Key: "ServerAddress"}).Count(&domains).Error)
+								assert.Zero(t, domains)
+							}
+						})
+					}
 				}
 			}
 			require.NoError(t, UpdateOptionsBulk(map[string]string{ordinaryKey: "ordinary-bulk-success"}))
