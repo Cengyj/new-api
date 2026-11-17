@@ -3,12 +3,16 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/hmac"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -3458,8 +3462,11 @@ func TestWalletCheckoutDisplaySnapshotPreservesPricingAndCapacity(t *testing.T) 
 							changed = true
 							// Run the real option persistence/runtime update after the first
 							// user read, before pricing and order creation.
-							assert.NoError(t, model.UpdateOption("general_setting.quota_display_type", display.after))
-							assert.NoError(t, model.UpdateOption("QuotaPerUnit", strconv.FormatFloat(display.nextQuotaPerUnit, 'f', -1, 64)))
+							assert.NoError(t, model.UpdateOptionsBulk(map[string]string{
+								"general_setting.quota_display_type": display.after,
+								"QuotaPerUnit":                       strconv.FormatFloat(display.nextQuotaPerUnit, 'f', -1, 64),
+								"Price":                              "2", "WaffoUnitPrice": "2", "WaffoPancakeUnitPrice": "2",
+							}))
 						}
 					}))
 					t.Cleanup(func() { assert.NoError(t, model.DB.Callback().Query().Remove(callbackName)) })
@@ -6358,7 +6365,9 @@ func TestWalletPricingConcurrentSaveAndReloadKeepLatestPrice(t *testing.T) {
 			laterPreflight := make(chan struct{})
 			var laterStarted, laterObserved atomic.Bool
 			require.NoError(t, healthy.Callback().Query().After("gorm:after_query").Register("fixture:topup_ratio_preflight", func(tx *gorm.DB) {
-				if tx.Statement.Table != "options" || !laterStarted.Load() {
+				// The first operation is paused. Observe the later save's count
+				// preflight whether it queries options or a derived table.
+				if !laterStarted.Load() {
 					return
 				}
 				if _, ok := tx.Statement.Dest.(*int64); ok && laterObserved.CompareAndSwap(false, true) {
@@ -7904,4 +7913,285 @@ func TestEpayCheckoutCallbackBasePreservesReachablePaths(t *testing.T) {
 			assert.Zero(t, rebates, "checkout alone must not award a wallet rebate")
 		})
 	}
+}
+
+func TestWalletEpayCheckoutUsesOneConfigurationSnapshot(t *testing.T) {
+	router, _ := walletCheckoutFixture(t)
+	oldOptions := common.OptionMap
+	common.OptionMap = make(map[string]string)
+	t.Cleanup(func() { common.OptionMap = oldOptions })
+	require.NoError(t, model.UpdateOptionsBulk(map[string]string{
+		"QuotaPerUnit": "10", "Price": "1", "EpayId": "merchant_before",
+		"EpayKey": "key_before", "TopupGroupRatio": `{"default":1}`,
+	}))
+	changed := false
+	const callbackName = "test:atomic_payment_configuration"
+	require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if tx.Statement.Table != "users" || changed {
+			return
+		}
+		changed = true
+		require.NoError(t, model.UpdateOptionsBulk(map[string]string{
+			"QuotaPerUnit": "100", "Price": "2", "EpayId": "merchant_after",
+			"EpayKey": "key_after", "TopupGroupRatio": `{"default":2}`,
+		}))
+	}))
+	t.Cleanup(func() { assert.NoError(t, model.DB.Callback().Query().Remove(callbackName)) })
+	router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestEpay)
+	request := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(`{"amount":100,"payment_method":"alipay"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	require.True(t, changed)
+	var payload struct {
+		Message string
+		Data    map[string]string
+	}
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &payload))
+	require.Equal(t, "success", payload.Message)
+	var order model.TopUp
+	require.NoError(t, model.DB.First(&order).Error)
+	require.NotNil(t, order.CreditedQuota)
+	// The order may use the complete old or complete new snapshot, never
+	// credit from the old conversion rate with the new merchant and price.
+	if payload.Data["pid"] == "merchant_before" {
+		assert.Equal(t, 1000, *order.CreditedQuota)
+		assert.Equal(t, "100.00", payload.Data["money"])
+	} else {
+		assert.Equal(t, "merchant_after", payload.Data["pid"])
+		assert.Equal(t, 10000, *order.CreditedQuota)
+		assert.Equal(t, "400.00", payload.Data["money"])
+	}
+}
+
+func TestWalletRemoteCheckoutKeepsProductAndCredentialsSnapshot(t *testing.T) {
+	for _, provider := range []string{model.PaymentProviderStripe, model.PaymentProviderCreem, model.PaymentProviderWaffoPancake} {
+		t.Run(provider, func(t *testing.T) {
+			router, _ := walletCheckoutFixture(t)
+			oldOptions, oldTransport, oldClient := common.OptionMap, http.DefaultTransport, http.DefaultClient
+			oldBackend := stripe.GetBackend(stripe.APIBackend)
+			common.OptionMap = make(map[string]string)
+			t.Cleanup(func() {
+				common.OptionMap, http.DefaultTransport, http.DefaultClient = oldOptions, oldTransport, oldClient
+				stripe.SetBackend(stripe.APIBackend, oldBackend)
+			})
+			before := map[string]string{
+				"QuotaPerUnit": "10", "TopupGroupRatio": `{"default":1}`,
+				"StripeApiSecret": "sk_test_before", "StripePriceId": "price_before",
+				"CreemApiKey": "creem_before", "CreemTestMode": "false",
+				"CreemProducts":          `[{"productId":"fixture","price":100,"currency":"USD","quota":1000}]`,
+				"WaffoPancakeMerchantID": "MER_aaaaaaaaaaaaaaaaaaaaaa", "WaffoPancakeProductID": "PROD_bbbbbbbbbbbbbbbbbbbbbb",
+			}
+			after := map[string]string{
+				"QuotaPerUnit": "100", "TopupGroupRatio": `{"default":2}`,
+				"StripeApiSecret": "sk_test_after", "StripePriceId": "price_after",
+				"CreemApiKey": "creem_after", "CreemTestMode": "true",
+				"CreemProducts":          `[{"productId":"fixture","price":200,"currency":"USD","quota":2000}]`,
+				"WaffoPancakeMerchantID": "MER_cccccccccccccccccccccc", "WaffoPancakeProductID": "PROD_dddddddddddddddddddddd",
+			}
+			require.NoError(t, model.UpdateOptionsBulk(before))
+			changed := false
+			const callbackName = "test:remote_checkout_config"
+			require.NoError(t, model.DB.Callback().Query().After("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+				if tx.Statement.Table == "users" && !changed {
+					changed = true
+					require.NoError(t, model.UpdateOptionsBulk(after))
+				}
+			}))
+			t.Cleanup(func() { assert.NoError(t, model.DB.Callback().Query().Remove(callbackName)) })
+			var calls atomic.Int32
+			transport := walletCheckoutTransport(func(request *http.Request) (*http.Response, error) {
+				calls.Add(1)
+				response := `{"id":"fixture","url":"https://checkout.example.invalid/snapshot","checkout_url":"https://checkout.example.invalid/snapshot"}`
+				switch provider {
+				case model.PaymentProviderStripe:
+					assert.NoError(t, request.ParseForm())
+					assert.Equal(t, "Bearer sk_test_before", request.Header.Get("Authorization"))
+					assert.Equal(t, "price_before", request.Form.Get("line_items[0][price]"))
+					assert.Equal(t, "100", request.Form.Get("line_items[0][quantity]"))
+				case model.PaymentProviderCreem:
+					assert.Equal(t, "creem_before", request.Header.Get("x-api-key"))
+					assert.Equal(t, "api.creem.io", request.URL.Host)
+					var checkout CreemCheckoutRequest
+					assert.NoError(t, common.DecodeJson(request.Body, &checkout))
+					assert.Equal(t, "fixture", checkout.ProductId)
+					assert.Equal(t, "1000", checkout.Metadata["quota"])
+				case model.PaymentProviderWaffoPancake:
+					assert.Equal(t, "MER_aaaaaaaaaaaaaaaaaaaaaa", request.Header.Get("X-Merchant-Id"))
+					if request.URL.Path == "/v1/actions/checkout/create-session" {
+						var checkout map[string]any
+						assert.NoError(t, common.DecodeJson(request.Body, &checkout))
+						assert.Equal(t, "PROD_bbbbbbbbbbbbbbbbbbbbbb", checkout["productId"])
+						response = `{"data":{"sessionId":"ses_snapshot","checkoutUrl":"https://checkout.example.invalid/snapshot","expiresAt":"2099-01-01T00:00:00Z"}}`
+					} else {
+						response = `{"data":{"token":"snapshot_fixture","expiresAt":"2099-01-01T00:00:00Z"}}`
+					}
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(response)), Request: request}, nil
+			})
+			http.DefaultTransport = transport
+			http.DefaultClient = &http.Client{Transport: transport}
+			stripe.SetBackend(stripe.APIBackend, stripe.GetBackendWithConfig(stripe.APIBackend, &stripe.BackendConfig{HTTPClient: http.DefaultClient, MaxNetworkRetries: stripe.Int64(0), EnableTelemetry: stripe.Bool(false)}))
+			handler, body := RequestStripePay, `{"amount":100,"payment_method":"stripe"}`
+			switch provider {
+			case model.PaymentProviderCreem:
+				handler, body = RequestCreemPay, `{"product_id":"fixture","payment_method":"creem"}`
+			case model.PaymentProviderWaffoPancake:
+				handler, body = RequestWaffoPancakePay, `{"amount":100}`
+			}
+			router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, handler)
+			request := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			require.True(t, changed)
+			require.Contains(t, response.Body.String(), `"message":"success"`)
+			require.Positive(t, calls.Load())
+			var order model.TopUp
+			require.NoError(t, model.DB.First(&order).Error)
+			require.NotNil(t, order.CreditedQuota)
+			assert.Equal(t, 1000, *order.CreditedQuota)
+		})
+	}
+}
+
+// These vectors construct signed preimages without provider/SDK signing code.
+// They validate local interoperability; disposable keys do not attest a real merchant.
+func TestWalletCallbacksAcceptIndependentSignatures(t *testing.T) {
+	for _, mode := range []string{"epay", "epay_rsa", "stripe", "creem", "waffo", "waffo_pancake"} {
+		t.Run(mode, func(t *testing.T) {
+			router, keys := walletWebhookFixture(t)
+			provider := mode
+			if mode == "epay_rsa" {
+				provider = "epay"
+			}
+			order := walletWebhookOrder(t, provider, "independent-signature-"+mode)
+			request := walletWebhookRequest(t, keys, provider, order.TradeNo, "100.00", true)
+			if provider == "stripe" || provider == "creem" {
+				request = walletWebhookRequest(t, keys, provider, order.TradeNo, "9000", true)
+			}
+			body, err := io.ReadAll(request.Body)
+			require.NoError(t, err)
+			var content string
+			if provider == "epay" {
+				params, err := url.ParseQuery(string(body))
+				require.NoError(t, err)
+				params.Set("name", "independent + 百分比 = 50%")
+				if mode == "epay_rsa" {
+					operation_setting.GetPaymentSetting().EpaySignType = operation_setting.EpaySignTypeRSA
+					operation_setting.GetPaymentSetting().EpayMerchantPrivateKey = keys.PrivateKey
+					operation_setting.GetPaymentSetting().EpayPlatformPublicKey = keys.PublicKey
+					params.Set("sign_type", "RSA")
+					params.Set("timestamp", strconv.FormatInt(time.Now().Unix(), 10))
+				}
+				names := make([]string, 0, len(params))
+				for name := range params {
+					if name != "sign" && name != "sign_type" && params.Get(name) != "" {
+						names = append(names, name)
+					}
+				}
+				slices.Sort(names)
+				parts := make([]string, 0, len(names))
+				for _, name := range names {
+					parts = append(parts, name+"="+params.Get(name))
+				}
+				content = strings.Join(parts, "&")
+				if mode == "epay" {
+					digest := md5.Sum([]byte(content + operation_setting.EpayKey))
+					params.Set("sign", hex.EncodeToString(digest[:]))
+				} else {
+					keyDER, err := base64.StdEncoding.DecodeString(keys.PrivateKey)
+					require.NoError(t, err)
+					privateKey, err := x509.ParsePKCS8PrivateKey(keyDER)
+					require.NoError(t, err)
+					digest := sha256.Sum256([]byte(content))
+					signature, err := rsa.SignPKCS1v15(rand.Reader, privateKey.(*rsa.PrivateKey), crypto.SHA256, digest[:])
+					require.NoError(t, err)
+					params.Set("sign", base64.StdEncoding.EncodeToString(signature))
+				}
+				body = []byte(params.Encode())
+			} else if provider == "stripe" || provider == "creem" {
+				content = string(body)
+				secret := setting.CreemWebhookSecret
+				timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+				if provider == "stripe" {
+					content = timestamp + "." + content
+					secret = setting.StripeWebhookSecret
+				}
+				mac := hmac.New(sha256.New, []byte(secret))
+				_, err = mac.Write([]byte(content))
+				require.NoError(t, err)
+				signature := hex.EncodeToString(mac.Sum(nil))
+				if provider == "stripe" {
+					request.Header.Set("Stripe-Signature", "t="+timestamp+",v1="+signature)
+				} else {
+					request.Header.Set(CreemSignatureHeader, signature)
+				}
+			} else {
+				content = string(body)
+				timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+				if provider == "waffo_pancake" {
+					content = timestamp + "." + content
+				}
+				keyDER, err := base64.StdEncoding.DecodeString(keys.PrivateKey)
+				require.NoError(t, err)
+				privateKey, err := x509.ParsePKCS8PrivateKey(keyDER)
+				require.NoError(t, err)
+				digest := sha256.Sum256([]byte(content))
+				signature, err := rsa.SignPKCS1v15(rand.Reader, privateKey.(*rsa.PrivateKey), crypto.SHA256, digest[:])
+				require.NoError(t, err)
+				if provider == "waffo_pancake" {
+					request.Header.Set("X-Waffo-Signature", "t="+timestamp+",v1="+base64.StdEncoding.EncodeToString(signature))
+				} else {
+					request.Header.Set("X-SIGNATURE", base64.StdEncoding.EncodeToString(signature))
+				}
+			}
+			for range 2 {
+				retry := httptest.NewRequest(http.MethodPost, request.URL.Path, bytes.NewReader(body))
+				retry.Header = request.Header.Clone()
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, retry)
+				assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
+				if provider == "epay" {
+					assert.Equal(t, "success", response.Body.String())
+				}
+			}
+			var invitee, inviter model.User
+			require.NoError(t, model.DB.First(&invitee, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			assert.Equal(t, 990, invitee.Quota)
+			assert.Equal(t, 107, inviter.AffQuota)
+			assert.Equal(t, 111, inviter.AffHistoryQuota)
+			var facts int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
+			assert.EqualValues(t, 1, facts)
+		})
+	}
+}
+
+func TestWalletWaffoRejectsChargesRoundedToZero(t *testing.T) {
+	router, _ := walletCheckoutFixture(t)
+	oldCurrency, oldPrice, oldMinimum := setting.WaffoCurrency, setting.WaffoUnitPrice, setting.WaffoMinTopUp
+	t.Cleanup(func() {
+		setting.WaffoCurrency, setting.WaffoUnitPrice, setting.WaffoMinTopUp = oldCurrency, oldPrice, oldMinimum
+	})
+	setting.WaffoCurrency, setting.WaffoUnitPrice, setting.WaffoMinTopUp = "JPY", 0.1, 1
+	var requests atomic.Int32
+	service.WaffoHTTPTransport = walletWaffoSDKTransport(func(context.Context, *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+		requests.Add(1)
+		return nil, errors.New("unexpected zero-currency checkout")
+	})
+	router.POST("/quote", func(c *gin.Context) { c.Set("id", 902) }, RequestWaffoAmount)
+	router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestWaffoPay)
+	for _, path := range []string{"/quote", "/checkout"} {
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"amount":1}`))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		assert.Contains(t, response.Body.String(), "Payment amount is too low", path)
+	}
+	assert.Zero(t, requests.Load())
+	var orders int64
+	require.NoError(t, model.DB.Model(&model.TopUp{}).Count(&orders).Error)
+	assert.Zero(t, orders)
 }

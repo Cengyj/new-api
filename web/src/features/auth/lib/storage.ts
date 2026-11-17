@@ -33,17 +33,25 @@ const STORAGE_KEYS = {
 // Affiliate Code Storage
 // ============================================================================
 
+// Invitation codes are public inputs, not credentials. Keep the current page's
+// input when storage is blocked/full so registration cannot use a stale code.
+let currentAffiliateCode = ''
+let affiliateWriteFailed = false
+
 /**
  * Get affiliate code from localStorage
  */
 export function getAffiliateCode(): string {
   if (typeof window === 'undefined') return ''
+  if (affiliateWriteFailed) return currentAffiliateCode
   try {
-    return window.localStorage.getItem(STORAGE_KEYS.AFFILIATE) ?? ''
+    currentAffiliateCode =
+      window.localStorage.getItem(STORAGE_KEYS.AFFILIATE) ?? ''
+    return currentAffiliateCode
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error('Failed to get affiliate code:', error)
-    return ''
+    return currentAffiliateCode
   }
 }
 
@@ -52,9 +60,12 @@ export function getAffiliateCode(): string {
  */
 export function saveAffiliateCode(code: string): void {
   if (typeof window === 'undefined') return
+  currentAffiliateCode = code
   try {
     window.localStorage.setItem(STORAGE_KEYS.AFFILIATE, code)
+    affiliateWriteFailed = false
   } catch (error) {
+    affiliateWriteFailed = true
     // eslint-disable-next-line no-console
     console.error('Failed to save affiliate code:', error)
   }

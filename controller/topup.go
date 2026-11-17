@@ -21,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 
 	"github.com/Calcium-Ion/go-epay/epay"
 	"github.com/gin-gonic/gin"
@@ -147,18 +148,25 @@ type AmountRequest struct {
 	Amount int64 `json:"amount"`
 }
 
-func GetEpayClient() *epay.Client {
-	common.OptionMapRWMutex.RLock()
-	address := operation_setting.PayAddress
+// Caller holds OptionMapRWMutex while capturing the complete payment configuration.
+func epayConfigLocked() *epay.Config {
 	paymentSetting := operation_setting.GetPaymentSetting()
-	config := &epay.Config{
-		PartnerID:          operation_setting.EpayId,
-		Key:                operation_setting.EpayKey,
+	return &epay.Config{
+		PartnerID: operation_setting.EpayId, Key: operation_setting.EpayKey,
 		SignType:           paymentSetting.EpaySignType,
 		MerchantPrivateKey: paymentSetting.EpayMerchantPrivateKey,
 		PlatformPublicKey:  paymentSetting.EpayPlatformPublicKey,
 	}
+}
+
+func GetEpayClient() *epay.Client {
+	common.OptionMapRWMutex.RLock()
+	address, config := operation_setting.PayAddress, epayConfigLocked()
 	common.OptionMapRWMutex.RUnlock()
+	return newEpayClient(config, address)
+}
+
+func newEpayClient(config *epay.Config, address string) *epay.Client {
 	if strings.TrimSpace(address) == "" || strings.TrimSpace(config.PartnerID) == "" {
 		return nil
 	}
@@ -171,13 +179,63 @@ func GetEpayClient() *epay.Client {
 	default:
 		return nil
 	}
-	// The SDK validates the selected signing mode and its required keys from
-	// the same configuration snapshot used to sign or verify the request.
-	withUrl, err := epay.NewClient(config, address)
+	client, err := epay.NewClient(config, address)
 	if err != nil {
 		return nil
 	}
-	return withUrl
+	return client
+}
+
+// walletTopUpPricing freezes conversion and pricing together, before any user
+// lookup or capacity check can overlap publication of another configuration.
+type walletTopUpPricing struct {
+	displayType  string
+	quotaPerUnit float64
+	minTopUp     int64
+	unitPrice    float64
+	discounts    map[int]float64
+	groupRatios  map[string]float64
+}
+
+func walletTopUpPricingLocked(price float64, minimum int) walletTopUpPricing {
+	return walletTopUpPricing{
+		displayType: operation_setting.GetQuotaDisplayType(), quotaPerUnit: common.QuotaPerUnit,
+		minTopUp: int64(minimum), unitPrice: price,
+		discounts:   maps.Clone(operation_setting.GetPaymentSetting().AmountDiscount),
+		groupRatios: common.GetTopupGroupRatios(),
+	}
+}
+
+func (pricing walletTopUpPricing) groupRatio(group string) float64 {
+	ratio := pricing.groupRatios[group]
+	if ratio == 0 {
+		return 1
+	}
+	return ratio
+}
+
+func (pricing walletTopUpPricing) payMoney(amount int64, group string) float64 {
+	quantity := decimal.NewFromInt(amount)
+	if pricing.displayType == operation_setting.QuotaDisplayTypeTokens {
+		quantity = quantity.Div(decimal.NewFromFloat(pricing.quotaPerUnit))
+	}
+	discount := pricing.discounts[int(amount)]
+	if discount <= 0 {
+		discount = 1
+	}
+	return quantity.Mul(decimal.NewFromFloat(pricing.unitPrice)).
+		Mul(decimal.NewFromFloat(pricing.groupRatio(group))).Mul(decimal.NewFromFloat(discount)).InexactFloat64()
+}
+
+func (pricing walletTopUpPricing) epayMinimum() int64 {
+	if pricing.displayType != operation_setting.QuotaDisplayTypeTokens {
+		return pricing.minTopUp
+	}
+	quota, err := common.WalletQuotaFromDecimalStrict(decimal.NewFromInt(pricing.minTopUp).Mul(decimal.NewFromFloat(pricing.quotaPerUnit)))
+	if err != nil {
+		return common.MaxWalletQuota
+	}
+	return int64(quota)
 }
 
 // walletTopUpUnits freezes the amount unit and conversion rate before validation.
@@ -189,51 +247,19 @@ func walletTopUpUnits() (string, float64) {
 }
 
 func getPayMoney(amount int64, group, displayType string, quotaPerUnit float64) float64 {
-	dAmount := decimal.NewFromInt(amount)
-	// 充值金额以“展示类型”为准：
-	// - USD/CNY: 前端传 amount 为金额单位；TOKENS: 前端传 tokens，需要换成 USD 金额
-	if displayType == operation_setting.QuotaDisplayTypeTokens {
-		dQuotaPerUnit := decimal.NewFromFloat(quotaPerUnit)
-		dAmount = dAmount.Div(dQuotaPerUnit)
-	}
-
 	common.OptionMapRWMutex.RLock()
-	topupGroupRatio := common.GetTopupGroupRatio(group)
-	price := operation_setting.Price
-	configuredDiscount := operation_setting.GetPaymentSetting().AmountDiscount[int(amount)]
+	pricing := walletTopUpPricingLocked(operation_setting.Price, operation_setting.MinTopUp)
 	common.OptionMapRWMutex.RUnlock()
-	if topupGroupRatio == 0 {
-		topupGroupRatio = 1
-	}
-
-	dTopupGroupRatio := decimal.NewFromFloat(topupGroupRatio)
-	dPrice := decimal.NewFromFloat(price)
-	// apply optional preset discount by the original request amount (if configured), default 1.0
-	discount := 1.0
-	if configuredDiscount > 0 {
-		discount = configuredDiscount
-	}
-	dDiscount := decimal.NewFromFloat(discount)
-
-	payMoney := dAmount.Mul(dPrice).Mul(dTopupGroupRatio).Mul(dDiscount)
-
-	return payMoney.InexactFloat64()
+	pricing.displayType, pricing.quotaPerUnit = displayType, quotaPerUnit
+	return pricing.payMoney(amount, group)
 }
 
 func getMinTopup(displayType string, quotaPerUnit float64) int64 {
 	common.OptionMapRWMutex.RLock()
-	minTopup := operation_setting.MinTopUp
+	pricing := walletTopUpPricingLocked(operation_setting.Price, operation_setting.MinTopUp)
 	common.OptionMapRWMutex.RUnlock()
-	if displayType == operation_setting.QuotaDisplayTypeTokens {
-		dMinTopup := decimal.NewFromInt(int64(minTopup))
-		dQuotaPerUnit := decimal.NewFromFloat(quotaPerUnit)
-		quota, err := common.WalletQuotaFromDecimalStrict(dMinTopup.Mul(dQuotaPerUnit))
-		if err != nil {
-			return common.MaxWalletQuota
-		}
-		minTopup = quota
-	}
-	return int64(minTopup)
+	pricing.displayType, pricing.quotaPerUnit = displayType, quotaPerUnit
+	return pricing.epayMinimum()
 }
 
 func getTopUpQuota(amount int64, displayType string, quotaPerUnit float64) (int, error) {
@@ -367,8 +393,14 @@ func RequestEpay(c *gin.Context) {
 		paymentError(c, common.NewMessage("Invalid parameters"))
 		return
 	}
-	displayType, quotaPerUnit := walletTopUpUnits()
-	minTopup := getMinTopup(displayType, quotaPerUnit)
+	common.OptionMapRWMutex.RLock()
+	pricing := walletTopUpPricingLocked(operation_setting.Price, operation_setting.MinTopUp)
+	allowedPayMethod := operation_setting.ContainsPayMethod(req.PaymentMethod)
+	address, config := operation_setting.PayAddress, epayConfigLocked()
+	callbackAddress, serverAddress := operation_setting.CustomCallbackAddress, system_setting.ServerAddress
+	common.OptionMapRWMutex.RUnlock()
+	displayType, quotaPerUnit := pricing.displayType, pricing.quotaPerUnit
+	minTopup := pricing.epayMinimum()
 	if req.Amount < minTopup {
 		paymentError(c, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": minTopup}))
 		return
@@ -384,26 +416,25 @@ func RequestEpay(c *gin.Context) {
 		paymentError(c, common.NewMessage("Failed to get the user group"))
 		return
 	}
-	payMoney := getPayMoney(req.Amount, group, displayType, quotaPerUnit)
+	payMoney := pricing.payMoney(req.Amount, group)
 	if err := validateTopUpPaymentAmount(payMoney); err != nil {
 		paymentError(c, err)
 		return
 	}
 
-	common.OptionMapRWMutex.RLock()
-	allowedPayMethod := operation_setting.ContainsPayMethod(req.PaymentMethod)
-	common.OptionMapRWMutex.RUnlock()
 	if !allowedPayMethod {
 		paymentError(c, common.NewMessage("Payment method does not exist"))
 		return
 	}
 
-	callBackAddress := service.GetCallbackAddress()
-	returnUrl, _ := url.Parse(paymentReturnPath("/usage-logs"))
-	notifyUrl, _ := url.Parse(callBackAddress + "/api/user/epay/notify")
+	if callbackAddress == "" {
+		callbackAddress = serverAddress
+	}
+	returnUrl, _ := url.Parse(strings.TrimRight(serverAddress, "/") + "/usage-logs")
+	notifyUrl, _ := url.Parse(strings.TrimRight(callbackAddress, "/") + "/api/user/epay/notify")
 	tradeNo := fmt.Sprintf("%s%d", common.GetRandomString(6), time.Now().Unix())
 	tradeNo = fmt.Sprintf("USR%dNO%s", id, tradeNo)
-	client := GetEpayClient()
+	client := newEpayClient(config, address)
 	if client == nil {
 		paymentError(c, common.NewMessage("Payment information has not been configured by administrator"))
 		return
@@ -622,8 +653,11 @@ func RequestAmount(c *gin.Context) {
 		return
 	}
 
-	displayType, quotaPerUnit := walletTopUpUnits()
-	minTopup := getMinTopup(displayType, quotaPerUnit)
+	common.OptionMapRWMutex.RLock()
+	pricing := walletTopUpPricingLocked(operation_setting.Price, operation_setting.MinTopUp)
+	common.OptionMapRWMutex.RUnlock()
+	displayType, quotaPerUnit := pricing.displayType, pricing.quotaPerUnit
+	minTopup := pricing.epayMinimum()
 	if req.Amount < minTopup {
 		paymentError(c, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": minTopup}))
 		return
@@ -637,7 +671,7 @@ func RequestAmount(c *gin.Context) {
 		paymentError(c, common.NewMessage("Failed to get the user group"))
 		return
 	}
-	payMoney := getPayMoney(req.Amount, group, displayType, quotaPerUnit)
+	payMoney := pricing.payMoney(req.Amount, group)
 	if err := validateTopUpPaymentAmount(payMoney); err != nil {
 		paymentError(c, err)
 		return

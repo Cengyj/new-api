@@ -37,6 +37,7 @@ import { beforeEach, expect, test, vi } from 'vitest'
 
 import * as systemConfigHooks from '@/hooks/use-system-config'
 import { api, applyAuthBundle, clearAuthentication } from '@/lib/api'
+import { initializeFrontendCache } from '@/lib/frontend-cache'
 import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
 import { usePaymentRecoveryStore } from '@/stores/payment-recovery-store'
 import {
@@ -51,6 +52,7 @@ import { PaymentConfirmDialog } from '../components/dialogs/payment-confirm-dial
 import { PaymentRecoveryNotice } from '../components/payment-recovery-notice'
 import { RechargeFormCard } from '../components/recharge-form-card'
 import * as walletStats from '../components/wallet-stats-card'
+import { useAffiliate } from '../hooks/use-affiliate'
 import { useBillingHistory } from '../hooks/use-billing-history'
 import { useCreemPayment } from '../hooks/use-creem-payment'
 import { requestPaymentAmount, usePayment } from '../hooks/use-payment'
@@ -2048,3 +2050,170 @@ test('only a successful current-user terminal order read retires a saved checkou
     screen.queryByText('Payment requests to check')
   ).not.toBeInTheDocument()
 })
+
+test('resolving a valid checkout keeps the warning for another corrupted recovery record', async () => {
+  usePaymentRecoveryStore.getState().remember(1, 'completed_checkout')
+  const corruptedKey = 'new-api:payment-recovery:v1:1:unresolved_checkout'
+  localStorage.setItem(corruptedKey, 'corrupted order reference!')
+  render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+  const warning =
+    'Order references could not be saved in this browser. Copy the order number before leaving this page.'
+  expect(screen.getByText('completed_checkout')).toBeVisible()
+  expect(screen.getByText(warning)).toBeVisible()
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        items: [
+          {
+            id: 1,
+            user_id: 1,
+            trade_no: 'completed_checkout',
+            status: 'success',
+            money: 10,
+            amount: 10,
+            create_time: 1794297600,
+            payment_method: 'creem',
+          },
+        ],
+        total: 1,
+      },
+    },
+  })
+  const history = renderHook(() => useBillingHistory())
+  await waitFor(() => expect(history.result.current.records).toHaveLength(1))
+
+  expect(screen.queryByText('completed_checkout')).not.toBeInTheDocument()
+  expect(screen.getByText(warning)).toBeVisible()
+  expect(localStorage.getItem(corruptedKey)).toBe('corrupted order reference!')
+})
+
+test('completed checkout cleanup keeps a warning if remaining storage cannot be read', () => {
+  usePaymentRecoveryStore.getState().remember(1, 'completed_checkout')
+  localStorage.setItem(
+    'new-api:payment-recovery:v1:1:other_checkout',
+    'other_checkout'
+  )
+  render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+  const read = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+    throw new DOMException('Storage blocked', 'SecurityError')
+  })
+
+  act(() => {
+    usePaymentRecoveryStore.getState().resolve(1, ['completed_checkout'])
+  })
+
+  expect(screen.queryByText('completed_checkout')).not.toBeInTheDocument()
+  expect(screen.getByText('other_checkout')).toBeVisible()
+  expect(
+    screen.getByText(
+      'Order references could not be saved in this browser. Copy the order number before leaving this page.'
+    )
+  ).toBeVisible()
+  read.mockRestore()
+  expect(
+    localStorage.getItem('new-api:payment-recovery:v1:1:completed_checkout')
+  ).toBeNull()
+  expect(
+    localStorage.getItem('new-api:payment-recovery:v1:1:other_checkout')
+  ).toBe('other_checkout')
+})
+
+test('completed checkout cleanup does not expose another account recovery records or warnings', () => {
+  usePaymentRecoveryStore.getState().remember(1, 'completed_checkout')
+  const otherUserKey = 'new-api:payment-recovery:v1:2:other_user_checkout'
+  localStorage.setItem(otherUserKey, 'corrupted order reference!')
+  render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+
+  act(() => {
+    usePaymentRecoveryStore.getState().resolve(1, ['completed_checkout'])
+  })
+
+  expect(
+    screen.queryByText('Payment requests to check')
+  ).not.toBeInTheDocument()
+  expect(localStorage.getItem(otherUserKey)).toBe('corrupted order reference!')
+})
+
+test.each([null, 'previous-ui-version'])(
+  'frontend cache initialization preserves unresolved payment identities with cache version %s',
+  async (version) => {
+    sessionStorage.clear()
+    const versionKey = 'newapi:default:cache-version'
+    if (version === null) {
+      const write = vi
+        .spyOn(Storage.prototype, 'setItem')
+        .mockImplementation(() => {
+          throw new DOMException('Storage full', 'QuotaExceededError')
+        })
+      initializeFrontendCache()
+      write.mockRestore()
+      expect(localStorage.getItem(versionKey)).toBeNull()
+    } else {
+      localStorage.setItem(versionKey, version)
+    }
+    usePaymentRecoveryStore.getState().remember(1, 'unresolved_checkout')
+    const operation = { request_id: 'unresolved-transfer-0001', quota: 500000 }
+    const transferKey = `new-api:affiliate-transfer:1:${operation.request_id}`
+    localStorage.setItem(transferKey, JSON.stringify(operation))
+    const corruptKey = 'new-api:payment-recovery:v1:1:damaged_checkout'
+    localStorage.setItem(corruptKey, 'damaged reference!')
+    const otherAccountKey = 'new-api:affiliate-transfer:2:damaged-transfer-0001'
+    localStorage.setItem(otherAccountKey, '{')
+    localStorage.setItem('stale-ui-cache', 'discardable')
+
+    // A reload discards page memory, then main.tsx initializes caches before
+    // mounting the components that recover unresolved money operations.
+    usePaymentRecoveryStore.setState({ orders: {}, storageErrors: {} })
+    initializeFrontendCache()
+    initializeFrontendCache()
+    const request = vi
+      .spyOn(api, 'request')
+      .mockImplementation(async (config) => ({
+        data: {
+          success: true,
+          data:
+            config.url === '/api/user/aff'
+              ? 'invite-code'
+              : {
+                  rule: { enabled: false, rate_bps: 500, valid_days: 7 },
+                  compliance_confirmed: true,
+                  aff_quota: '1000000',
+                  aff_history_quota: '1000000',
+                  rebate_quota: '1000000',
+                  direct_count: 1,
+                },
+        },
+      }))
+    const transfer = renderHook(() => useAffiliate(), {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={new QueryClient()}>
+          {children}
+        </QueryClientProvider>
+      ),
+    })
+    render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+
+    expect.soft(screen.queryByText('unresolved_checkout')).toBeVisible()
+    expect
+      .soft(
+        screen.queryByText(
+          'Order references could not be saved in this browser. Copy the order number before leaving this page.'
+        )
+      )
+      .toBeVisible()
+    expect.soft(transfer.result.current.pending).toEqual(operation)
+    await act(async () => {
+      expect
+        .soft(await transfer.result.current.transferQuota(500000))
+        .toBe(false)
+    })
+    expect
+      .soft(request.mock.calls.some(([config]) => config.method === 'post'))
+      .toBe(false)
+    expect(localStorage.getItem(transferKey)).toBe(JSON.stringify(operation))
+    expect(localStorage.getItem(corruptKey)).toBe('damaged reference!')
+    expect(localStorage.getItem(otherAccountKey)).toBe('{')
+    expect(localStorage.getItem('stale-ui-cache')).toBeNull()
+  }
+)

@@ -28,6 +28,12 @@ const PRESERVED_LOCAL_STORAGE_KEYS = new Set([
   'aff',
   'oauth:binding:result',
 ])
+// Unresolved payment identities must survive UI cache resets, including
+// unreadable records that recovery screens need to flag for the user.
+const PRESERVED_LOCAL_STORAGE_PREFIXES = [
+  'new-api:payment-recovery:v1:',
+  'new-api:affiliate-transfer:',
+]
 
 export function initializeFrontendCache(): void {
   if (typeof window === 'undefined') return
@@ -52,7 +58,11 @@ function clearLocalUiCache(): void {
   const keysToRemove: string[] = []
   for (let index = 0; index < window.localStorage.length; index += 1) {
     const key = window.localStorage.key(index)
-    if (key && !PRESERVED_LOCAL_STORAGE_KEYS.has(key)) {
+    if (
+      key &&
+      !PRESERVED_LOCAL_STORAGE_KEYS.has(key) &&
+      !PRESERVED_LOCAL_STORAGE_PREFIXES.some((prefix) => key.startsWith(prefix))
+    ) {
       keysToRemove.push(key)
     }
   }

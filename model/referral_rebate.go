@@ -55,14 +55,17 @@ func paymentComplianceConfirmed() bool {
 
 // Generic option writes must use the database's key equality, too: MySQL
 // collations can resolve case, accent, width or trailing-space aliases to the
-// protected rule. Check before any bulk dispatch or write so all values remain
+// protected rule. Preserve the key column's collation even when its rule row
+// is missing. Check before any bulk dispatch or write so all values remain
 // unchanged when the dedicated, validated rule endpoint would be bypassed.
 func rejectGenericReferralRuleUpdates(keys []string) error {
 	if slices.Contains(keys, ReferralRebateOptionKey) {
 		return ErrInvalidReferralRule
 	}
 	var matches int64
-	if err := DB.Model(&Option{}).Where(&Option{Key: ReferralRebateOptionKey}).
+	keysWithColumnCollation := DB.Raw("? UNION ALL SELECT ?",
+		DB.Model(&Option{}).Select("?", clause.Column{Name: "key"}).Where("1 = 0"), ReferralRebateOptionKey)
+	if err := DB.Table("(?) AS referral_rule_option_key", keysWithColumnCollation).
 		Where(map[string]any{"key": keys}).Count(&matches).Error; err != nil {
 		return err
 	}

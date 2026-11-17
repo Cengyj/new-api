@@ -15,6 +15,7 @@ import (
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
@@ -45,8 +46,10 @@ type StripeAdaptor struct {
 }
 
 func (*StripeAdaptor) RequestAmount(c *gin.Context, req *StripePayRequest) {
-	_, quotaPerUnit := walletTopUpUnits()
-	minTopup := getStripeMinTopup()
+	common.OptionMapRWMutex.RLock()
+	pricing := walletTopUpPricingLocked(setting.StripeUnitPrice, setting.StripeMinTopUp)
+	common.OptionMapRWMutex.RUnlock()
+	quotaPerUnit, minTopup := pricing.quotaPerUnit, pricing.minTopUp
 	if req.Amount < minTopup {
 		paymentError(c, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": minTopup}))
 		return
@@ -61,7 +64,7 @@ func (*StripeAdaptor) RequestAmount(c *gin.Context, req *StripePayRequest) {
 		paymentError(c, common.NewMessage("Failed to get the user group"))
 		return
 	}
-	chargedMoney := GetChargedAmount(float64(req.Amount), model.User{Group: group})
+	chargedMoney := float64(req.Amount) * pricing.groupRatio(group)
 	creditedQuota, err := getStripeCreditedQuota(chargedMoney, quotaPerUnit)
 	if err == nil {
 		err = model.ValidateTopUpQuotaCapacity(id, creditedQuota)
@@ -70,7 +73,7 @@ func (*StripeAdaptor) RequestAmount(c *gin.Context, req *StripePayRequest) {
 		paymentError(c, err)
 		return
 	}
-	payMoney := getStripePayMoney(float64(req.Amount))
+	payMoney := float64(req.Amount) * pricing.unitPrice
 	if err := validateTopUpPaymentAmount(payMoney); err != nil {
 		paymentError(c, err)
 		return
@@ -79,19 +82,21 @@ func (*StripeAdaptor) RequestAmount(c *gin.Context, req *StripePayRequest) {
 }
 
 func (*StripeAdaptor) RequestPay(c *gin.Context, req *StripePayRequest) {
-	_, quotaPerUnit := walletTopUpUnits()
+	common.OptionMapRWMutex.RLock()
+	pricing := walletTopUpPricingLocked(setting.StripeUnitPrice, setting.StripeMinTopUp)
+	checkoutConfig := stripeCheckoutConfigLocked()
+	webhookConfigured := isStripeWebhookConfigured()
+	common.OptionMapRWMutex.RUnlock()
+	quotaPerUnit := pricing.quotaPerUnit
 	if req.PaymentMethod != model.PaymentMethodStripe {
 		paymentError(c, common.NewMessage("Unsupported payment channel"))
 		return
 	}
-	common.OptionMapRWMutex.RLock()
-	webhookConfigured := isStripeWebhookConfigured()
-	common.OptionMapRWMutex.RUnlock()
 	if !webhookConfigured {
 		paymentError(c, common.NewMessage("Stripe webhook is not configured"))
 		return
 	}
-	minTopup := getStripeMinTopup()
+	minTopup := pricing.minTopUp
 	if req.Amount < minTopup {
 		common.ApiErrorStatus(c, http.StatusOK, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": minTopup}), gin.H{"data": 10})
 		return
@@ -117,7 +122,7 @@ func (*StripeAdaptor) RequestPay(c *gin.Context, req *StripePayRequest) {
 		paymentError(c, common.NewMessage("User does not exist"))
 		return
 	}
-	chargedMoney := GetChargedAmount(float64(req.Amount), *user)
+	chargedMoney := float64(req.Amount) * pricing.groupRatio(user.Group)
 	creditedQuota, err := getStripeCreditedQuota(chargedMoney, quotaPerUnit)
 	if err == nil {
 		err = model.ValidateTopUpQuotaCapacity(id, creditedQuota)
@@ -129,9 +134,7 @@ func (*StripeAdaptor) RequestPay(c *gin.Context, req *StripePayRequest) {
 
 	reference := fmt.Sprintf("new-api-ref-%d-%d-%s", user.Id, time.Now().UnixMilli(), randstr.String(4))
 	referenceId := "ref_" + common.Sha1([]byte(reference))
-	common.OptionMapRWMutex.RLock()
-	apiSecret := setting.StripeApiSecret
-	common.OptionMapRWMutex.RUnlock()
+	apiSecret := checkoutConfig.apiSecret
 	if !strings.HasPrefix(apiSecret, "sk_") && !strings.HasPrefix(apiSecret, "rk_") {
 		logger.LogError(c.Request.Context(), common.LogText("Stripe failed to create Checkout Session user_id=%d trade_no=%s amount=%d error=%q", id, referenceId, req.Amount, "invalid Stripe API key"))
 		paymentError(c, common.NewMessage("Failed to start payment"))
@@ -155,7 +158,7 @@ func (*StripeAdaptor) RequestPay(c *gin.Context, req *StripePayRequest) {
 		paymentError(c, common.NewMessage("Failed to create order"))
 		return
 	}
-	payLink, err := genStripeLink(referenceId, user.StripeCustomer, user.Email, req.Amount, req.SuccessURL, req.CancelURL)
+	payLink, err := checkoutConfig.link(referenceId, user.StripeCustomer, user.Email, req.Amount, req.SuccessURL, req.CancelURL)
 	if err != nil {
 		knownRejection := false
 		var stripeErr *stripe.Error
@@ -494,6 +497,16 @@ func stripeCheckoutErrorSummary(err error) string {
 	return fmt.Sprintf("error_type=%T", err)
 }
 
+type stripeCheckoutConfig struct {
+	priceID, apiSecret, serverAddress string
+	allowPromotionCodes               bool
+}
+
+func stripeCheckoutConfigLocked() stripeCheckoutConfig {
+	return stripeCheckoutConfig{priceID: setting.StripePriceId, apiSecret: setting.StripeApiSecret,
+		serverAddress: system_setting.ServerAddress, allowPromotionCodes: setting.StripePromotionCodesEnabled}
+}
+
 // genStripeLink generates a Stripe Checkout session URL for payment.
 // It creates a new checkout session with the specified parameters and returns the payment URL.
 //
@@ -508,15 +521,19 @@ func stripeCheckoutErrorSummary(err error) string {
 // Returns the checkout session URL or an error if the session creation fails.
 func genStripeLink(referenceId string, customerId string, email string, amount int64, successURL string, cancelURL string) (string, error) {
 	common.OptionMapRWMutex.RLock()
-	priceID, apiSecret := setting.StripePriceId, setting.StripeApiSecret
-	allowPromotionCodes := setting.StripePromotionCodesEnabled
+	config := stripeCheckoutConfigLocked()
 	common.OptionMapRWMutex.RUnlock()
+	return config.link(referenceId, customerId, email, amount, successURL, cancelURL)
+}
+
+func (config stripeCheckoutConfig) link(referenceId, customerId, email string, amount int64, successURL, cancelURL string) (string, error) {
+	priceID, apiSecret, allowPromotionCodes := config.priceID, config.apiSecret, config.allowPromotionCodes
 	// Use custom URLs if provided, otherwise use defaults
 	if successURL == "" {
-		successURL = paymentReturnPath("/usage-logs")
+		successURL = strings.TrimRight(config.serverAddress, "/") + "/usage-logs"
 	}
 	if cancelURL == "" {
-		cancelURL = paymentReturnPath("/wallet")
+		cancelURL = strings.TrimRight(config.serverAddress, "/") + "/wallet"
 	}
 
 	params := &stripe.CheckoutSessionParams{
