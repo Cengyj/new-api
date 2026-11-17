@@ -7142,6 +7142,7 @@
     "Unable to parse structured pricing": "无法解析为结构化价格",
     "Unable to prepare chat link. Please ensure you have an enabled API key.": "无法准备聊天链接。请确保您有一个已启用的 API 密钥。",
     "Unable to read clipboard": "无法读取剪贴板",
+    "Unable to read your invitation information. Allow browser storage and try again.": "无法读取邀请信息。请允许浏览器存储后重试。",
     "Unauthorized": "未授权",
     "Unauthorized Access": "未经授权的访问",
     "Unauthorized, insufficient privileges": "无权进行此操作，权限不足",

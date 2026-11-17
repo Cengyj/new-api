@@ -165,7 +165,7 @@ func TestReferralWalletRecoversLostPostgresCommitReply(t *testing.T) {
 	t.Cleanup(func() { assert.NoError(t, connection.Close()) })
 	DB = proxied
 	for _, operation := range []string{"topup", "transfer"} {
-		t.Run(operation, func(t *testing.T) {
+		if !t.Run(operation, func(t *testing.T) {
 			armed.Store(true)
 			if operation == "topup" {
 				duplicate, err := RechargeEpay(order.TradeNo, "alipay", "127.0.0.1")
@@ -182,7 +182,9 @@ func TestReferralWalletRecoversLostPostgresCommitReply(t *testing.T) {
 			default:
 				t.Fatal("the COMMIT response was not lost on the network")
 			}
-		})
+		}) {
+			return // A failed case may leave the shared proxy notification unread.
+		}
 	}
 	var firstOrder TopUp
 	require.NoError(t, db.First(&firstOrder, order.Id).Error)

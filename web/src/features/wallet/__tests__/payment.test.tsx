@@ -1105,7 +1105,10 @@ test('Waffo keeps supported provider deep links while rejecting active content U
   vi.spyOn(api, 'post').mockResolvedValue({
     data: {
       message: 'success',
-      data: { payment_url: 'alipays://platformapi/startapp?appId=20000067' },
+      data: {
+        payment_url: 'alipays://platformapi/startapp?appId=20000067',
+        order_id: 'usable_waffo_checkout',
+      },
     },
   })
   const open = vi.spyOn(window, 'open').mockReturnValue({} as Window)
@@ -1118,6 +1121,7 @@ test('Waffo keeps supported provider deep links while rejecting active content U
     '_blank',
     'noopener,noreferrer'
   )
+  expect(usePaymentRecoveryStore.getState().orders[1] ?? []).toEqual([])
   for (const url of [
     'javascript:alert(1)',
     'data:text/html,<h1>test</h1>',
@@ -1830,6 +1834,66 @@ test.each(['alipay', 'stripe', 'creem', 'waffo', 'waffo_pancake'])(
   }
 )
 
+test.each(['alipay', 'creem', 'waffo', 'waffo_pancake'])(
+  '%s retains its received original order when the checkout URL cannot be opened',
+  async (provider) => {
+    const original = `unusable_${provider}_checkout`
+    const invalidURL = 'javascript:alert(1)'
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        message: 'success',
+        url: invalidURL,
+        data:
+          provider === 'alipay'
+            ? { out_trade_no: original }
+            : {
+                order_id: original,
+                checkout_url: invalidURL,
+                payment_url: invalidURL,
+              },
+      },
+    })
+    const open = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+    const submit = vi
+      .spyOn(HTMLFormElement.prototype, 'submit')
+      .mockImplementation(() => {})
+    const onUnknown = vi.fn()
+    const { result } = renderHook(() => ({
+      regular: usePayment(onUnknown),
+      creem: useCreemPayment(onUnknown),
+      waffo: useWaffoPayment(onUnknown),
+      pancake: useWaffoPancakePayment(onUnknown),
+    }))
+    const viewOrder = vi.fn()
+    const notice = render(<PaymentRecoveryNotice onViewOrder={viewOrder} />)
+    await act(async () => {
+      let succeeded: boolean
+      if (provider === 'creem') {
+        succeeded = await result.current.creem.processCreemPayment('prod_test')
+      } else if (provider === 'waffo') {
+        succeeded = await result.current.waffo.processWaffoPayment(10, 0)
+      } else if (provider === 'waffo_pancake') {
+        succeeded = await result.current.pancake.processWaffoPancakePayment(10)
+      } else {
+        succeeded = await result.current.regular.processPayment(10, provider)
+      }
+      expect(succeeded).toBe(false)
+    })
+
+    expect(screen.getByText(original)).toBeVisible()
+    expect(onUnknown).toHaveBeenCalledOnce()
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(open).not.toHaveBeenCalled()
+    expect(submit).not.toHaveBeenCalled()
+    notice.unmount()
+    usePaymentRecoveryStore.setState({ orders: {}, storageErrors: {} })
+    render(<PaymentRecoveryNotice onViewOrder={viewOrder} />)
+    expect(screen.getByText(original)).toBeVisible()
+    await userEvent.click(screen.getByRole('button', { name: 'View order' }))
+    expect(viewOrder).toHaveBeenCalledWith(original)
+  }
+)
+
 test('a saved checkout reference survives logout and a new session only for its original account', async () => {
   vi.spyOn(api, 'post').mockResolvedValue({
     data: {
@@ -1872,39 +1936,55 @@ test('a saved checkout reference survives logout and a new session only for its 
   page.unmount()
 })
 
-test('a late unknown checkout cannot add an order reference after the payer changes', async () => {
-  let finish!: (value: { data: unknown }) => void
-  vi.spyOn(api, 'post').mockReturnValue(
-    new Promise((resolve) => {
-      finish = resolve
+test.each(['unknown', 'unusable redirect'])(
+  'a late %s checkout cannot add an order reference after the payer changes',
+  async (outcome) => {
+    let finish!: (value: { data: unknown }) => void
+    vi.spyOn(api, 'post').mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve
+      })
+    )
+    const { result } = renderHook(() => useCreemPayment())
+    render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+    let operation!: Promise<boolean>
+    act(() => {
+      operation = result.current.processCreemPayment('prod_reference')
     })
-  )
-  const { result } = renderHook(() => useCreemPayment())
-  render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
-  let operation!: Promise<boolean>
-  act(() => {
-    operation = result.current.processCreemPayment('prod_reference')
-  })
-  act(() =>
-    useAuthStore.getState().auth.setUser({ id: 2, username: 'other', role: 1 })
-  )
-  await act(async () => {
-    finish({
-      data: {
-        message: 'error',
-        trade_no: 'late_previous_checkout',
-        message_key:
-          'Payment request result is unknown. Check Order History before trying again.',
-      },
+    act(() =>
+      useAuthStore
+        .getState()
+        .auth.setUser({ id: 2, username: 'other', role: 1 })
+    )
+    await act(async () => {
+      finish({
+        data:
+          outcome === 'unknown'
+            ? {
+                message: 'error',
+                trade_no: 'late_previous_checkout',
+                message_key:
+                  'Payment request result is unknown. Check Order History before trying again.',
+              }
+            : {
+                message: 'success',
+                data: {
+                  order_id: 'late_previous_checkout',
+                  checkout_url: 'not-an-absolute-payment-url',
+                },
+              },
+      })
+      expect(await operation).toBe(false)
     })
-    expect(await operation).toBe(false)
-  })
-  expect(screen.queryByText('late_previous_checkout')).not.toBeInTheDocument()
-  act(() =>
-    useAuthStore.getState().auth.setUser({ id: 1, username: 'payer', role: 1 })
-  )
-  expect(screen.queryByText('late_previous_checkout')).not.toBeInTheDocument()
-})
+    expect(screen.queryByText('late_previous_checkout')).not.toBeInTheDocument()
+    act(() =>
+      useAuthStore
+        .getState()
+        .auth.setUser({ id: 1, username: 'payer', role: 1 })
+    )
+    expect(screen.queryByText('late_previous_checkout')).not.toBeInTheDocument()
+  }
+)
 
 test('failed browser storage keeps the known order copyable and warns before leaving', async () => {
   vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {

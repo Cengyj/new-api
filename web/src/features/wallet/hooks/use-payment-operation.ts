@@ -68,7 +68,8 @@ export function usePaymentOperation(onUnknownCheckout?: () => void) {
         if (!mounted.current || changed) return false
         // Keep delivery synchronous with the identity check: an await between
         // checking the payer and opening checkout allows another account to win.
-        const unknownOrder = getServerErrorSources(response).find(
+        const sources = getServerErrorSources(response)
+        const unknownOrder = sources.find(
           (source) =>
             source.message_key ===
               'Payment request result is unknown. Check Order History before trying again.' &&
@@ -81,7 +82,29 @@ export function usePaymentOperation(onUnknownCheckout?: () => void) {
             .remember(auth.user.id, unknownOrder.trade_no as string)
           onUnknownCheckout?.()
         }
-        return handleResponse(response)
+        const completed = handleResponse(response)
+        if (completed || unknownOrder || !auth.user?.id) return completed
+
+        // A created checkout whose redirect cannot be used still has a
+        // pending order. Preserve the local ID returned by the existing
+        // channel response, without treating it as proof of payment.
+        const checkout = sources.find(
+          (source) => source.success === true || source.message === 'success'
+        )
+        const data = checkout?.data
+        if (!data || typeof data !== 'object') return false
+        let tradeNo: unknown
+        if ('order_id' in data) tradeNo = data.order_id
+        else if ('out_trade_no' in data) tradeNo = data.out_trade_no
+        if (
+          typeof tradeNo !== 'string' ||
+          !/^[a-zA-Z0-9_-]{1,128}$/.test(tradeNo)
+        ) {
+          return false
+        }
+        usePaymentRecoveryStore.getState().remember(auth.user.id, tradeNo)
+        onUnknownCheckout?.()
+        return false
       } catch (error) {
         if (!mounted.current || changed) return false
         const status = isAxiosError(error) ? error.response?.status : undefined
