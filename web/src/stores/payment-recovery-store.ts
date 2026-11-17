@@ -68,9 +68,10 @@ export const usePaymentRecoveryStore = create<PaymentRecoveryState>(
       let storageError = false
       const prefix = `${PAYMENT_RECOVERY_PREFIX}${userId}:`
       try {
-        for (let index = 0; index < localStorage.length; index += 1) {
-          const key = localStorage.key(index)
-          if (!key?.startsWith(prefix)) continue
+        // Capture names before reading: another tab can remove an earlier key
+        // during a read, shifting numeric indexes past an unresolved order.
+        for (const key of Object.keys(localStorage)) {
+          if (!key.startsWith(prefix)) continue
           const tradeNo = localStorage.getItem(key)
           if (tradeNo === null) continue
           if (

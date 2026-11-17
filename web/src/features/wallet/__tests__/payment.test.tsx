@@ -2097,6 +2097,30 @@ test('failed browser storage keeps the known order copyable and warns before lea
   ).toBeVisible()
 })
 
+test('another tab cleaning up a completed checkout during restoration cannot hide the next unresolved order', () => {
+  const completedKey = 'new-api:payment-recovery:v1:1:completed_checkout'
+  const unresolvedKey = 'new-api:payment-recovery:v1:1:unresolved_checkout'
+  localStorage.setItem(completedKey, 'completed_checkout')
+  localStorage.setItem(unresolvedKey, 'unresolved_checkout')
+  const read = Storage.prototype.getItem
+  vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (
+    this: Storage,
+    key
+  ) {
+    // Another tab removes the preceding key after enumeration, before its read.
+    if (this === localStorage && key === completedKey) {
+      localStorage.removeItem(completedKey)
+    }
+    return read.call(this, key)
+  })
+
+  render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+
+  expect(screen.getByText('unresolved_checkout')).toBeVisible()
+  expect(screen.queryByText('completed_checkout')).not.toBeInTheDocument()
+  expect(localStorage.getItem(unresolvedKey)).toBe('unresolved_checkout')
+})
+
 test('another tab order reference does not replace the current unknown checkout', async () => {
   vi.spyOn(api, 'post').mockResolvedValue({
     data: {

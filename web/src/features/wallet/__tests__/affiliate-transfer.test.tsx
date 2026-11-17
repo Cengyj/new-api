@@ -593,6 +593,47 @@ test('storage cleanup failure preserves a confirmed result and never offers anot
   expect(savedTransfer('new-api:affiliate-transfer:1')).toBeNull()
 })
 
+test('another tab cleaning up a completed transfer cannot hide an unresolved identity during the dispatch check', async () => {
+  const request = vi
+    .spyOn(api, 'request')
+    .mockImplementation(async (config) => {
+      if (config.url === '/api/user/aff') return success('invite-first')
+      return success(summary)
+    })
+  mountCard()
+  await userEvent.click(
+    await screen.findByRole('button', { name: 'Transfer to Balance' })
+  )
+  const completed = { request_id: 'completed-transfer-0001', quota: 500000 }
+  const unresolved = { request_id: 'unresolved-transfer-0001', quota: 500000 }
+  const completedKey = `new-api:affiliate-transfer:1:${completed.request_id}`
+  const unresolvedKey = `new-api:affiliate-transfer:1:${unresolved.request_id}`
+  localStorage.setItem(completedKey, JSON.stringify(completed))
+  localStorage.setItem(unresolvedKey, JSON.stringify(unresolved))
+  const read = Storage.prototype.getItem
+  vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (
+    this: Storage,
+    key
+  ) {
+    // Another tab removes the preceding key after enumeration, before its read.
+    if (this === localStorage && key === completedKey) {
+      localStorage.removeItem(completedKey)
+    }
+    return read.call(this, key)
+  })
+
+  await userEvent.click(screen.getByRole('button', { name: 'Transfer' }))
+
+  expect
+    .soft(request.mock.calls.filter(([config]) => config.method === 'post'))
+    .toHaveLength(0)
+  expect(screen.getByText(unresolved.request_id)).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'Retry original transfer' })
+  ).toBeDisabled()
+  expect(localStorage.getItem(unresolvedKey)).toBe(JSON.stringify(unresolved))
+})
+
 test('confirmation never clears a different unresolved operation saved while the response was pending', async () => {
   const laterOperation = { request_id: 'other-operation-0002', quota: 500000 }
   let finish!: (value: ReturnType<typeof success>) => void

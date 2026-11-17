@@ -7181,6 +7181,9 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 		{name: "missing_payment_request", status: 200, signature: "valid", code: "0"},
 		{name: "missing_merchant_order", status: 200, signature: "valid", code: "0"},
 		{name: "blank_checkout_url", status: 200, signature: "valid", code: "0"},
+		{name: "missing_action_url", status: 200, signature: "valid", code: "0"},
+		{name: "malformed_action_json", status: 200, signature: "valid", code: "0"},
+		{name: "valid_deep_link", status: 200, signature: "valid", code: "0", accepted: true},
 		{name: "nil_response", status: 200, signature: "valid", code: "0"},
 		{name: "network_failure", status: 200, signature: "valid", code: "0"},
 		{name: "unknown_status", status: 200, signature: "valid", code: "E0001"},
@@ -7229,6 +7232,12 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 					created.MerchantOrderID = ""
 				case "blank_checkout_url":
 					created.OrderAction = `{"actionType":"WEB","webUrl":"   "}`
+				case "missing_action_url":
+					created.OrderAction = `{"actionType":"WEB"}`
+				case "malformed_action_json":
+					created.OrderAction = `{"actionType":`
+				case "valid_deep_link":
+					created.OrderAction = `{"actionType":"DEEPLINK","deeplinkUrl":"alipays://platformapi/startapp?appId=20000067"}`
 				}
 				body, err := common.Marshal(map[string]any{"code": tc.code, "data": created})
 				require.NoError(t, err)
@@ -7277,6 +7286,9 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &decoded))
 			if tc.accepted {
 				assert.Equal(t, "success", decoded.Message)
+				if tc.name == "valid_deep_link" {
+					assert.Contains(t, string(decoded.Data), `"payment_url":"alipays://platformapi/startapp?appId=20000067"`)
+				}
 			} else {
 				assert.Equal(t, "error", decoded.Message)
 				if tc.rejected {
@@ -8415,5 +8427,140 @@ func TestWalletEpayFormParametersBindVerifiedOrder(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestWalletServerAddressAliasesPreservePaymentURLs(t *testing.T) {
+	router, keys := walletCheckoutFixture(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.AuditLog{}, &model.PasskeyCredential{}))
+	oldOptions, oldServer, oldCallback := common.OptionMap, system_setting.ServerAddress, operation_setting.CustomCallbackAddress
+	oldPasskey := *system_setting.GetPasskeySettings()
+	common.OptionMap = map[string]string{}
+	*system_setting.GetPasskeySettings() = system_setting.PasskeySettings{}
+	operation_setting.CustomCallbackAddress = ""
+	t.Cleanup(func() {
+		common.OptionMap, system_setting.ServerAddress, operation_setting.CustomCallbackAddress = oldOptions, oldServer, oldCallback
+		*system_setting.GetPasskeySettings() = oldPasskey
+	})
+	const before, after = "https://before.example.invalid", "https://after.example.invalid"
+	system_setting.ServerAddress = before
+	require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 901).Updates(map[string]any{"role": common.RoleRootUser, "auth_version": 1, "group": "default"}).Error)
+	_, credential := createAccessTokenTestSession(t, 901, "wallet-address-settings")
+	router.PUT("/api/option/", middleware.RootAuth(), UpdateOption)
+	pending := walletWebhookOrder(t, model.PaymentProviderEpay, "before-address-alias-save")
+	for _, method := range []string{"single", "bulk"} {
+		for _, alias := range []string{"serveraddress", "ServerAddress "} {
+			t.Run(method+"/"+alias, func(t *testing.T) {
+				require.NoError(t, model.DB.Where(map[string]any{"key": []string{"ServerAddress", alias}}).Delete(&model.Option{}).Error)
+				require.NoError(t, model.UpdateOption("ServerAddress", before))
+				require.NoError(t, model.UpdateOption("Price", "1"))
+				var matched model.Option
+				lookup := model.DB.Where(&model.Option{Key: alias}).First(&matched).Error
+				require.True(t, lookup == nil || errors.Is(lookup, gorm.ErrRecordNotFound))
+				equivalent := lookup == nil
+				if method == "single" {
+					body, err := common.Marshal(map[string]string{"key": alias, "value": after})
+					require.NoError(t, err)
+					response := accessTokenRequest(router, http.MethodPut, "/api/option/", credential, "", string(body))
+					require.Equal(t, http.StatusOK, response.Code)
+					assert.Contains(t, response.Body.String(), fmt.Sprintf(`"success":%t`, !equivalent))
+				} else {
+					err := model.UpdateOptionsBulk(map[string]string{alias: after, "Price": "2"})
+					if equivalent {
+						require.Error(t, err)
+					} else {
+						require.NoError(t, err)
+					}
+				}
+				var stored model.Option
+				require.NoError(t, model.DB.Where(&model.Option{Key: "ServerAddress"}).First(&stored).Error)
+				assert.Equal(t, before, stored.Value)
+				assert.Equal(t, before+"/wallet", paymentReturnPath("/wallet"))
+				require.NoError(t, model.LoadOptionsFromDatabase())
+				assert.Equal(t, before+"/wallet", paymentReturnPath("/wallet"))
+				assert.Equal(t, before, service.GetCallbackAddress())
+				expectedPrice := 1.0
+				if method == "bulk" && !equivalent {
+					expectedPrice = 2
+				}
+				assert.Equal(t, expectedPrice, operation_setting.Price, "alias rejection rolls back the entire payment batch")
+			})
+		}
+	}
+	// The address guard preserves the old order identity and normal trusted
+	// notifications; neither an attempted save nor a reload creates a new order.
+	for range 2 {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, walletWebhookRequest(t, keys, model.PaymentProviderEpay, pending.TradeNo, "100.00", true))
+		require.Equal(t, "success", response.Body.String())
+	}
+	var buyer, inviter model.User
+	require.NoError(t, model.DB.First(&buyer, 902).Error)
+	require.NoError(t, model.DB.First(&inviter, 901).Error)
+	require.NoError(t, model.DB.First(pending, pending.Id).Error)
+	assert.Equal(t, 990, buyer.Quota)
+	assert.Equal(t, 107, inviter.AffQuota)
+	assert.Equal(t, common.TopUpStatusSuccess, pending.Status)
+	var rebates int64
+	require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Where("top_up_id = ?", pending.Id).Count(&rebates).Error)
+	assert.EqualValues(t, 1, rebates)
+}
+
+func TestWalletAddressBatchCanonicalizesHistoricalPaymentKeys(t *testing.T) {
+	for _, key := range []string{"ServerAddress", "Price"} {
+		t.Run(key, func(t *testing.T) {
+			router, _ := walletCheckoutFixture(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.AuditLog{}, &model.PasskeyCredential{}))
+			oldOptions, oldServer := common.OptionMap, system_setting.ServerAddress
+			oldPasskey := *system_setting.GetPasskeySettings()
+			common.OptionMap = map[string]string{}
+			*system_setting.GetPasskeySettings() = system_setting.PasskeySettings{}
+			t.Cleanup(func() {
+				common.OptionMap, system_setting.ServerAddress = oldOptions, oldServer
+				*system_setting.GetPasskeySettings() = oldPasskey
+			})
+			const before, after = "https://before.example.invalid", "https://after.example.invalid"
+			system_setting.ServerAddress = before
+			initial, replacement := before, after
+			if key == "Price" {
+				initial, replacement = "1", "2"
+			}
+			require.NoError(t, model.DB.Create(&model.Option{Key: strings.ToLower(key), Value: initial}).Error)
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 901).Updates(map[string]any{"role": common.RoleRootUser, "auth_version": 1, "group": "default"}).Error)
+			_, credential := createAccessTokenTestSession(t, 901, "wallet-historical-address-settings")
+			router.PUT("/api/option/", middleware.RootAuth(), UpdateOption)
+			beforeRows, err := model.AllOption()
+			require.NoError(t, err)
+			failure := errors.New("isolated payment address batch failure")
+			require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("fixture:address_failure", func(tx *gorm.DB) {
+				if option, ok := tx.Statement.Dest.(*model.Option); ok && option.Key == "passkey.origins" {
+					tx.AddError(failure)
+				}
+			}))
+			assert.ErrorIs(t, model.UpdateOptionsBulk(map[string]string{"ServerAddress": after, key: replacement}), failure)
+			require.NoError(t, model.DB.Callback().Update().Remove("fixture:address_failure"))
+			afterRows, err := model.AllOption()
+			require.NoError(t, err)
+			assert.ElementsMatch(t, beforeRows, afterRows, "failed mixed save rolls back historical key normalization too")
+			assert.Equal(t, before, system_setting.ServerAddress)
+			assert.Equal(t, 1.0, operation_setting.Price)
+			if key == "ServerAddress" {
+				response := accessTokenRequest(router, http.MethodPut, "/api/option/", credential, "", `{"key":"ServerAddress","value":"https://after.example.invalid"}`)
+				require.Contains(t, response.Body.String(), `"success":true`)
+			} else {
+				require.NoError(t, model.UpdateOptionsBulk(map[string]string{"ServerAddress": after, key: replacement}))
+			}
+			var stored model.Option
+			require.NoError(t, model.DB.Where(&model.Option{Key: key}).First(&stored).Error)
+			assert.Equal(t, key, stored.Key)
+			assert.Equal(t, replacement, stored.Value)
+			system_setting.ServerAddress, operation_setting.Price = "https://cold.example.invalid", 1
+			require.NoError(t, model.LoadOptionsFromDatabase())
+			assert.Equal(t, after+"/wallet", paymentReturnPath("/wallet"))
+			if key == "Price" {
+				assert.Equal(t, 2.0, operation_setting.Price)
+			}
+			assert.Contains(t, system_setting.PasskeySettingsSnapshot().RelyingPartyIDs(), "before.example.invalid", "canonical address saves retain the previous implicit domain")
+		})
 	}
 }

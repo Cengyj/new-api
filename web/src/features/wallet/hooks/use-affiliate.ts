@@ -89,9 +89,10 @@ function readPendingTransfer(
     }
     const prefix = `${key}:`
     const operations: PendingTransfer[] = []
-    for (let index = 0; index < localStorage.length; index += 1) {
-      const operationKey = localStorage.key(index)
-      if (!operationKey?.startsWith(prefix)) continue
+    // Capture names before reading so another tab's cleanup cannot shift an
+    // unresolved operation past a numeric index and permit a replacement ID.
+    for (const operationKey of Object.keys(localStorage)) {
+      if (!operationKey.startsWith(prefix)) continue
       const raw = localStorage.getItem(operationKey)
       if (raw === null) continue
       const operation = parsePendingTransfer(raw)

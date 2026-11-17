@@ -382,11 +382,28 @@ if walletRunID .. ':' .. (redis.call('HGET', KEYS[1], 'WalletGeneration') or '')
   return 0
 end
 local hasQuota = redis.call('HEXISTS', KEYS[1], 'Quota') == 1
+local quota = redis.call('HGET', KEYS[1], 'Quota') or ''
+local magnitude = string.match(quota, '^%-?([1-9]%d*)$')
+local limit = string.sub(quota, 1, 1) == '-' and '9223372036854775808' or '9223372036854775807'
+local validQuota = quota == '0' or (magnitude and
+  (#magnitude < 19 or (#magnitude == 19 and magnitude <= limit)))
+-- Use the same signed-int64 format as publication. Creating a pending credit
+-- for an already invalid counter would prevent its normal SQL hydration.
 -- Metadata repair preserves an existing counter. Treating that counter as a
 -- cache miss would omit this credit's marker while later repair kept the old balance.
-if hasQuota and (tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[1])
+if hasQuota and (not validQuota
+  or tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[1])
   or tonumber(redis.call('HGET', KEYS[1], 'CacheSchema') or '0') ~= tonumber(ARGV[2])) then
   return redis.error_reply('WALLET_CACHE_RECOVERY_REQUIRED')
+end
+if not hasQuota then
+  -- Existing credits still need this counter; publication cannot hydrate it
+  -- from SQL while their deltas remain pending, so this is not a cold cache.
+  for _, field in ipairs(redis.call('HKEYS', KEYS[1])) do
+    if string.sub(field, 1, 13) == 'WalletCredit:' then
+      return redis.error_reply('WALLET_CACHE_RECOVERY_REQUIRED')
+    end
+  end
 end
 redis.call('DEL', KEYS[2])
 if not hasQuota then

@@ -1856,7 +1856,7 @@ func TestReferralWalletCreditRejectsDamagedCacheMetadataAcrossDatabases(t *testi
 	setupAffiliateTransferCompliance(t)
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		for _, operation := range []string{"topup", "transfer"} {
-			for _, damage := range []string{"missing_id", "wrong_id", "missing_schema", "old_schema"} {
+			for _, damage := range []string{"missing_id", "wrong_id", "missing_schema", "old_schema", "quota:corrupted", "quota:01", "quota:+1", "quota:-0", "quota:9223372036854775808", "quota:-9223372036854775809"} {
 				t.Run(dialect+"/"+operation+"/"+damage, func(t *testing.T) {
 					db, _ := newReferralIntegrationDatabase(t, dialect)
 					previousDB, previousLogDB := DB, LOG_DB
@@ -1890,8 +1890,8 @@ func TestReferralWalletCreditRejectsDamagedCacheMetadataAcrossDatabases(t *testi
 					user := User{Id: userID, Username: "damaged-cache-user", AffCode: "damaged-cache-user", Status: common.UserStatusEnabled, Quota: 50, AffQuota: 100, AffHistoryQuota: 200, InviterId: inviter.Id, CreatedAt: time.Now().Unix(), ReferralRateBPS: 1000, ReferralExpiresAt: time.Now().Unix() + 86400}
 					require.NoError(t, db.Create(&user).Error)
 					require.NoError(t, populateUserCache(user))
-					// Only metadata is damaged. The current Redis run and its live counter
-					// remain intact, so normal metadata repair must preserve this balance.
+					// There is no unfinished credit yet. Reject before creating its
+					// marker so normal repair can preserve or hydrate the counter.
 					switch damage {
 					case "missing_id":
 						require.NoError(t, client.HDel(t.Context(), keys[0], "Id").Err())
@@ -1901,6 +1901,10 @@ func TestReferralWalletCreditRejectsDamagedCacheMetadataAcrossDatabases(t *testi
 						require.NoError(t, client.HDel(t.Context(), keys[0], "CacheSchema").Err())
 					case "old_schema":
 						require.NoError(t, client.HSet(t.Context(), keys[0], "CacheSchema", 1).Err())
+					default:
+						quota, ok := strings.CutPrefix(damage, "quota:")
+						require.True(t, ok)
+						require.NoError(t, client.HSet(t.Context(), keys[0], "Quota", quota).Err())
 					}
 					fillToken, err := reserveWalletCacheFill(t.Context(), client, userID)
 					require.NoError(t, err)
@@ -1959,7 +1963,7 @@ func TestReferralWalletCreditRejectsDamagedCacheMetadataAcrossDatabases(t *testi
 						require.NoError(t, creditWallet(), "recover using the original durable identity")
 					}
 					cached, err := cacheGetUserBase(userID)
-					require.NoError(t, err, "repaired metadata must pass real cache signature validation")
+					require.NoError(t, err, "repaired cache must pass real signature and quota validation")
 					assert.Equal(t, 150, cached.Quota)
 					require.NoError(t, db.First(&user, userID).Error)
 					require.NoError(t, db.First(&inviter, inviter.Id).Error)
@@ -1997,8 +2001,11 @@ func TestSignedUserCacheDoesNotRebaseUnfinishedWalletCredit(t *testing.T) {
 	for _, damaged := range []string{"missing", "malformed", "9223372036854775808", "-9223372036854775809", "01", "+1", "-0"} {
 		t.Run(damaged, func(t *testing.T) {
 			_, user := referralFixture(t, 1000)
-			user.Quota = 50
-			require.NoError(t, DB.Model(&user).Update("quota", user.Quota).Error)
+			user.Quota, user.AffQuota = 50, 100
+			require.NoError(t, DB.Model(&user).Updates(map[string]any{"quota": user.Quota, "aff_quota": user.AffQuota}).Error)
+			previousUnit := common.QuotaPerUnit
+			common.QuotaPerUnit = 1
+			t.Cleanup(func() { common.QuotaPerUnit = previousUnit })
 			previousDB, previousClient, previousEnabled := DB, common.RDB, common.RedisEnabled
 			client := redis.NewClient(&redis.Options{Addr: address, DB: 12, MaxRetries: -1})
 			require.NoError(t, client.Ping(t.Context()).Err())
@@ -2032,6 +2039,24 @@ func TestSignedUserCacheDoesNotRebaseUnfinishedWalletCredit(t *testing.T) {
 			} else {
 				require.NoError(t, client.HSet(t.Context(), keys[0], "Quota", damaged).Err())
 			}
+			fillToken, err := reserveWalletCacheFill(t.Context(), client, user.Id)
+			require.NoError(t, err)
+			beforeTransfer, err := client.HGetAll(t.Context(), keys[0]).Result()
+			require.NoError(t, err)
+			_, err = user.TransferAffQuotaToQuota(100, "damaged-counter-second-transfer")
+			require.ErrorIs(t, err, ErrWalletCacheRecoveryRequired, "a missing counter with an unfinished credit is not a cold cache")
+			afterTransfer, err := client.HGetAll(t.Context(), keys[0]).Result()
+			require.NoError(t, err)
+			assert.Equal(t, beforeTransfer, afterTransfer)
+			retainedFill, err := client.Get(t.Context(), keys[3]).Result()
+			require.NoError(t, err)
+			assert.Equal(t, fillToken, retainedFill)
+			require.NoError(t, DB.First(&user, user.Id).Error)
+			assert.Equal(t, 150, user.Quota)
+			assert.Equal(t, 100, user.AffQuota)
+			var transfers int64
+			require.NoError(t, DB.Model(&AffiliateTransfer{}).Count(&transfers).Error)
+			assert.Zero(t, transfers)
 			_, err = GetUserCache(user.Id)
 			require.ErrorIs(t, err, ErrWalletCacheRecoveryRequired, "a SQL snapshot already containing the credit cannot retain its pending delta")
 			_, err = RechargeEpay(order.TradeNo, "", "")

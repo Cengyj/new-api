@@ -37,7 +37,7 @@ var walletPaymentOptionKeys = []string{
 	"WaffoPancakeUnitPrice", "CreemProducts", "payment_setting.amount_discount",
 	"QuotaPerUnit", "QuotaForInviter", "QuotaForInvitee",
 	"general_setting.quota_display_type", "DisplayInCurrencyEnabled",
-	"PayAddress", "CustomCallbackAddress", "EpayId", "EpayKey", "MinTopUp", "PayMethods", "USDExchangeRate",
+	"PayAddress", "CustomCallbackAddress", "ServerAddress", "EpayId", "EpayKey", "MinTopUp", "PayMethods", "USDExchangeRate",
 	operation_setting.EpaySignTypeOptionKey, operation_setting.EpayMerchantPrivateKeyOptionKey, operation_setting.EpayPlatformPublicKeyOptionKey,
 	"StripeApiSecret", "StripeWebhookSecret", "StripePriceId", "StripeMinTopUp", "StripePromotionCodesEnabled",
 	"CreemApiKey", "CreemWebhookSecret", "CreemTestMode",

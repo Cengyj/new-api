@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -430,7 +431,11 @@ func resolveWaffoCheckoutResponse(topUp *model.TopUp, resp *core.ApiResponse[ord
 	}
 	paymentURL := orderData.FetchRedirectURL()
 	if paymentURL == "" {
-		paymentURL = orderData.OrderAction
+		// Keep legacy plain URLs, but an incomplete or malformed action JSON
+		// is not a usable payment link and cannot establish checkout success.
+		if legacyURL, err := url.ParseRequestURI(orderData.OrderAction); err == nil && legacyURL.IsAbs() {
+			paymentURL = orderData.OrderAction
+		}
 	}
 	if strings.TrimSpace(paymentURL) == "" {
 		// An incomplete response does not prove the provider rejected the order.

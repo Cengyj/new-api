@@ -252,6 +252,21 @@ func UpdatePasskeyDomainOptions(values map[string]string, preview bool, confirma
 		values["ServerAddress"] = serverAddress
 		keys := slices.Sorted(maps.Keys(values))
 		for _, key := range keys {
+			if slices.Contains(walletPaymentOptionKeys, key) {
+				option := Option{Key: key}
+				if err := tx.FirstOrCreate(&option, Option{Key: key}).Error; err != nil {
+					return err
+				}
+				if option.Key != key {
+					// Keep canonical payment saves reloadable when a historical
+					// alias compares equal under the database's collation.
+					if err := tx.Model(&Option{}).Where(&Option{Key: option.Key}).
+						Updates(map[string]any{"key": key, "value": values[key]}).Error; err != nil {
+						return err
+					}
+					continue
+				}
+			}
 			if err := tx.Save(&Option{Key: key, Value: values[key]}).Error; err != nil {
 				return err
 			}
