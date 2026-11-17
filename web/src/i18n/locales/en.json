@@ -7142,6 +7142,7 @@
     "Unable to parse structured pricing": "Unable to parse structured pricing",
     "Unable to prepare chat link. Please ensure you have an enabled API key.": "Unable to prepare chat link. Please ensure you have an enabled API key.",
     "Unable to read clipboard": "Unable to read clipboard",
+    "Unable to read your invitation information. Allow browser storage and try again.": "Unable to read your invitation information. Allow browser storage and try again.",
     "Unauthorized": "Unauthorized",
     "Unauthorized Access": "Unauthorized Access",
     "Unauthorized, insufficient privileges": "Unauthorized, insufficient privileges",

@@ -7142,6 +7142,7 @@
     "Unable to parse structured pricing": "Не удалось разобрать структурированные цены",
     "Unable to prepare chat link. Please ensure you have an enabled API key.": "Не удается подготовить ссылку для чата. Убедитесь, что у вас есть активированный API-ключ.",
     "Unable to read clipboard": "Не удалось прочитать буфер обмена",
+    "Unable to read your invitation information. Allow browser storage and try again.": "Не удалось прочитать данные приглашения. Разрешите хранение данных в браузере и повторите попытку.",
     "Unauthorized": "Не авторизован",
     "Unauthorized Access": "Несанкционированный доступ",
     "Unauthorized, insufficient privileges": "Нет доступа, недостаточно прав",
