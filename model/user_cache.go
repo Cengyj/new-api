@@ -381,10 +381,15 @@ return walletRunID .. ':' .. (redis.call('HGET', KEYS[1], 'WalletGeneration') or
 if walletRunID .. ':' .. (redis.call('HGET', KEYS[1], 'WalletGeneration') or '') ~= ARGV[4] then
   return 0
 end
+local hasQuota = redis.call('HEXISTS', KEYS[1], 'Quota') == 1
+-- Metadata repair preserves an existing counter. Treating that counter as a
+-- cache miss would omit this credit's marker while later repair kept the old balance.
+if hasQuota and (tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[1])
+  or tonumber(redis.call('HGET', KEYS[1], 'CacheSchema') or '0') ~= tonumber(ARGV[2])) then
+  return redis.error_reply('WALLET_CACHE_RECOVERY_REQUIRED')
+end
 redis.call('DEL', KEYS[2])
-if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[1])
-  or tonumber(redis.call('HGET', KEYS[1], 'CacheSchema') or '0') ~= tonumber(ARGV[2])
-  or redis.call('HEXISTS', KEYS[1], 'Quota') == 0 then
+if not hasQuota then
   return 1
 end
 redis.call('HSET', KEYS[1], 'WalletGeneration', ARGV[3])

@@ -66,7 +66,10 @@ export function CreemConfirmDialog({
           >
             {t('Cancel')}
           </Button>
-          <Button onClick={onConfirm} disabled={processing}>
+          <Button
+            onClick={onConfirm}
+            disabled={processing || product.currency === null}
+          >
             {processing && <Loader2 className='mr-2 h-4 w-4 animate-spin' />}
             {t('Confirm Payment')}
           </Button>
@@ -81,7 +84,9 @@ export function CreemConfirmDialog({
         <div className='flex items-center justify-between'>
           <span className='text-muted-foreground'>{t('Price')}</span>
           <span className='text-primary font-medium'>
-            {formatCreemPrice(product.price, product.currency)}
+            {product.currency === null
+              ? t('Product configuration error')
+              : formatCreemPrice(product.price, product.currency)}
           </span>
         </div>
         <div className='flex items-center justify-between'>

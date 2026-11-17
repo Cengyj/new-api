@@ -116,8 +116,14 @@ function parseCreemProducts(data: unknown): CreemProduct[] {
         !!item && typeof item === 'object'
     )
     .map((item) => {
-      const currency: CreemProduct['currency'] =
-        item.currency === 'EUR' ? 'EUR' : 'USD'
+      // Old configurations omitted the currency and displayed USD. An explicit
+      // unsupported value must not be presented as a different currency.
+      let currency: CreemProduct['currency'] = null
+      if (item.currency === undefined || item.currency === 'USD') {
+        currency = 'USD'
+      } else if (item.currency === 'EUR') {
+        currency = 'EUR'
+      }
 
       return {
         name: typeof item.name === 'string' ? item.name : '',

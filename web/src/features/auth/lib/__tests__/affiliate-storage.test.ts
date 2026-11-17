@@ -69,6 +69,61 @@ test('empty readable invitation storage allows registration and OAuth login with
   expect(post.mock.calls[1][1]).toMatchObject({ aff: undefined })
 })
 
+test.each(['getter', 'getItem'] as const)(
+  'an initial durable invitation %s failure blocks registration and OAuth until the saved invitation is readable',
+  async (failure) => {
+    localStorage.setItem('aff', 'intended-inviter')
+    const { getAffiliateCode } = await import('../storage')
+    const { register, createOAuthAuthorization } = await import('../../api')
+    const { api } = await import('@/lib/api')
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: { success: true, data: 'flow-token' },
+    })
+    const durable = localStorage
+    const originalRead = Storage.prototype.getItem
+    const read =
+      failure === 'getter'
+        ? vi.spyOn(window, 'localStorage', 'get').mockImplementation(() => {
+            throw new DOMException('Storage blocked', 'SecurityError')
+          })
+        : vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (
+            this: Storage,
+            key
+          ) {
+            if (this === durable && key === 'aff') {
+              throw new DOMException('Storage blocked', 'SecurityError')
+            }
+            return originalRead.call(this, key)
+          })
+
+    expect(() =>
+      register({
+        username: 'invitee',
+        password: 'registration-password',
+        aff_code: getAffiliateCode(),
+      })
+    ).toThrow(
+      'Unable to read your invitation information. Allow browser storage or reopen your invitation link, then try again.'
+    )
+    await expect(createOAuthAuthorization('github', 'login')).rejects.toThrow(
+      'Unable to read your invitation information. Allow browser storage or reopen your invitation link, then try again.'
+    )
+    expect(post).not.toHaveBeenCalled()
+
+    read.mockRestore()
+    await register({
+      username: 'invitee',
+      password: 'registration-password',
+      aff_code: getAffiliateCode(),
+    })
+    await createOAuthAuthorization('github', 'login')
+    expect(post.mock.calls[0][1]).toMatchObject({
+      aff_code: 'intended-inviter',
+    })
+    expect(post.mock.calls[1][1]).toMatchObject({ aff: 'intended-inviter' })
+  }
+)
+
 test('healthy storage still follows invitation changes and removal from another tab', async () => {
   const { getAffiliateCode, saveAffiliateCode } = await import('../storage')
   saveAffiliateCode('first-inviter')
@@ -185,7 +240,7 @@ test.each(['getter', 'getItem'] as const)(
     ).rejects.toMatchObject({
       name: 'AuthOperationError',
       message:
-        'Unable to read your invitation information. Allow browser storage and try again.',
+        'Unable to read your invitation information. Allow browser storage or reopen your invitation link, then try again.',
     })
     expect(post).not.toHaveBeenCalled()
 
@@ -222,10 +277,10 @@ test('an unreadable session store blocks a local-only invitation until an explic
       aff_code: getAffiliateCode(),
     })
   ).toThrow(
-    'Unable to read your invitation information. Allow browser storage and try again.'
+    'Unable to read your invitation information. Allow browser storage or reopen your invitation link, then try again.'
   )
   await expect(createOAuthAuthorization('github', 'login')).rejects.toThrow(
-    'Unable to read your invitation information. Allow browser storage and try again.'
+    'Unable to read your invitation information. Allow browser storage or reopen your invitation link, then try again.'
   )
   expect(post).not.toHaveBeenCalled()
 
@@ -409,7 +464,7 @@ test.each([
     readFailure: true,
   },
 ])(
-  'a damaged invitation fallback $fallback does not reactivate the previous inviter after readFailure=$readFailure',
+  'a damaged invitation fallback $fallback blocks registration until repaired after readFailure=$readFailure',
   async ({ fallback, readFailure }) => {
     localStorage.setItem('aff', 'previous-inviter')
     sessionStorage.setItem('new-api:affiliate-code:fallback:v1', fallback)
@@ -421,14 +476,42 @@ test.each([
           throw new DOMException('Storage blocked', 'SecurityError')
         })
       expect(() => storage.getAffiliateCode()).toThrow(
-        'Unable to read your invitation information. Allow browser storage and try again.'
+        'Unable to read your invitation information. Allow browser storage or reopen your invitation link, then try again.'
       )
       read.mockRestore()
     }
-    expect.soft(storage.getAffiliateCode()).toBe('')
+    const { register, createOAuthAuthorization } = await import('../../api')
+    const { api } = await import('@/lib/api')
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: { success: true, data: 'flow-token' },
+    })
+    expect(() =>
+      register({
+        username: 'invitee',
+        password: 'registration-password',
+        aff_code: storage.getAffiliateCode(),
+      })
+    ).toThrow('Unable to read your invitation information.')
+    await expect(createOAuthAuthorization('github', 'login')).rejects.toThrow(
+      'Unable to read your invitation information.'
+    )
+    expect(post).not.toHaveBeenCalled()
+
+    await createOAuthAuthorization('github', 'bind')
+    await createOAuthAuthorization('github', 'verify')
+    expect(post.mock.calls.map(([, data]) => data)).toEqual([
+      expect.objectContaining({ intent: 'bind', aff: undefined }),
+      expect.objectContaining({ intent: 'verify', aff: undefined }),
+    ])
+
     vi.resetModules()
     storage = await import('../storage')
-    expect.soft(storage.getAffiliateCode()).toBe('')
+    expect(() => storage.getAffiliateCode()).toThrow(
+      'Unable to read your invitation information.'
+    )
+    expect(() => storage.getAffiliateCode()).toThrow(
+      'Unable to read your invitation information.'
+    )
 
     localStorage.setItem('aff', 'another-inviter')
     expect(storage.getAffiliateCode()).toBe('another-inviter')
@@ -437,6 +520,33 @@ test.each([
     vi.resetModules()
     const reloaded = await import('../storage')
     expect(reloaded.getAffiliateCode()).toBe('current-inviter')
+  }
+)
+
+test.each(['recovered-inviter', ''])(
+  'a damaged fallback recovers from a repaired invitation %s without a reload',
+  async (code) => {
+    localStorage.setItem('aff', 'previous-inviter')
+    sessionStorage.setItem('new-api:affiliate-code:fallback:v1', '{')
+    const { getAffiliateCode } = await import('../storage')
+    expect(() => getAffiliateCode()).toThrow(
+      'Unable to read your invitation information.'
+    )
+
+    sessionStorage.setItem(
+      'new-api:affiliate-code:fallback:v1',
+      JSON.stringify({ code, storedCode: 'previous-inviter' })
+    )
+    expect(getAffiliateCode()).toBe(code)
+
+    sessionStorage.setItem('new-api:affiliate-code:fallback:v1', '{')
+    vi.resetModules()
+    const reloaded = await import('../storage')
+    expect(() => reloaded.getAffiliateCode()).toThrow(
+      'Unable to read your invitation information.'
+    )
+    reloaded.saveAffiliateCode(code)
+    expect(reloaded.getAffiliateCode()).toBe(code)
   }
 )
 

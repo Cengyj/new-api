@@ -21,6 +21,7 @@ import { useTranslation } from 'react-i18next'
 import { Card, CardContent } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { formatNumber } from '@/lib/format'
+import { cn } from '@/lib/utils'
 
 import { formatCreemPrice } from '../lib/format'
 import type { CreemProduct } from '../types'
@@ -41,8 +42,8 @@ export function CreemProductsSection({
   if (loading) {
     return (
       <div className='grid grid-cols-2 gap-2 sm:grid-cols-2 sm:gap-3 md:grid-cols-3'>
-        {Array.from({ length: 3 }).map((_, i) => (
-          <Skeleton key={i} className='h-24 rounded-lg' />
+        {[0, 1, 2].map((id) => (
+          <Skeleton key={id} className='h-24 rounded-lg' />
         ))}
       </div>
     )
@@ -58,8 +59,13 @@ export function CreemProductsSection({
         <Card
           key={product.productId}
           data-card-hover='false'
-          className='cursor-pointer'
-          onClick={() => onProductSelect(product)}
+          className={cn(product.currency !== null && 'cursor-pointer')}
+          aria-disabled={product.currency === null}
+          onClick={
+            product.currency === null
+              ? undefined
+              : () => onProductSelect(product)
+          }
         >
           <CardContent className='p-3 text-center sm:p-4'>
             <div className='mb-2 text-lg font-medium'>{product.name}</div>
@@ -67,7 +73,9 @@ export function CreemProductsSection({
               {t('Quota')}: {formatNumber(product.quota)}
             </div>
             <div className='text-primary text-lg font-semibold'>
-              {formatCreemPrice(product.price, product.currency)}
+              {product.currency === null
+                ? t('Product configuration error')
+                : formatCreemPrice(product.price, product.currency)}
             </div>
           </CardContent>
         </Card>

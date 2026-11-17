@@ -39,9 +39,10 @@ const STORAGE_KEYS = {
 // Invitation codes are public inputs, not credentials. A failed durable write
 // keeps the current input in this tab, including across a reload when possible.
 let currentAffiliateCode = ''
+let affiliateCodeKnown = false
 let affiliateFallbackLoaded = false
 let affiliateFallback: {
-  code: string
+  code: string | null
   storedCode?: string | null
 } | null = null
 
@@ -63,15 +64,21 @@ function clearAffiliateFallback(): void {
  */
 export function getAffiliateCode(): string {
   if (typeof window === 'undefined') return ''
-  if (!affiliateFallbackLoaded) {
+  if (!affiliateFallbackLoaded || affiliateFallback?.code === null) {
     try {
       const raw = window.sessionStorage.getItem(STORAGE_KEYS.AFFILIATE_FALLBACK)
       affiliateFallbackLoaded = true
       if (raw !== null && raw !== 'null') {
         // A damaged fallback cannot establish that an older durable code is
         // still the intended invitation. A new invitation can replace it.
-        currentAffiliateCode = ''
-        affiliateFallback = { code: '' }
+        affiliateCodeKnown = false
+        affiliateFallback = {
+          code: null,
+          storedCode:
+            affiliateFallback?.code === null
+              ? affiliateFallback.storedCode
+              : undefined,
+        }
         const saved: unknown = JSON.parse(raw)
         if (
           typeof saved !== 'object' ||
@@ -90,6 +97,7 @@ export function getAffiliateCode(): string {
           throw new Error('Invalid saved invitation')
         }
         currentAffiliateCode = saved.code
+        affiliateCodeKnown = true
         affiliateFallback = { code: saved.code, storedCode }
       }
     } catch (error) {
@@ -97,7 +105,7 @@ export function getAffiliateCode(): string {
       console.error('Failed to get affiliate code fallback:', error)
       if (!affiliateFallbackLoaded) {
         throw new AuthOperationError(
-          'Unable to read your invitation information. Allow browser storage and try again.',
+          'Unable to read your invitation information. Allow browser storage or reopen your invitation link, then try again.',
           undefined,
           { cause: error }
         )
@@ -110,20 +118,26 @@ export function getAffiliateCode(): string {
       // The first readable old value must not replace the current invitation.
       // Remember it so a later change in another tab can take precedence.
       affiliateFallback.storedCode = storedCode
-      try {
-        window.sessionStorage.setItem(
-          STORAGE_KEYS.AFFILIATE_FALLBACK,
-          JSON.stringify(affiliateFallback)
-        )
-      } catch (error) {
-        // eslint-disable-next-line no-console
-        console.error('Failed to save affiliate code fallback:', error)
+      if (affiliateFallback.code !== null) {
+        try {
+          window.sessionStorage.setItem(
+            STORAGE_KEYS.AFFILIATE_FALLBACK,
+            JSON.stringify(affiliateFallback)
+          )
+        } catch (error) {
+          // eslint-disable-next-line no-console
+          console.error('Failed to save affiliate code fallback:', error)
+        }
       }
     }
     if (affiliateFallback && storedCode === affiliateFallback.storedCode) {
+      if (affiliateFallback.code === null) {
+        throw new Error('Invalid saved invitation')
+      }
       return currentAffiliateCode
     }
     currentAffiliateCode = storedCode ?? ''
+    affiliateCodeKnown = true
     if (affiliateFallback) {
       // Another tab has changed or removed the old value. Follow the durable
       // invitation again rather than allowing this tab's fallback to mask it.
@@ -134,6 +148,13 @@ export function getAffiliateCode(): string {
   } catch (error) {
     // eslint-disable-next-line no-console
     console.error('Failed to get affiliate code:', error)
+    if (!affiliateCodeKnown) {
+      throw new AuthOperationError(
+        'Unable to read your invitation information. Allow browser storage or reopen your invitation link, then try again.',
+        undefined,
+        { cause: error }
+      )
+    }
     return currentAffiliateCode
   }
 }
@@ -144,6 +165,7 @@ export function getAffiliateCode(): string {
 export function saveAffiliateCode(code: string): void {
   if (typeof window === 'undefined') return
   currentAffiliateCode = code
+  affiliateCodeKnown = true
   affiliateFallbackLoaded = true
   try {
     window.localStorage.setItem(STORAGE_KEYS.AFFILIATE, code)

@@ -72,8 +72,8 @@ export interface CreemProduct {
   price: number
   /** Quota amount to credit */
   quota: number
-  /** Currency (USD or EUR) */
-  currency: 'USD' | 'EUR'
+  /** Supported display currency; null means an invalid product configuration. */
+  currency: 'USD' | 'EUR' | null
 }
 
 /**

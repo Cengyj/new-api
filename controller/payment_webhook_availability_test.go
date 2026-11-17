@@ -7965,9 +7965,9 @@ func TestWalletEpayCheckoutUsesOneConfigurationSnapshot(t *testing.T) {
 }
 
 func TestWalletRemoteCheckoutKeepsProductAndCredentialsSnapshot(t *testing.T) {
-	for _, provider := range []string{model.PaymentProviderStripe, model.PaymentProviderCreem, model.PaymentProviderWaffoPancake} {
+	for _, provider := range []string{model.PaymentProviderStripe, model.PaymentProviderCreem, model.PaymentProviderWaffo, model.PaymentProviderWaffoPancake} {
 		t.Run(provider, func(t *testing.T) {
-			router, _ := walletCheckoutFixture(t)
+			router, keys := walletCheckoutFixture(t)
 			oldOptions, oldTransport, oldClient := common.OptionMap, http.DefaultTransport, http.DefaultClient
 			oldBackend := stripe.GetBackend(stripe.APIBackend)
 			common.OptionMap = make(map[string]string)
@@ -7988,6 +7988,31 @@ func TestWalletRemoteCheckoutKeepsProductAndCredentialsSnapshot(t *testing.T) {
 				"CreemApiKey": "creem_after", "CreemTestMode": "true",
 				"CreemProducts":          `[{"productId":"fixture","price":200,"currency":"USD","quota":2000}]`,
 				"WaffoPancakeMerchantID": "MER_cccccccccccccccccccccc", "WaffoPancakeProductID": "PROD_dddddddddddddddddddddd",
+			}
+			if provider == model.PaymentProviderWaffo {
+				stringsToRestore := []*string{&setting.WaffoMerchantId, &setting.WaffoCurrency, &setting.WaffoNotifyUrl, &setting.WaffoReturnUrl,
+					&setting.WaffoSandboxApiKey, &setting.WaffoSandboxPrivateKey, &setting.WaffoSandboxPublicCert}
+				for _, pointer := range stringsToRestore {
+					value := *pointer
+					t.Cleanup(func() { *pointer = value })
+				}
+				oldPrice, oldMinimum := setting.WaffoUnitPrice, setting.WaffoMinTopUp
+				t.Cleanup(func() { setting.WaffoUnitPrice, setting.WaffoMinTopUp = oldPrice, oldMinimum })
+				rotatedKeys, err := waffoutils.GenerateKeyPair()
+				require.NoError(t, err)
+				maps.Copy(before, map[string]string{
+					"WaffoMerchantId": "merchant_before", "WaffoApiKey": "waffo_before", "WaffoSandbox": "false",
+					"WaffoUnitPrice": "1", "WaffoMinTopUp": "1", "WaffoCurrency": "USD",
+					"WaffoPayMethods": `[{"payMethodType":"CARD","payMethodName":"Card"}]`,
+					"WaffoNotifyUrl":  "https://before.example.invalid/notify", "WaffoReturnUrl": "https://before.example.invalid/return",
+				})
+				maps.Copy(after, map[string]string{
+					"WaffoMerchantId": "merchant_after", "WaffoSandbox": "true", "WaffoSandboxApiKey": "waffo_after",
+					"WaffoSandboxPrivateKey": rotatedKeys.PrivateKey, "WaffoSandboxPublicCert": rotatedKeys.PublicKey,
+					"WaffoUnitPrice": "2", "WaffoCurrency": "JPY",
+					"WaffoPayMethods": `[{"payMethodType":"BANK_TRANSFER","payMethodName":"Bank"}]`,
+					"WaffoNotifyUrl":  "https://after.example.invalid/notify", "WaffoReturnUrl": "https://after.example.invalid/return",
+				})
 			}
 			require.NoError(t, model.UpdateOptionsBulk(before))
 			changed := false
@@ -8032,10 +8057,45 @@ func TestWalletRemoteCheckoutKeepsProductAndCredentialsSnapshot(t *testing.T) {
 			http.DefaultTransport = transport
 			http.DefaultClient = &http.Client{Transport: transport}
 			stripe.SetBackend(stripe.APIBackend, stripe.GetBackendWithConfig(stripe.APIBackend, &stripe.BackendConfig{HTTPClient: http.DefaultClient, MaxNetworkRetries: stripe.Int64(0), EnableTelemetry: stripe.Bool(false)}))
+			if provider == model.PaymentProviderWaffo {
+				service.WaffoHTTPTransport = walletWaffoSDKTransport(func(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+					calls.Add(1)
+					assert.Equal(t, "https://api.waffo.com/api/v1/order/create", request.URL)
+					assert.Equal(t, "waffo_before", request.Headers["X-API-KEY"])
+					assert.True(t, waffoutils.Verify(string(request.Body), request.Headers[core.HeaderSignature], keys.PublicKey))
+					var checkout order.CreateOrderParams
+					if err := common.Unmarshal(request.Body, &checkout); err != nil {
+						return nil, err
+					}
+					require.NotNil(t, checkout.MerchantInfo)
+					require.NotNil(t, checkout.PaymentInfo)
+					assert.Equal(t, "merchant_before", checkout.MerchantInfo.MerchantID)
+					assert.Equal(t, "100.00", checkout.OrderAmount)
+					assert.Equal(t, "USD", checkout.OrderCurrency)
+					assert.Equal(t, "CARD", checkout.PaymentInfo.PayMethodType)
+					assert.Equal(t, "Card", checkout.PaymentInfo.PayMethodName)
+					assert.Equal(t, "https://before.example.invalid/notify", checkout.NotifyURL)
+					assert.Equal(t, "https://before.example.invalid/return", checkout.SuccessRedirectURL)
+					response, err := common.Marshal(map[string]any{"code": "0", "data": map[string]string{
+						"merchantOrderId": checkout.MerchantOrderID, "paymentRequestId": checkout.PaymentRequestID,
+						"orderAction": "https://checkout.example.invalid/snapshot",
+					}})
+					if err != nil {
+						return nil, err
+					}
+					signature, err := waffoutils.Sign(string(response), keys.PrivateKey)
+					if err != nil {
+						return nil, err
+					}
+					return &waffonet.HttpResponse{StatusCode: http.StatusOK, Body: response, Headers: map[string]string{core.HeaderSignature: signature}}, nil
+				})
+			}
 			handler, body := RequestStripePay, `{"amount":100,"payment_method":"stripe"}`
 			switch provider {
 			case model.PaymentProviderCreem:
 				handler, body = RequestCreemPay, `{"product_id":"fixture","payment_method":"creem"}`
+			case model.PaymentProviderWaffo:
+				handler, body = RequestWaffoPay, `{"amount":100,"pay_method_index":0}`
 			case model.PaymentProviderWaffoPancake:
 				handler, body = RequestWaffoPancakePay, `{"amount":100}`
 			}
@@ -8051,6 +8111,10 @@ func TestWalletRemoteCheckoutKeepsProductAndCredentialsSnapshot(t *testing.T) {
 			require.NoError(t, model.DB.First(&order).Error)
 			require.NotNil(t, order.CreditedQuota)
 			assert.Equal(t, 1000, *order.CreditedQuota)
+			if provider == model.PaymentProviderWaffo {
+				require.NotNil(t, order.WaffoMerchantID)
+				assert.Equal(t, "merchant_before", *order.WaffoMerchantID)
+			}
 		})
 	}
 }
@@ -8194,4 +8258,162 @@ func TestWalletWaffoRejectsChargesRoundedToZero(t *testing.T) {
 	var orders int64
 	require.NoError(t, model.DB.Model(&model.TopUp{}).Count(&orders).Error)
 	assert.Zero(t, orders)
+}
+
+func TestEpayRSANotificationClockBoundary(t *testing.T) {
+	setupEpayCallbackTest(t)
+	merchantPrivate, _ := newEpayRSAKeyPairForTest(t)
+	platformPrivate, platformPublic := newEpayRSAKeyPairForTest(t)
+	payment := operation_setting.GetPaymentSetting()
+	payment.EpaySignType = operation_setting.EpaySignTypeRSA
+	payment.EpayMerchantPrivateKey, payment.EpayPlatformPublicKey = merchantPrivate, platformPublic
+	keyDER, err := base64.StdEncoding.DecodeString(platformPrivate)
+	require.NoError(t, err)
+	privateKey, err := x509.ParsePKCS8PrivateKey(keyDER)
+	require.NoError(t, err)
+	router := gin.New()
+	router.POST("/epay", EpayNotify)
+	// Freeze the application and locked SDK clocks together. Pending callbacks
+	// exercise the real proof gate without needing a database or settlement.
+	synctest.Test(t, func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			offset   int64
+			accepted bool
+		}{
+			{"current", 0, true},
+			{"past boundary", -300, true},
+			{"past boundary exceeded", -301, false},
+			{"future boundary", 300, true},
+			{"future boundary exceeded", 301, false},
+		} {
+			params := url.Values{
+				"money": {"1.00"}, "name": {"clock fixture"}, "out_trade_no": {"clock-order"},
+				"pid": {"epay_id"}, "timestamp": {strconv.FormatInt(time.Now().Unix()+tc.offset, 10)},
+				"trade_status": {"WAIT_BUYER_PAY"}, "type": {"alipay"},
+			}
+			parts := make([]string, 0, len(params))
+			for _, key := range []string{"money", "name", "out_trade_no", "pid", "timestamp", "trade_status", "type"} {
+				parts = append(parts, key+"="+params.Get(key))
+			}
+			digest := sha256.Sum256([]byte(strings.Join(parts, "&")))
+			signature, err := rsa.SignPKCS1v15(rand.Reader, privateKey.(*rsa.PrivateKey), crypto.SHA256, digest[:])
+			require.NoError(t, err)
+			params.Set("sign", base64.StdEncoding.EncodeToString(signature))
+			params.Set("sign_type", "RSA")
+			request := httptest.NewRequest(http.MethodPost, "/epay", strings.NewReader(params.Encode()))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			want := "fail"
+			if tc.accepted {
+				want = "success"
+			}
+			assert.Equal(t, want, response.Body.String(), tc.name)
+		}
+	})
+}
+
+func TestWalletEpayFormParametersBindVerifiedOrder(t *testing.T) {
+	for _, mode := range []string{"MD5", "RSA"} {
+		for _, tc := range []struct {
+			name     string
+			method   string
+			accepted bool
+		}{
+			{"GET signed first values", http.MethodGet, true},
+			{"POST signed first values", http.MethodPost, true},
+			{"GET unsigned first values", http.MethodGet, false},
+			{"POST unsigned first values", http.MethodPost, false},
+			{"POST query cannot override signed body", http.MethodPost, true},
+			{"encoded separator is ambiguous", http.MethodPost, false},
+		} {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				router, keys := walletWebhookFixture(t)
+				router.GET("/epay", EpayNotify)
+				order := walletWebhookOrder(t, model.PaymentProviderEpay, "verified-epay-order")
+				other := walletWebhookOrder(t, model.PaymentProviderEpay, "unsigned-epay-order")
+				params := url.Values{
+					"money": {"100.00"}, "name": {"encoded + 商品 = 50%"}, "out_trade_no": {order.TradeNo},
+					"pid": {"epay_fixture"}, "trade_status": {"TRADE_SUCCESS"}, "type": {"alipay"},
+					"empty": {""}, "whitespace": {" \t "},
+				}
+				if tc.name == "encoded separator is ambiguous" {
+					params.Set("name", "item&money=0")
+				}
+				if mode == "RSA" {
+					payment := operation_setting.GetPaymentSetting()
+					payment.EpaySignType = operation_setting.EpaySignTypeRSA
+					payment.EpayMerchantPrivateKey, payment.EpayPlatformPublicKey = keys.PrivateKey, keys.PublicKey
+					params.Set("timestamp", strconv.FormatInt(time.Now().Unix(), 10))
+				}
+				names := make([]string, 0, len(params))
+				for key := range params {
+					value := params.Get(key)
+					if value != "" && (mode != "RSA" || strings.Trim(value, " \t\n\r\x00\x0b") != "") {
+						names = append(names, key)
+					}
+				}
+				slices.Sort(names)
+				parts := make([]string, 0, len(names))
+				for _, name := range names {
+					parts = append(parts, name+"="+params.Get(name))
+				}
+				content := strings.Join(parts, "&")
+				if mode == "MD5" {
+					digest := md5.Sum([]byte(content + operation_setting.EpayKey))
+					params.Set("sign", hex.EncodeToString(digest[:]))
+				} else {
+					keyDER, err := base64.StdEncoding.DecodeString(keys.PrivateKey)
+					require.NoError(t, err)
+					privateKey, err := x509.ParsePKCS8PrivateKey(keyDER)
+					require.NoError(t, err)
+					digest := sha256.Sum256([]byte(content))
+					signature, err := rsa.SignPKCS1v15(rand.Reader, privateKey.(*rsa.PrivateKey), crypto.SHA256, digest[:])
+					require.NoError(t, err)
+					params.Set("sign", base64.StdEncoding.EncodeToString(signature))
+				}
+				params.Set("sign_type", mode)
+				if strings.HasSuffix(tc.name, "first values") {
+					params.Add("out_trade_no", other.TradeNo)
+					params.Add("money", "0")
+					if !tc.accepted {
+						slices.Reverse(params["out_trade_no"])
+						slices.Reverse(params["money"])
+					}
+				}
+				path := "/epay"
+				var body io.Reader
+				if tc.method == http.MethodGet {
+					path += "?" + params.Encode()
+				} else {
+					body = strings.NewReader(params.Encode())
+					if tc.name == "POST query cannot override signed body" {
+						path += "?out_trade_no=" + other.TradeNo + "&money=0&pid=other"
+					}
+				}
+				request := httptest.NewRequest(tc.method, path, body)
+				request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+				wantBody, wantQuota := "fail", -10
+				if tc.accepted {
+					wantBody, wantQuota = "success", 990
+				}
+				assert.Equal(t, wantBody, response.Body.String())
+				var buyer model.User
+				require.NoError(t, model.DB.First(&buyer, 902).Error)
+				assert.Equal(t, wantQuota, buyer.Quota)
+				require.NoError(t, model.DB.First(other, other.Id).Error)
+				assert.Equal(t, common.TopUpStatusPending, other.Status)
+				var rebates int64
+				require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+				if tc.accepted {
+					assert.EqualValues(t, 1, rebates)
+				} else {
+					assert.Zero(t, rebates)
+				}
+			})
+		}
+	}
 }

@@ -47,7 +47,9 @@ import {
 
 import * as paymentApi from '../api'
 import * as affiliateRewards from '../components/affiliate-rewards-card'
+import { CreemProductsSection } from '../components/creem-products-section'
 import * as billingHistory from '../components/dialogs/billing-history-dialog'
+import { CreemConfirmDialog } from '../components/dialogs/creem-confirm-dialog'
 import { PaymentConfirmDialog } from '../components/dialogs/payment-confirm-dialog'
 import { PaymentRecoveryNotice } from '../components/payment-recovery-notice'
 import { RechargeFormCard } from '../components/recharge-form-card'
@@ -101,6 +103,87 @@ const topupInfo: TopupInfo = {
   amount_options: [],
   discount: {},
 }
+
+test.each(['GBP', 'INVALID'])(
+  'Creem currency %s cannot masquerade as USD or disable valid products and other channels',
+  async (currency) => {
+    vi.spyOn(api, 'get').mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          ...topupInfo,
+          enable_creem_topup: true,
+          creem_products: JSON.stringify([
+            {
+              name: 'Invalid currency',
+              productId: 'invalid',
+              price: 10,
+              quota: 500000,
+              currency,
+            },
+            {
+              name: 'Dollar product',
+              productId: 'dollar',
+              price: 20,
+              quota: 500000,
+              currency: 'USD',
+            },
+            {
+              name: 'Euro product',
+              productId: 'euro',
+              price: 30,
+              quota: 500000,
+              currency: 'EUR',
+            },
+            {
+              name: 'Legacy product',
+              productId: 'legacy',
+              price: 40,
+              quota: 500000,
+            },
+          ]),
+        },
+      },
+    })
+    const { result } = renderHook(() => topupInfoHooks.useTopupInfo())
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.loadFailed).toBe(false)
+    expect(result.current.topupInfo?.pay_methods).toEqual([
+      expect.objectContaining({ type: 'alipay' }),
+    ])
+    const products = result.current.topupInfo?.creem_products ?? []
+    const select = vi.fn()
+    const catalog = render(
+      <CreemProductsSection products={products} onProductSelect={select} />
+    )
+    expect(screen.getByText('Product configuration error')).toBeVisible()
+    expect(screen.queryByText('$10.00')).not.toBeInTheDocument()
+    expect(screen.getByText('$20.00')).toBeVisible()
+    expect(screen.getByText('€30.00')).toBeVisible()
+    expect(screen.getByText('$40.00')).toBeVisible()
+    await userEvent.click(screen.getByText('Invalid currency'))
+    expect(select).not.toHaveBeenCalled()
+    await userEvent.click(screen.getByText('Dollar product'))
+    expect(select).toHaveBeenCalledExactlyOnceWith(products[1])
+    catalog.unmount()
+
+    const confirm = vi.fn()
+    render(
+      <CreemConfirmDialog
+        open
+        onOpenChange={vi.fn()}
+        onConfirm={confirm}
+        product={products[0]}
+        processing={false}
+      />
+    )
+    expect(screen.getByText('Product configuration error')).toBeVisible()
+    const button = screen.getByRole('button', { name: 'Confirm Payment' })
+    expect(button).toBeDisabled()
+    await userEvent.click(button)
+    expect(confirm).not.toHaveBeenCalled()
+  }
+)
 
 test.each([
   { mode: 'USD', quantity: 10, preset: '10', confirmed: '$10', updated: '$10' },

@@ -42,7 +42,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import type { CreemProduct } from '@/features/wallet/types'
 
 import { safeNumberFieldProps } from '../utils/numeric-field'
 
@@ -58,14 +57,14 @@ type CreemProductDialogFormValues = z.infer<typeof creemProductDialogSchema>
 
 const CREEM_PRODUCT_FORM_ID = 'creem-product-form'
 
-// Re-export for backwards compatibility
-export type CreemProductData = CreemProduct
+// The editor only creates configurations with a supported display currency.
+export type CreemProductData = CreemProductDialogFormValues
 
 type CreemProductDialogProps = {
   open: boolean
   onOpenChange: (open: boolean) => void
-  onSave: (data: CreemProduct) => void
-  editData?: CreemProduct | null
+  onSave: (data: CreemProductData) => void
+  editData?: CreemProductData | null
 }
 
 export function CreemProductDialog({
@@ -103,7 +102,7 @@ export function CreemProductDialog({
   }, [editData, form, open])
 
   const handleSubmit = (values: CreemProductDialogFormValues) => {
-    const data: CreemProduct = {
+    const data: CreemProductData = {
       name: values.name,
       productId: values.productId,
       price: values.price,

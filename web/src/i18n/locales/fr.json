@@ -7142,7 +7142,7 @@
     "Unable to parse structured pricing": "Impossible d'analyser la tarification structurée",
     "Unable to prepare chat link. Please ensure you have an enabled API key.": "Impossible de préparer le lien de chat. Veuillez vous assurer d'avoir une clé API activée.",
     "Unable to read clipboard": "Impossible de lire le presse-papiers",
-    "Unable to read your invitation information. Allow browser storage and try again.": "Impossible de lire vos informations d’invitation. Autorisez le stockage du navigateur, puis réessayez.",
+    "Unable to read your invitation information. Allow browser storage or reopen your invitation link, then try again.": "Impossible de lire vos informations d’invitation. Autorisez le stockage du navigateur ou rouvrez votre lien d’invitation, puis réessayez.",
     "Unauthorized": "Non autorisé",
     "Unauthorized Access": "Accès non autorisé",
     "Unauthorized, insufficient privileges": "Non autorisé, privilèges insuffisants",

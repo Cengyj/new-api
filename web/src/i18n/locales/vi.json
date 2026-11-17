@@ -7142,7 +7142,7 @@
     "Unable to parse structured pricing": "Không thể phân tích giá có cấu trúc",
     "Unable to prepare chat link. Please ensure you have an enabled API key.": "Không thể chuẩn bị liên kết chat. Vui lòng đảm bảo bạn có khóa API được kích hoạt.",
     "Unable to read clipboard": "Không thể đọc bảng tạm",
-    "Unable to read your invitation information. Allow browser storage and try again.": "Không thể đọc thông tin lời mời. Hãy cho phép trình duyệt lưu trữ dữ liệu rồi thử lại.",
+    "Unable to read your invitation information. Allow browser storage or reopen your invitation link, then try again.": "Không thể đọc thông tin lời mời của bạn. Hãy cho phép lưu trữ trên trình duyệt hoặc mở lại liên kết mời, rồi thử lại.",
     "Unauthorized": "Chưa xác thực",
     "Unauthorized Access": "Truy cập trái phép",
     "Unauthorized, insufficient privileges": "Không được phép, không đủ quyền",

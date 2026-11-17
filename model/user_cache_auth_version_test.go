@@ -1848,6 +1848,147 @@ func TestReferralWalletCacheFinalizationPreservesSignedIntegerQuota(t *testing.T
 	}
 }
 
+func TestReferralWalletCreditRejectsDamagedCacheMetadataAcrossDatabases(t *testing.T) {
+	address := os.Getenv("NEW_API_REFERRAL_REDIS_ADDR")
+	if address == "" {
+		t.Skip("set NEW_API_REFERRAL_REDIS_ADDR to a disposable isolated Redis instance")
+	}
+	setupAffiliateTransferCompliance(t)
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		for _, operation := range []string{"topup", "transfer"} {
+			for _, damage := range []string{"missing_id", "wrong_id", "missing_schema", "old_schema"} {
+				t.Run(dialect+"/"+operation+"/"+damage, func(t *testing.T) {
+					db, _ := newReferralIntegrationDatabase(t, dialect)
+					previousDB, previousLogDB := DB, LOG_DB
+					previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+					previousClient, previousEnabled, previousUnit := common.RDB, common.RedisEnabled, common.QuotaPerUnit
+					kind := map[string]common.DatabaseType{"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL}[dialect]
+					common.SetDatabaseTypes(kind, kind)
+					DB, LOG_DB = db, db
+					client := redis.NewClient(&redis.Options{Addr: address, DB: 12, MaxRetries: -1})
+					require.NoError(t, client.Ping(t.Context()).Err())
+					common.RDB, common.RedisEnabled, common.QuotaPerUnit = client, true, 1
+					userID := 100000000 + int(time.Now().UnixNano()%1000000000)
+					keys := []string{getUserCacheKey(userID), getUserAuthFenceKey(userID), getUserAuthVersionKey(userID), getWalletCacheFillKey(userID)}
+					for _, key := range keys {
+						exists, err := client.Exists(t.Context(), key).Result()
+						require.NoError(t, err)
+						require.Zero(t, exists, "the fixture must not replace another test's key")
+					}
+					t.Cleanup(func() {
+						DB, LOG_DB = previousDB, previousLogDB
+						common.SetDatabaseTypes(previousMain, previousLog)
+						common.RDB, common.RedisEnabled, common.QuotaPerUnit = previousClient, previousEnabled, previousUnit
+						assert.NoError(t, client.Del(context.Background(), keys...).Err())
+						assert.NoError(t, client.Close())
+					})
+					require.NoError(t, db.AutoMigrate(&User{}, &Option{}, &TopUp{}, &SubscriptionOrder{}, &ReferralRebate{}, &AffiliateTransfer{}, &Log{}))
+					require.NoError(t, InitializeReferralRebateRule(db))
+					require.NoError(t, SaveReferralRebateRule(ReferralRebateRule{Enabled: true, RateBPS: 1000, ValidDays: 1}))
+					inviter := User{Id: userID + 1, Username: "damaged-cache-inviter", AffCode: "damaged-cache-inviter", Status: common.UserStatusEnabled}
+					require.NoError(t, db.Create(&inviter).Error)
+					user := User{Id: userID, Username: "damaged-cache-user", AffCode: "damaged-cache-user", Status: common.UserStatusEnabled, Quota: 50, AffQuota: 100, AffHistoryQuota: 200, InviterId: inviter.Id, CreatedAt: time.Now().Unix(), ReferralRateBPS: 1000, ReferralExpiresAt: time.Now().Unix() + 86400}
+					require.NoError(t, db.Create(&user).Error)
+					require.NoError(t, populateUserCache(user))
+					// Only metadata is damaged. The current Redis run and its live counter
+					// remain intact, so normal metadata repair must preserve this balance.
+					switch damage {
+					case "missing_id":
+						require.NoError(t, client.HDel(t.Context(), keys[0], "Id").Err())
+					case "wrong_id":
+						require.NoError(t, client.HSet(t.Context(), keys[0], "Id", userID+1).Err())
+					case "missing_schema":
+						require.NoError(t, client.HDel(t.Context(), keys[0], "CacheSchema").Err())
+					case "old_schema":
+						require.NoError(t, client.HSet(t.Context(), keys[0], "CacheSchema", 1).Err())
+					}
+					fillToken, err := reserveWalletCacheFill(t.Context(), client, userID)
+					require.NoError(t, err)
+					before, err := client.HGetAll(t.Context(), keys[0]).Result()
+					require.NoError(t, err)
+					ttl, err := client.PTTL(t.Context(), keys[0]).Result()
+					require.NoError(t, err)
+					require.Positive(t, ttl)
+					credit := 100
+					order := TopUp{UserId: userID, TradeNo: "damaged-cache-topup", CreditedQuota: &credit, PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending}
+					const requestID = "damaged-cache-transfer-identity"
+					if operation == "topup" {
+						require.NoError(t, order.Insert())
+					}
+					creditWallet := func() error {
+						if operation == "topup" {
+							_, err := RechargeEpay(order.TradeNo, "", "")
+							return err
+						}
+						_, err := user.TransferAffQuotaToQuota(credit, requestID)
+						return err
+					}
+					require.ErrorIs(t, creditWallet(), ErrWalletCacheRecoveryRequired)
+					after, err := client.HGetAll(t.Context(), keys[0]).Result()
+					require.NoError(t, err)
+					assert.Equal(t, before, after, "failure must not alter the live balance, generation or operation markers")
+					afterTTL, err := client.PTTL(t.Context(), keys[0]).Result()
+					require.NoError(t, err)
+					assert.LessOrEqual(t, afterTTL, ttl, "failure must not renew the damaged hash")
+					retainedFill, err := client.Get(t.Context(), keys[3]).Result()
+					require.NoError(t, err)
+					assert.Equal(t, fillToken, retainedFill)
+					require.NoError(t, db.First(&user, userID).Error)
+					require.NoError(t, db.First(&inviter, inviter.Id).Error)
+					assert.Equal(t, 50, user.Quota)
+					assert.Equal(t, 100, user.AffQuota)
+					assert.Equal(t, 200, user.AffHistoryQuota)
+					assert.Zero(t, inviter.AffQuota)
+					assert.Zero(t, inviter.AffHistoryQuota)
+					var rebates, transfers int64
+					require.NoError(t, db.Model(&ReferralRebate{}).Count(&rebates).Error)
+					require.NoError(t, db.Model(&AffiliateTransfer{}).Count(&transfers).Error)
+					assert.Zero(t, rebates)
+					assert.Zero(t, transfers, "a cache fault is not a durable business rejection")
+					if operation == "topup" {
+						require.NoError(t, db.First(&order, order.Id).Error)
+						assert.Equal(t, common.TopUpStatusPending, order.Status)
+						assert.Zero(t, order.CompleteTime)
+						assert.Nil(t, order.SettlementAudit)
+					}
+					repaired, err := GetUserCache(userID)
+					require.NoError(t, err)
+					assert.Equal(t, 50, repaired.Quota)
+					assert.Equal(t, userID, repaired.Id)
+					for range 2 {
+						require.NoError(t, creditWallet(), "recover using the original durable identity")
+					}
+					cached, err := cacheGetUserBase(userID)
+					require.NoError(t, err, "repaired metadata must pass real cache signature validation")
+					assert.Equal(t, 150, cached.Quota)
+					require.NoError(t, db.First(&user, userID).Error)
+					require.NoError(t, db.First(&inviter, inviter.Id).Error)
+					assert.Equal(t, 150, user.Quota)
+					assert.Equal(t, 200, user.AffHistoryQuota)
+					require.NoError(t, db.Model(&ReferralRebate{}).Count(&rebates).Error)
+					require.NoError(t, db.Model(&AffiliateTransfer{}).Count(&transfers).Error)
+					if operation == "topup" {
+						require.NoError(t, db.First(&order, order.Id).Error)
+						assert.Equal(t, common.TopUpStatusSuccess, order.Status)
+						assert.Positive(t, order.CompleteTime)
+						assert.NotNil(t, order.SettlementAudit)
+						assert.EqualValues(t, 1, rebates)
+						assert.Zero(t, transfers)
+						assert.Equal(t, 10, inviter.AffQuota)
+						assert.Equal(t, 10, inviter.AffHistoryQuota)
+						assert.Equal(t, 100, user.AffQuota)
+					} else {
+						assert.Zero(t, rebates)
+						assert.EqualValues(t, 1, transfers)
+						assert.Zero(t, user.AffQuota)
+						assert.Zero(t, inviter.AffQuota)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestSignedUserCacheDoesNotRebaseUnfinishedWalletCredit(t *testing.T) {
 	address := os.Getenv("NEW_API_REFERRAL_REDIS_ADDR")
 	if address == "" {
