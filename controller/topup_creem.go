@@ -1,0 +1,477 @@
+package controller
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
+	"github.com/thanhpk/randstr"
+)
+
+const CreemSignatureHeader = "creem-signature"
+
+var creemAdaptor = &CreemAdaptor{}
+
+// Local construction failures and documented input/authentication refusals
+// establish that no checkout was created. Other failures leave the result open.
+var errCreemCheckoutNotCreated = errors.New("Creem checkout was not created")
+
+// 生成HMAC-SHA256签名
+func generateCreemSignature(payload string, secret string) string {
+	h := hmac.New(sha256.New, []byte(secret))
+	h.Write([]byte(payload))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// 验证Creem webhook签名
+func verifyCreemSignature(payload string, signature string, secret string) bool {
+	if strings.TrimSpace(secret) == "" {
+		logger.LogWarn(context.Background(), common.LogText("Creem webhook secret is not configured test_mode=%t", setting.CreemTestMode))
+		return false
+	}
+
+	expectedSignature := generateCreemSignature(payload, secret)
+	return hmac.Equal([]byte(signature), []byte(expectedSignature))
+}
+
+type CreemPayRequest struct {
+	ProductId     string `json:"product_id"`
+	PaymentMethod string `json:"payment_method"`
+}
+
+type CreemProduct struct {
+	ProductId string  `json:"productId"`
+	Name      string  `json:"name"`
+	Price     float64 `json:"price"`
+	Currency  string  `json:"currency"`
+	Quota     int64   `json:"quota"`
+}
+
+type CreemAdaptor struct {
+}
+
+func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
+	if req.PaymentMethod != model.PaymentMethodCreem {
+		paymentError(c, common.NewMessage("Unsupported payment channel"))
+		return
+	}
+	common.OptionMapRWMutex.RLock()
+	webhookConfigured := isCreemWebhookConfigured()
+	productConfig := setting.CreemProducts
+	common.OptionMapRWMutex.RUnlock()
+	if !webhookConfigured {
+		paymentError(c, common.NewMessage("Creem webhook is not configured"))
+		return
+	}
+
+	if req.ProductId == "" {
+		paymentError(c, common.NewMessage("Please select a product"))
+		return
+	}
+
+	// 解析产品列表
+	var products []CreemProduct
+	err := common.Unmarshal([]byte(productConfig), &products)
+	if err != nil {
+		logger.LogError(c.Request.Context(), common.LogText("Creem failed to parse product config user_id=%d error=%q", c.GetInt("id"), err.Error()))
+		paymentError(c, common.NewMessage("Product configuration error"))
+		return
+	}
+
+	// 查找对应的产品
+	var selectedProduct *CreemProduct
+	for _, product := range products {
+		if product.ProductId == req.ProductId {
+			selectedProduct = &product
+			break
+		}
+	}
+
+	if selectedProduct == nil {
+		paymentError(c, common.NewMessage("Product does not exist"))
+		return
+	}
+
+	id := c.GetInt("id")
+	if rejectInvalidCreditedQuota(c, id, decimal.NewFromInt(selectedProduct.Quota)) {
+		return
+	}
+
+	user, err := model.GetUserById(id, false)
+	if err != nil || user == nil {
+		paymentError(c, common.NewMessage("User does not exist"))
+		return
+	}
+
+	// 生成唯一的订单引用ID
+	reference := fmt.Sprintf("creem-api-ref-%d-%d-%s", user.Id, time.Now().UnixMilli(), randstr.String(4))
+	referenceId := "ref_" + common.Sha1([]byte(reference))
+
+	// 先创建订单记录，使用产品配置的金额和充值额度
+	topUp := &model.TopUp{
+		UserId:          id,
+		Amount:          selectedProduct.Quota, // 充值额度
+		Money:           selectedProduct.Price, // 支付金额
+		TradeNo:         referenceId,
+		PaymentMethod:   model.PaymentMethodCreem,
+		PaymentProvider: model.PaymentProviderCreem,
+		CreateTime:      time.Now().Unix(),
+		Status:          common.TopUpStatusPending,
+	}
+	err = topUp.Insert()
+	if err != nil {
+		logger.LogError(c.Request.Context(), common.LogText("Creem failed to create top-up order user_id=%d trade_no=%s product_id=%s error=%q", id, referenceId, selectedProduct.ProductId, err.Error()))
+		paymentError(c, common.NewMessage("Failed to create order"))
+		return
+	}
+
+	// 创建支付链接，传入用户邮箱
+	checkoutUrl, err := genCreemLink(c.Request.Context(), referenceId, selectedProduct, user.Email, user.Username)
+	if err != nil {
+		logger.LogError(c.Request.Context(), common.LogText("Creem failed to create payment link user_id=%d trade_no=%s product_id=%s error_type=%T", id, referenceId, selectedProduct.ProductId, err))
+		if errors.Is(err, errCreemCheckoutNotCreated) {
+			paymentError(c, common.NewMessage("Failed to start payment"))
+		} else {
+			paymentCheckoutUnknown(c, referenceId)
+		}
+		return
+	}
+
+	logger.LogInfo(c.Request.Context(), common.LogText("Creem top-up order created user_id=%d trade_no=%s product_id=%s product_name=%q quota=%d money=%.2f", id, referenceId, selectedProduct.ProductId, selectedProduct.Name, selectedProduct.Quota, selectedProduct.Price))
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "success",
+		"data": gin.H{
+			"checkout_url": checkoutUrl,
+			"order_id":     referenceId,
+		},
+	})
+}
+
+func RequestCreemPay(c *gin.Context) {
+	if !requirePaymentCompliance(c) {
+		return
+	}
+
+	var req CreemPayRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		paymentError(c, common.NewMessage("Invalid parameters"))
+		return
+	}
+	creemAdaptor.RequestPay(c, &req)
+}
+
+// 新的Creem Webhook结构体，匹配实际的webhook数据格式
+type CreemWebhookEvent struct {
+	Id        string `json:"id"`
+	EventType string `json:"eventType"`
+	CreatedAt int64  `json:"created_at"`
+	Object    struct {
+		Id        string `json:"id"`
+		Object    string `json:"object"`
+		RequestId string `json:"request_id"`
+		Order     struct {
+			Object      string `json:"object"`
+			Id          string `json:"id"`
+			Customer    string `json:"customer"`
+			Product     string `json:"product"`
+			Amount      *int64 `json:"amount"`
+			Currency    string `json:"currency"`
+			SubTotal    int    `json:"sub_total"`
+			TaxAmount   int    `json:"tax_amount"`
+			AmountDue   int    `json:"amount_due"`
+			AmountPaid  *int64 `json:"amount_paid"`
+			Status      string `json:"status"`
+			Type        string `json:"type"`
+			Transaction string `json:"transaction"`
+			CreatedAt   string `json:"created_at"`
+			UpdatedAt   string `json:"updated_at"`
+			Mode        string `json:"mode"`
+		} `json:"order"`
+		Product struct {
+			Id                string  `json:"id"`
+			Object            string  `json:"object"`
+			Name              string  `json:"name"`
+			Description       string  `json:"description"`
+			Price             int     `json:"price"`
+			Currency          string  `json:"currency"`
+			BillingType       string  `json:"billing_type"`
+			BillingPeriod     string  `json:"billing_period"`
+			Status            string  `json:"status"`
+			TaxMode           string  `json:"tax_mode"`
+			TaxCategory       string  `json:"tax_category"`
+			DefaultSuccessUrl *string `json:"default_success_url"`
+			CreatedAt         string  `json:"created_at"`
+			UpdatedAt         string  `json:"updated_at"`
+			Mode              string  `json:"mode"`
+		} `json:"product"`
+		Units    int `json:"units"`
+		Customer struct {
+			Id        string `json:"id"`
+			Object    string `json:"object"`
+			Email     string `json:"email"`
+			Name      string `json:"name"`
+			Country   string `json:"country"`
+			CreatedAt string `json:"created_at"`
+			UpdatedAt string `json:"updated_at"`
+			Mode      string `json:"mode"`
+		} `json:"customer"`
+		Status   string            `json:"status"`
+		Metadata map[string]string `json:"metadata"`
+		Mode     string            `json:"mode"`
+	} `json:"object"`
+}
+
+func CreemWebhook(c *gin.Context) {
+	common.OptionMapRWMutex.RLock()
+	secret := setting.CreemWebhookSecret
+	enabled := isCreemWebhookEnabled()
+	common.OptionMapRWMutex.RUnlock()
+	if !enabled || strings.TrimSpace(secret) == "" {
+		logger.LogWarn(c.Request.Context(), common.LogText("Creem webhook rejected reason=webhook_disabled path=%q client_ip=%s", c.Request.URL.Path, c.ClientIP()))
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
+
+	// Preserve the exact signed body for verification and decoding.
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		logger.LogError(c.Request.Context(), common.LogText("Creem webhook failed to read request body path=%q client_ip=%s error=%q", c.Request.URL.Path, c.ClientIP(), err.Error()))
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	// 获取签名头
+	signature := c.GetHeader(CreemSignatureHeader)
+	logger.LogInfo(c.Request.Context(), common.LogText("Creem webhook received request path=%q client_ip=%s body_bytes=%d", c.Request.URL.Path, c.ClientIP(), len(bodyBytes)))
+	if signature == "" {
+		logger.LogWarn(c.Request.Context(), common.LogText("Creem webhook missing signature path=%q client_ip=%s", c.Request.URL.Path, c.ClientIP()))
+		c.AbortWithStatus(http.StatusUnauthorized)
+		return
+	}
+
+	// 验证签名
+	if !verifyCreemSignature(string(bodyBytes), signature, secret) {
+		logger.LogWarn(c.Request.Context(), common.LogText("Creem webhook signature verification failed path=%q client_ip=%s body_bytes=%d", c.Request.URL.Path, c.ClientIP(), len(bodyBytes)))
+		c.AbortWithStatus(http.StatusUnauthorized)
+		return
+	}
+
+	logger.LogInfo(c.Request.Context(), common.LogText("Creem webhook signature verified path=%q client_ip=%s", c.Request.URL.Path, c.ClientIP()))
+
+	// 重新设置body供后续的ShouldBindJSON使用
+	c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+
+	// 解析新格式的webhook数据
+	var webhookEvent CreemWebhookEvent
+	if err := c.ShouldBindJSON(&webhookEvent); err != nil {
+		logger.LogError(c.Request.Context(), common.LogText("Creem webhook failed to parse path=%q client_ip=%s error_type=%T", c.Request.URL.Path, c.ClientIP(), err))
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	logger.LogInfo(c.Request.Context(), common.LogText("Creem webhook parsed event_type=%s event_id=%s request_id=%s order_id=%s order_status=%s", webhookEvent.EventType, webhookEvent.Id, webhookEvent.Object.RequestId, webhookEvent.Object.Order.Id, webhookEvent.Object.Order.Status))
+
+	// 根据事件类型处理不同的webhook
+	switch webhookEvent.EventType {
+	case "checkout.completed":
+		handleCheckoutCompleted(c, &webhookEvent)
+	default:
+		logger.LogInfo(c.Request.Context(), common.LogText("Creem webhook ignored event event_type=%s event_id=%s", webhookEvent.EventType, webhookEvent.Id))
+		c.Status(http.StatusOK)
+	}
+}
+
+// 处理支付完成事件
+func handleCheckoutCompleted(c *gin.Context, event *CreemWebhookEvent) {
+	// 验证订单状态
+	if event.Object.Order.Status != "paid" {
+		logger.LogInfo(c.Request.Context(), common.LogText("Creem order not paid, ignored request_id=%s order_id=%s order_status=%s", event.Object.RequestId, event.Object.Order.Id, event.Object.Order.Status))
+		c.Status(http.StatusOK)
+		return
+	}
+
+	// 获取引用ID（这是我们创建订单时传递的request_id）
+	referenceId := event.Object.RequestId
+	if referenceId == "" {
+		logger.LogWarn(c.Request.Context(), common.LogText("Creem webhook missing request_id event_id=%s order_id=%s", event.Id, event.Object.Order.Id))
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	// Try complete subscription order first
+	LockOrder(referenceId)
+	defer UnlockOrder(referenceId)
+	if err := model.CompleteSubscriptionOrder(referenceId, common.GetJsonString(event), model.PaymentProviderCreem, ""); err == nil {
+		logger.LogInfo(c.Request.Context(), common.LogText("Creem subscription order processed trade_no=%s creem_order_id=%s", referenceId, event.Object.Order.Id))
+		c.Status(http.StatusOK)
+		return
+	} else if err != nil && !errors.Is(err, model.ErrSubscriptionOrderNotFound) {
+		logger.LogError(c.Request.Context(), common.LogText("Creem subscription order processing failed trade_no=%s creem_order_id=%s error=%q", referenceId, event.Object.Order.Id, err.Error()))
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	// 验证订单类型，目前只处理一次性付款（充值）
+	if event.Object.Order.Type != "onetime" {
+		logger.LogInfo(c.Request.Context(), common.LogText("Creem order type not supported, ignored request_id=%s creem_order_id=%s order_type=%s", referenceId, event.Object.Order.Id, event.Object.Order.Type))
+		c.Status(http.StatusOK)
+		return
+	}
+
+	// Creem's OrderEntity makes amount_paid optional; older completed
+	// checkouts provide the required order amount instead. Neither field is
+	// payment proof: the verified signature and paid/onetime checks above are.
+	// Retain presence so a missing amount cannot silently become a free order.
+	amount, amountField := event.Object.Order.AmountPaid, "amount_paid"
+	if amount == nil {
+		amount, amountField = event.Object.Order.Amount, "amount"
+	}
+	if amount == nil || *amount < 0 || event.Object.Order.Amount != nil && *event.Object.Order.Amount < 0 {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	logger.LogInfo(c.Request.Context(), common.LogText("Creem wallet payment verified trade_no=%s creem_order_id=%s amount=%d amount_field=%s currency=%s", referenceId, event.Object.Order.Id, *amount, amountField, event.Object.Order.Currency))
+
+	// 处理充值，传入客户邮箱和姓名信息
+	customerEmail := event.Object.Customer.Email
+	customerName := event.Object.Customer.Name
+
+	// 防护性检查，确保邮箱和姓名不为空字符串
+	if customerEmail == "" {
+		logger.LogWarn(c.Request.Context(), common.LogText("Creem callback customer email is empty trade_no=%s creem_order_id=%s", referenceId, event.Object.Order.Id))
+	}
+	if customerName == "" {
+		logger.LogWarn(c.Request.Context(), common.LogText("Creem callback customer name is empty trade_no=%s creem_order_id=%s", referenceId, event.Object.Order.Id))
+	}
+
+	err := model.RechargeCreem(referenceId, customerEmail, customerName, c.ClientIP())
+	if err != nil {
+		logger.LogError(c.Request.Context(), common.LogText("Creem top-up processing failed trade_no=%s creem_order_id=%s client_ip=%s error=%q", referenceId, event.Object.Order.Id, c.ClientIP(), err.Error()))
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
+	logger.LogInfo(c.Request.Context(), common.LogText("Creem top-up succeeded trade_no=%s creem_order_id=%s client_ip=%s", referenceId, event.Object.Order.Id, c.ClientIP()))
+	c.Status(http.StatusOK)
+}
+
+type CreemCheckoutRequest struct {
+	ProductId string `json:"product_id"`
+	RequestId string `json:"request_id"`
+	Customer  struct {
+		Email string `json:"email"`
+	} `json:"customer"`
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+type CreemCheckoutResponse struct {
+	CheckoutUrl string `json:"checkout_url"`
+	Id          string `json:"id"`
+}
+
+func genCreemLink(ctx context.Context, referenceId string, product *CreemProduct, email string, username string) (string, error) {
+	common.OptionMapRWMutex.RLock()
+	apiKey, testMode := setting.CreemApiKey, setting.CreemTestMode
+	common.OptionMapRWMutex.RUnlock()
+	if apiKey == "" {
+		return "", fmt.Errorf("%w: API key is not configured", errCreemCheckoutNotCreated)
+	}
+
+	// 根据测试模式选择 API 端点
+	apiUrl := "https://api.creem.io/v1/checkouts"
+	if testMode {
+		apiUrl = "https://test-api.creem.io/v1/checkouts"
+		logger.LogInfo(ctx, common.LogText("Creem using test environment api_url=%s", apiUrl))
+	}
+
+	// 构建请求数据，确保包含用户邮箱
+	requestData := CreemCheckoutRequest{
+		ProductId: product.ProductId,
+		RequestId: referenceId, // 这个作为订单ID传递给Creem
+		Customer: struct {
+			Email string `json:"email"`
+		}{
+			Email: email, // 用户邮箱会在支付页面预填充
+		},
+		Metadata: map[string]string{
+			"username":     username,
+			"reference_id": referenceId,
+			"product_name": product.Name,
+			"quota":        fmt.Sprintf("%d", product.Quota),
+		},
+	}
+
+	// 序列化请求数据
+	jsonData, err := common.Marshal(requestData)
+	if err != nil {
+		return "", fmt.Errorf("%w: marshal request data: %w", errCreemCheckoutNotCreated, err)
+	}
+
+	// 创建 HTTP 请求
+	req, err := http.NewRequest("POST", apiUrl, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("%w: create HTTP request: %w", errCreemCheckoutNotCreated, err)
+	}
+
+	// 设置请求头
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", apiKey)
+
+	logger.LogInfo(ctx, common.LogText("Creem payment request sent api_url=%s product_id=%s trade_no=%s", apiUrl, product.ProductId, referenceId))
+
+	// 发送请求
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send HTTP request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// 读取响应
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %v", err)
+	}
+
+	logger.LogInfo(ctx, common.LogText("Creem API response received trade_no=%s status_code=%d body_bytes=%d", referenceId, resp.StatusCode, len(body)))
+
+	var checkoutResp CreemCheckoutResponse
+	err = common.Unmarshal(body, &checkoutResp)
+	if resp.StatusCode/100 != 2 {
+		// Create Checkout documents 400/401/404 as input/auth/resource
+		// rejections. A contradictory checkout payload or unreadable body
+		// remains unknown; this does not change the local pending policy.
+		if (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusNotFound) &&
+			err == nil && checkoutResp.Id == "" && strings.TrimSpace(checkoutResp.CheckoutUrl) == "" {
+			return "", fmt.Errorf("%w: HTTP %d", errCreemCheckoutNotCreated, resp.StatusCode)
+		}
+		return "", fmt.Errorf("Creem API http status %d", resp.StatusCode)
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to parse response: %v", err)
+	}
+
+	if strings.TrimSpace(checkoutResp.CheckoutUrl) == "" {
+		return "", fmt.Errorf("Creem API resp no checkout url ")
+	}
+
+	logger.LogInfo(ctx, common.LogText("Creem payment link created trade_no=%s response_id=%s", referenceId, checkoutResp.Id))
+	return checkoutResp.CheckoutUrl, nil
+}
