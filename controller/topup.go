@@ -382,6 +382,16 @@ func rejectInvalidTopUpQuota(c *gin.Context, userId int, amount int64, displayTy
 	return creditedQuota, false
 }
 
+// Epay signs these addresses as supplied. A relative path or a path appended
+// after a query/fragment cannot route the provider to the configured endpoint.
+func epayCheckoutURL(base, route string) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimRight(base, "/") + route)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, common.NewMessage("Payment configuration error")
+	}
+	return u, nil
+}
+
 func RequestEpay(c *gin.Context) {
 	if !requirePaymentCompliance(c) {
 		return
@@ -432,8 +442,16 @@ func RequestEpay(c *gin.Context) {
 	if callbackAddress == "" {
 		callbackAddress = serverAddress
 	}
-	returnUrl, _ := url.Parse(strings.TrimRight(serverAddress, "/") + "/usage-logs")
-	notifyUrl, _ := url.Parse(strings.TrimRight(callbackAddress, "/") + "/api/user/epay/notify")
+	returnUrl, err := epayCheckoutURL(serverAddress, "/usage-logs")
+	if err != nil {
+		paymentError(c, err)
+		return
+	}
+	notifyUrl, err := epayCheckoutURL(callbackAddress, "/api/user/epay/notify")
+	if err != nil {
+		paymentError(c, err)
+		return
+	}
 	tradeNo := fmt.Sprintf("%s%d", common.GetRandomString(6), time.Now().Unix())
 	tradeNo = fmt.Sprintf("USR%dNO%s", id, tradeNo)
 	client := newEpayClient(config, address)

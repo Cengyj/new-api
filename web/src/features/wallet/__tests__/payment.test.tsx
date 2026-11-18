@@ -1060,16 +1060,18 @@ test.each(['creem', 'waffo', 'waffo_pancake'])(
   }
 )
 
-test('a lost order response warns about uncertainty without automatic resubmission', async () => {
+test('a lost order response opens recovery without a guessed reference or another submission', async () => {
   const post = vi
     .spyOn(api, 'post')
     .mockRejectedValue(new AxiosError('Network Error', 'ERR_NETWORK'))
   const error = vi.spyOn(toast, 'error')
-  const { result } = renderHook(() => usePayment())
+  const onUnknown = vi.fn()
+  const { result } = renderHook(() => usePayment(onUnknown))
   await act(async () => {
     expect(await result.current.processPayment(10, 'stripe')).toBe(false)
   })
   expect(post).toHaveBeenCalledTimes(1)
+  expect(onUnknown).toHaveBeenCalledExactlyOnceWith()
   expect(error).toHaveBeenCalledWith(
     'Payment request result is unknown. Check Order History before trying again.'
   )

@@ -17,7 +17,10 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { api } from '@/lib/api'
-import { requireServerSuccess } from '@/lib/server-error-message'
+import {
+  createServerError,
+  requireServerSuccess,
+} from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 
 export interface ReferralRule {
@@ -130,7 +133,11 @@ export async function referralRequest<T>(
     if (referralIdentity() !== identity || controller.signal.aborted) {
       throw new DOMException('Aborted', 'AbortError')
     }
-    return requireServerSuccess(response.data).data as T
+    const envelope = requireServerSuccess(response.data)
+    if (envelope?.success !== true) {
+      throw createServerError({ message_key: 'Invalid response' })
+    }
+    return envelope.data as T
   } finally {
     unsubscribe()
     options.signal?.removeEventListener('abort', abort)

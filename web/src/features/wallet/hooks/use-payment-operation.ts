@@ -27,7 +27,9 @@ import { usePaymentRecoveryStore } from '@/stores/payment-recovery-store'
 
 // A lost response does not cancel an order already created by the server.
 // Prevent concurrent submissions and discard delivery after payer changes.
-export function usePaymentOperation(onUnknownCheckout?: () => void) {
+export function usePaymentOperation(
+  onUnknownCheckout?: (tradeNo?: string) => void
+) {
   const [processing, setProcessing] = useState(false)
   const pending = useRef(false)
   const mounted = useRef(true)
@@ -53,6 +55,7 @@ export function usePaymentOperation(onUnknownCheckout?: () => void) {
       const auth = useAuthStore.getState().auth
       let changed = false
       let unresolvedOrder: string | undefined
+      let checkHistory = false
       const unsubscribe = useAuthStore.subscribe((state) => {
         if (
           state.auth.user?.id !== auth.user?.id ||
@@ -96,6 +99,7 @@ export function usePaymentOperation(onUnknownCheckout?: () => void) {
         }
         const completed = handleResponse(response)
         if (completed && !unknownOrder) unresolvedOrder = undefined
+        checkHistory = !completed && !!checkout
         return completed
       } catch (error) {
         if (!mounted.current || changed) return false
@@ -103,6 +107,7 @@ export function usePaymentOperation(onUnknownCheckout?: () => void) {
         if (status !== undefined && status >= 400 && status < 500) {
           handleServerError(error, i18next.t('Payment request failed'))
         } else {
+          checkHistory = true
           handleServerError(error, undefined, {
             title: i18next.t(
               'Payment request result is unknown. Check Order History before trying again.'
@@ -115,11 +120,15 @@ export function usePaymentOperation(onUnknownCheckout?: () => void) {
         activeController.current = null
         pending.current = false
         if (mounted.current) setProcessing(false)
-        if (unresolvedOrder && mounted.current && !changed && auth.user?.id) {
-          usePaymentRecoveryStore
-            .getState()
-            .remember(auth.user.id, unresolvedOrder)
-          onUnknownCheckout?.()
+        if (mounted.current && !changed && auth.user?.id) {
+          if (unresolvedOrder) {
+            usePaymentRecoveryStore
+              .getState()
+              .remember(auth.user.id, unresolvedOrder)
+            onUnknownCheckout?.(unresolvedOrder)
+          } else if (checkHistory) {
+            onUnknownCheckout?.()
+          }
         }
       }
     },

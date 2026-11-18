@@ -401,10 +401,16 @@ func fulfillOrder(ctx context.Context, event stripe.Event, referenceId string, c
 		return nil
 	}
 
-	// Missing or malformed amounts are not a free checkout. Explicit zero is
-	// valid only once Stripe's signed event establishes payment completion.
-	total, err := strconv.ParseInt(event.GetObjectValue("amount_total"), 10, 64)
-	if err != nil || total < 0 || (zeroCheckout && total != 0) {
+	// The SDK's Object map converts JSON numbers to float64, then formats
+	// large amounts in scientific notation. Read the signed integer itself.
+	var receipt struct {
+		AmountTotal *int64 `json:"amount_total"`
+	}
+	if err := common.Unmarshal(event.Data.Raw, &receipt); err != nil || receipt.AmountTotal == nil {
+		return errors.New("invalid Stripe payment amount")
+	}
+	total := *receipt.AmountTotal
+	if total < 0 || (zeroCheckout && total != 0) {
 		return errors.New("invalid Stripe payment amount")
 	}
 	if err := model.Recharge(referenceId, customerId, callerIp); err != nil {

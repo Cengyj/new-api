@@ -198,12 +198,15 @@ export function useAffiliate(onBalanceChanged?: () => Promise<void>) {
     retry: false,
     meta: { errorToast: false },
     mutationFn: (operation: PendingTransfer) =>
-      referralRequest('/api/user/aff_transfer', {
-        method: 'post',
-        data: operation,
-        identity,
-        signal: abort.current.signal,
-      }),
+      referralRequest<AffiliateTransferResult['transfer']>(
+        '/api/user/aff_transfer',
+        {
+          method: 'post',
+          data: operation,
+          identity,
+          signal: abort.current.signal,
+        }
+      ),
   })
   const verify = useMutation({
     retry: false,
@@ -311,7 +314,15 @@ export function useAffiliate(onBalanceChanged?: () => Promise<void>) {
       }
       setSaved({ pending: operation, storageError: false })
       setCheckedAbsent(false)
-      await transfer.mutateAsync(operation)
+      const receipt = await transfer.mutateAsync(operation)
+      if (
+        receipt?.request_id !== operation.request_id ||
+        receipt.quota !== operation.quota
+      ) {
+        throw new Error(
+          t('The transfer result does not match the original operation')
+        )
+      }
       return completed(operation)
     } catch (error) {
       if (mounted.current && referralIdentity() === identity) {
@@ -360,12 +371,13 @@ export function useAffiliate(onBalanceChanged?: () => Promise<void>) {
       return false
     }
     busy.current = true
+    setCheckedAbsent(false)
     try {
       const result = await verify.mutateAsync(pending)
       if (!mounted.current || referralIdentity() !== identity) return false
       if (result.rejection) {
         if (
-          result.found ||
+          result.found !== false ||
           result.transfer !== null ||
           confirmed ||
           result.rejection.request_id !== pending.request_id ||
@@ -380,13 +392,13 @@ export function useAffiliate(onBalanceChanged?: () => Promise<void>) {
         return false
       }
       if (
-        result.found &&
+        result.found === true &&
         result.transfer?.request_id === pending.request_id &&
         result.transfer.quota === pending.quota
       ) {
         return completed(pending)
       }
-      if (result.found || confirmed) {
+      if (result.found !== false || result.transfer !== null || confirmed) {
         throw new Error(
           t('The transfer result does not match the original operation')
         )

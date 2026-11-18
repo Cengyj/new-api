@@ -26,7 +26,9 @@ import { requestCreemPayment, isApiSuccess } from '../api'
 import { isSafePaymentUrl } from '../lib/payment'
 import { usePaymentOperation } from './use-payment-operation'
 
-export function useCreemPayment(onUnknownCheckout?: () => void) {
+export function useCreemPayment(
+  onUnknownCheckout?: (tradeNo?: string) => void
+) {
   const { processing, runPayment } = usePaymentOperation(onUnknownCheckout)
   const processCreemPayment = useCallback(
     async (productId: string) => {

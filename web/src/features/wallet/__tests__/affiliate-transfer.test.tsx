@@ -199,7 +199,7 @@ test.each(['USD', 'CNY', 'CUSTOM'] as const)(
     vi.spyOn(api, 'request').mockImplementation(async (config) => {
       if (config.method === 'post') {
         posts.push(config.data)
-        return success({})
+        return success(config.data)
       }
       if (config.url?.includes('/aff_transfer/')) {
         return success({ found: false, transfer: null })
@@ -231,6 +231,70 @@ test.each(['USD', 'CNY', 'CUSTOM'] as const)(
   }
 )
 
+test.each([
+  'missing receipt',
+  'different ID',
+  'different quota',
+  'missing success flag',
+])(
+  'a transfer response with %s retains the original until a matching lookup',
+  async (kind) => {
+    let operation!: { request_id: string; quota: number }
+    let consistent = false
+    const request = vi
+      .spyOn(api, 'request')
+      .mockImplementation(async (config) => {
+        if (config.method === 'post') {
+          operation = config.data as typeof operation
+          if (kind === 'missing receipt') return success(null)
+          if (kind === 'missing success flag') {
+            return { data: { data: operation } }
+          }
+          return success(
+            kind === 'different ID'
+              ? { ...operation, request_id: 'unrelated-transfer-01' }
+              : { ...operation, quota: operation.quota + 1 }
+          )
+        }
+        if (config.url?.includes('/aff_transfer/')) {
+          expect(config.url).toBe(
+            `/api/user/aff_transfer/${operation.request_id}`
+          )
+          return success({ found: consistent, transfer: operation })
+        }
+        return success(
+          config.url === '/api/user/aff' ? 'invite-first' : summary
+        )
+      })
+    const { refresh } = mountCard()
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Transfer to Balance' })
+    )
+    await userEvent.click(screen.getByRole('button', { name: 'Transfer' }))
+    const key = `new-api:affiliate-transfer:1:${operation.request_id}`
+    expect(localStorage.getItem(key)).toBe(JSON.stringify(operation))
+    const dialog = within(
+      screen.getByRole('dialog', { name: 'Transfer Rewards' })
+    )
+    await userEvent.click(
+      dialog.getByRole('button', { name: 'Check transfer result' })
+    )
+    expect(
+      dialog.getByRole('button', { name: 'Retry original transfer' })
+    ).toBeDisabled()
+    expect(refresh).not.toHaveBeenCalled()
+    consistent = true
+    await userEvent.click(
+      dialog.getByRole('button', { name: 'Check transfer result' })
+    )
+    await waitFor(() => expect(localStorage.getItem(key)).toBeNull())
+    expect(refresh).toHaveBeenCalledOnce()
+    expect(
+      request.mock.calls.filter(([config]) => config.method === 'post')
+    ).toHaveLength(1)
+  }
+)
+
 test.each(['network loss', 'timeout'])(
   '%s requires lookup and preserves the original ID and amount on retry',
   async (failure) => {
@@ -246,7 +310,7 @@ test.each(['network loss', 'timeout'])(
             }
             throw new Error('network unavailable')
           }
-          return success({})
+          return success(config.data)
         }
         if (config.url?.includes('/aff_transfer/')) {
           return success({ found: false, transfer: null })
@@ -344,6 +408,7 @@ test.each(['rejected', 'thrown'])(
   'a successful transfer remains successful when a balance refresh is %s',
   async (failure) => {
     vi.spyOn(api, 'request').mockImplementation(async (config) => {
+      if (config.method === 'post') return success(config.data)
       if (config.url === '/api/user/aff') return success('invite-first')
       return success(summary)
     })
@@ -535,7 +600,7 @@ test('storage cleanup failure preserves a confirmed result and never offers anot
     .mockImplementation(async (config) => {
       if (config.method === 'post') {
         operation = config.data as { request_id: string; quota: number }
-        return success({})
+        return success(config.data)
       }
       if (config.url?.includes('/aff_transfer/')) {
         return success({
@@ -660,7 +725,7 @@ test('confirmation never clears a different unresolved operation saved while the
     JSON.stringify(laterOperation)
   )
   await act(async () => {
-    finish(success({}))
+    finish(success(submitted?.data))
     await response
   })
   await waitFor(() =>
@@ -683,6 +748,7 @@ test('a confirmed transfer closes before a slow balance refresh finishes', async
     finish = resolve
   })
   vi.spyOn(api, 'request').mockImplementation(async (config) => {
+    if (config.method === 'post') return success(config.data)
     if (config.url === '/api/user/aff') return success('invite-first')
     return success(summary)
   })
@@ -843,7 +909,7 @@ test('a correlated first-attempt rejection releases the operation and permits a 
           },
         }
       }
-      return success({})
+      return success(config.data)
     }
     if (config.url === '/api/user/aff') return success('invite-first')
     return success(summary)

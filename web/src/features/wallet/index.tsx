@@ -118,9 +118,13 @@ export function Wallet(props: WalletProps) {
   const { meta: currencyDisplay } = getCurrencyDisplay()
   const effectiveUsdExchangeRate =
     currencyDisplay.kind === 'tokens' ? 1 : currencyDisplay.exchangeRate
-  const handleUnknownCheckout = useCallback(() => {
+  const handleUnknownCheckout = useCallback((tradeNo?: string) => {
     setConfirmDialogOpen(false)
     setCreemDialogOpen(false)
+    if (!tradeNo) {
+      setBillingTradeNo('')
+      setBillingDialogOpen(true)
+    }
   }, [])
   const {
     amount: paymentAmount,

@@ -3256,6 +3256,8 @@ func TestWalletReferralStripeZeroPaymentRequiresExplicitCompletedAmount(t *testi
 	}{
 		{name: "completed free wallet", amount: 0, status: "complete", paymentStatus: "no_payment_required", wantHTTP: http.StatusOK, wantSettlement: true},
 		{name: "paid zero wallet", amount: 0, status: "complete", paymentStatus: "paid", wantHTTP: http.StatusOK, wantSettlement: true},
+		{name: "paid seven digit minor units", amount: 1_000_000, status: "complete", paymentStatus: "paid", wantHTTP: http.StatusOK, wantSettlement: true},
+		{name: "free checkout string is not an integer", amount: "0", status: "complete", paymentStatus: "no_payment_required", wantHTTP: http.StatusInternalServerError},
 		{name: "free checkout null amount", status: "complete", paymentStatus: "no_payment_required", wantHTTP: http.StatusInternalServerError},
 		{name: "free checkout nonzero amount", amount: 9000, status: "complete", paymentStatus: "no_payment_required", wantHTTP: http.StatusInternalServerError},
 		{name: "free checkout not complete", amount: 0, status: "open", paymentStatus: "no_payment_required", wantHTTP: http.StatusOK},
@@ -8097,6 +8099,30 @@ func TestEpayCheckoutCallbackBasePreservesReachablePaths(t *testing.T) {
 			var rebates int64
 			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebates).Error)
 			assert.Zero(t, rebates, "checkout alone must not award a wallet rebate")
+		})
+	}
+}
+
+func TestWalletEpayCheckoutRequiresUsableCallbackAddresses(t *testing.T) {
+	router, _ := walletCheckoutFixture(t)
+	router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestEpay)
+	oldCustom, oldServer := operation_setting.CustomCallbackAddress, system_setting.ServerAddress
+	t.Cleanup(func() { operation_setting.CustomCallbackAddress, system_setting.ServerAddress = oldCustom, oldServer })
+	for _, tc := range []struct{ name, callback, server string }{
+		{"invalid return address", "https://notify.example.invalid", "https://wallet.example.invalid/%"},
+		{"relative callback", "/proxy", "https://wallet.example.invalid/base"},
+		{"query is not a base path", "https://notify.example.invalid/?site=1", "https://wallet.example.invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			operation_setting.CustomCallbackAddress, system_setting.ServerAddress = tc.callback, tc.server
+			r := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(`{"amount":100,"payment_method":"alipay"}`))
+			r.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			require.NotPanics(t, func() { router.ServeHTTP(w, r) })
+			assert.Contains(t, w.Body.String(), `"message":"error"`)
+			var rows int64
+			require.NoError(t, model.DB.Model(&model.TopUp{}).Count(&rows).Error)
+			assert.Zero(t, rows)
 		})
 	}
 }
