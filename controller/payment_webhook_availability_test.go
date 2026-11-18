@@ -1173,6 +1173,126 @@ func TestWalletEpaySigningSwitchPreservesFrozenAndHistoricalSettlement(t *testin
 	}
 }
 
+func TestWalletEpaySigningBatchRotationPreservesPendingOrder(t *testing.T) {
+	router, _ := walletWebhookFixture(t)
+	oldOptions := common.OptionMap
+	common.OptionMap = make(map[string]string)
+	maps.Copy(common.OptionMap, oldOptions)
+	t.Cleanup(func() { common.OptionMap = oldOptions })
+	payment := operation_setting.GetPaymentSetting()
+	merchantPrivate, merchantPublic := newEpayRSAKeyPairForTest(t)
+	platformPrivate, platformPublic := newEpayRSAKeyPairForTest(t)
+	nextPrivate, nextPublic := newEpayRSAKeyPairForTest(t)
+	keys := []string{operation_setting.EpaySignTypeOptionKey, operation_setting.EpayMerchantPrivateKeyOptionKey, operation_setting.EpayPlatformPublicKeyOptionKey}
+	initial := map[string]string{keys[0]: operation_setting.EpaySignTypeRSA, keys[1]: merchantPrivate, keys[2]: platformPublic}
+	rotated := map[string]string{keys[0]: operation_setting.EpaySignTypeRSA, keys[1]: merchantPrivate, keys[2]: nextPublic}
+	order := walletWebhookOrder(t, model.PaymentProviderEpay, "epay-batch-rotation")
+
+	// A legacy database without signing rows cannot inherit a node's stale RSA
+	// keys. Reload retains the documented MD5 default without writing new rows.
+	payment.EpaySignType, payment.EpayMerchantPrivateKey, payment.EpayPlatformPublicKey = "RSA", merchantPrivate, platformPublic
+	require.NoError(t, model.LoadOptionsFromDatabase())
+	assert.Equal(t, operation_setting.EpaySignTypeMD5, payment.EpaySignType)
+	assert.Empty(t, payment.EpayMerchantPrivateKey)
+	assert.Empty(t, payment.EpayPlatformPublicKey)
+
+	invalid := maps.Clone(initial)
+	invalid[keys[2]] = "invalid-public-key"
+	require.Error(t, model.UpdateOptionsBulk(invalid))
+	var rows []model.Option
+	require.NoError(t, model.DB.Where(map[string]any{"key": keys}).Find(&rows).Error)
+	assert.Empty(t, rows, "rejected first configuration must not leave partial signing rows")
+	require.NoError(t, model.UpdateOptionsBulk(initial))
+
+	// Fault the public-key write after the complete candidate has been checked.
+	// Earlier writes in this batch must roll back with it, and runtime proof
+	// verification must keep the old public key until a successful commit.
+	fault := errors.New("isolated Epay key rotation write failure")
+	var failedWrites atomic.Int32
+	require.NoError(t, model.DB.Callback().Update().After("gorm:update").Register("test:epay_rotation_write_failure", func(tx *gorm.DB) {
+		option, ok := tx.Statement.Dest.(*model.Option)
+		if ok && option.Key == keys[2] {
+			failedWrites.Add(1)
+			tx.AddError(fault)
+		}
+	}))
+	t.Cleanup(func() { _ = model.DB.Callback().Update().Remove("test:epay_rotation_write_failure") })
+	require.ErrorIs(t, model.UpdateOptionsBulk(rotated), fault)
+	require.EqualValues(t, 1, failedWrites.Load())
+	require.NoError(t, model.DB.Callback().Update().Remove("test:epay_rotation_write_failure"))
+
+	for _, stage := range []string{"failed_rotation", "successful_single_key_rotation", "stale_node_clear_rejected"} {
+		t.Run(stage, func(t *testing.T) {
+			want := initial
+			if stage == "successful_single_key_rotation" {
+				require.NoError(t, model.UpdateOption(keys[2], nextPublic))
+				want = rotated
+			} else if stage == "stale_node_clear_rejected" {
+				// A stale node's MD5 state cannot remove a key required by the
+				// durable RSA mode. This simulates stale state, not a second process.
+				payment.EpaySignType = operation_setting.EpaySignTypeMD5
+				require.Error(t, model.UpdateOption(keys[1], ""))
+				require.NoError(t, model.LoadOptionsFromDatabase())
+				want = rotated
+			}
+			require.NoError(t, model.DB.Where(map[string]any{"key": keys}).Find(&rows).Error)
+			stored := make(map[string]string, len(rows))
+			for _, row := range rows {
+				stored[row.Key] = row.Value
+			}
+			assert.Equal(t, want, stored)
+			assert.Equal(t, want[keys[0]], payment.EpaySignType)
+			assert.Equal(t, want[keys[1]], payment.EpayMerchantPrivateKey)
+			assert.Equal(t, want[keys[2]], payment.EpayPlatformPublicKey)
+
+			for _, signer := range []struct{ name, private string }{{"old", platformPrivate}, {"new", nextPrivate}} {
+				platform, err := epay.NewClient(&epay.Config{PartnerID: operation_setting.EpayId, SignType: epay.SignTypeRSA,
+					MerchantPrivateKey: signer.private, PlatformPublicKey: merchantPublic}, operation_setting.PayAddress)
+				require.NoError(t, err)
+				fields, err := platform.SignParams(map[string]string{"pid": operation_setting.EpayId, "type": "alipay", "money": "100.00",
+					"name": "rotation fixture", "out_trade_no": order.TradeNo, "trade_status": "WAIT_BUYER_PAY"})
+				require.NoError(t, err)
+				form := url.Values{}
+				for key, value := range fields {
+					form.Set(key, value)
+				}
+				request := httptest.NewRequest(http.MethodPost, "/epay", strings.NewReader(form.Encode()))
+				request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+				accepted := stage == "failed_rotation" && signer.name == "old" || stage != "failed_rotation" && signer.name == "new"
+				if accepted {
+					assert.Equal(t, "success", response.Body.String())
+				} else {
+					assert.Equal(t, "fail", response.Body.String())
+				}
+			}
+			require.NoError(t, model.DB.First(order, order.Id).Error)
+			assert.Equal(t, common.TopUpStatusPending, order.Status, "configuration changes and unpaid callbacks must preserve the original order")
+		})
+	}
+
+	// Switching back to MD5 and clearing RSA keys is one valid atomic change.
+	require.NoError(t, model.UpdateOptionsBulk(map[string]string{keys[0]: operation_setting.EpaySignTypeMD5, keys[1]: "", keys[2]: ""}))
+	assert.Equal(t, operation_setting.EpaySignTypeMD5, payment.EpaySignType)
+	assert.Empty(t, payment.EpayMerchantPrivateKey)
+	assert.Empty(t, payment.EpayPlatformPublicKey)
+	for range 2 {
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, walletWebhookRequest(t, nil, model.PaymentProviderEpay, order.TradeNo, "100.00", true))
+		assert.Equal(t, "success", response.Body.String())
+	}
+	var buyer, inviter model.User
+	require.NoError(t, model.DB.First(&buyer, 902).Error)
+	require.NoError(t, model.DB.First(&inviter, 901).Error)
+	assert.Equal(t, 990, buyer.Quota)
+	assert.Equal(t, 107, inviter.AffQuota)
+	assert.Equal(t, 111, inviter.AffHistoryQuota)
+	var count int64
+	require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Where("top_up_id = ?", order.Id).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+}
+
 // walletWebhookFixture uses real controllers, the providers' real signature
 // verification, and a disposable database. These are local protocol
 // fixtures; platform sandbox and cross-process database tests are separate.
@@ -1520,9 +1640,11 @@ func TestWalletReferralSignedCallbacksAndManualCompletion(t *testing.T) {
 					router.ServeHTTP(recorder, request)
 					assert.Contains(t, recorder.Body.String(), `"success":true`)
 				}
-				for range 2 {
+				// A delayed non-success notification after duplicate success must
+				// preserve the committed order and its original referral contribution.
+				for _, paid := range []bool{true, true, false} {
 					recorder := httptest.NewRecorder()
-					router.ServeHTTP(recorder, walletWebhookRequest(t, keys, provider, order.TradeNo, paidAmount, true))
+					router.ServeHTTP(recorder, walletWebhookRequest(t, keys, provider, order.TradeNo, paidAmount, paid))
 					require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 					assert.NotContains(t, recorder.Body.String(), "fail")
 				}
@@ -8836,6 +8958,597 @@ func TestWalletAddressBatchCanonicalizesHistoricalPaymentKeys(t *testing.T) {
 				assert.Equal(t, 2.0, operation_setting.Price)
 			}
 			assert.Contains(t, system_setting.PasskeySettingsSnapshot().RelyingPartyIDs(), "before.example.invalid", "canonical address saves retain the previous implicit domain")
+		})
+	}
+}
+
+func TestWalletPancakeCatalogRequiresSuccessfulHTTPResponse(t *testing.T) {
+	keys, err := waffoutils.GenerateKeyPair()
+	require.NoError(t, err)
+	requestBody, err := common.Marshal(map[string]string{
+		"merchant_id": "MER_AbCdEfGhIjKlMnOpQrStUv", "private_key": keys.PrivateKey,
+	})
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		valid  bool
+	}{
+		{"catalog", http.StatusOK, `{"data":{"stores":[{"id":"store_fixture","name":"Fixture","onetimeProducts":[{"id":"product_fixture","status":"active"}]}]}}`, true},
+		{"empty_catalog", http.StatusOK, `{"data":{"stores":[]}}`, true},
+		{"missing_data", http.StatusOK, `{}`, false},
+		{"null_data", http.StatusOK, `{"data":null}`, false},
+		{"missing_stores", http.StatusOK, `{"data":{}}`, false},
+		{"null_stores", http.StatusOK, `{"data":{"stores":null}}`, false},
+		{"malformed_stores", http.StatusOK, `{"data":{"stores":{}}}`, false},
+		{"unauthorized_with_catalog", http.StatusUnauthorized, `{"data":{"stores":[{"id":"untrusted_store"}]}}`, false},
+		{"server_error_with_catalog", http.StatusInternalServerError, `{"data":{"stores":[{"id":"untrusted_store"}]}}`, false},
+		{"redirect_with_catalog", http.StatusTemporaryRedirect, `{"data":{"stores":[{"id":"untrusted_store"}]}}`, false},
+		{"graphql_error_with_catalog", http.StatusOK, `{"data":{"stores":[{"id":"untrusted_store"}]},"errors":[{"message":"not authorized"}]}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			originalClient := http.DefaultClient
+			t.Cleanup(func() { http.DefaultClient = originalClient })
+			requests := 0
+			http.DefaultClient = &http.Client{Transport: walletCheckoutTransport(func(request *http.Request) (*http.Response, error) {
+				requests++
+				assert.Equal(t, "https://api.waffo.ai/v1/graphql", request.URL.String())
+				assert.Equal(t, http.MethodPost, request.Method)
+				raw, err := io.ReadAll(request.Body)
+				if !assert.NoError(t, err) {
+					return nil, err
+				}
+				hash := sha256.Sum256(raw)
+				canonical := "POST\n/v1/graphql\n" + request.Header.Get("X-Timestamp") + "\n" + base64.StdEncoding.EncodeToString(hash[:])
+				assert.True(t, waffoutils.Verify(canonical, request.Header.Get("X-Signature"), keys.PublicKey))
+				return &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body)), Header: make(http.Header)}, nil
+			})}
+			router := gin.New()
+			router.POST("/catalog", ListWaffoPancakeCatalog)
+			request := httptest.NewRequest(http.MethodPost, "/catalog", bytes.NewReader(requestBody))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			assert.Equal(t, http.StatusOK, response.Code)
+			assert.Equal(t, 1, requests)
+			var result struct {
+				Success    *bool           `json:"success"`
+				Message    string          `json:"message"`
+				MessageKey string          `json:"message_key"`
+				Data       json.RawMessage `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			if tc.valid {
+				assert.Equal(t, "success", result.Message)
+				assert.Contains(t, string(result.Data), `"stores"`)
+			} else {
+				require.NotNil(t, result.Success)
+				assert.False(t, *result.Success)
+				assert.Equal(t, "Failed to fetch the catalog", result.MessageKey)
+				assert.NotContains(t, response.Body.String(), "untrusted_store")
+			}
+			assert.NotContains(t, response.Body.String(), keys.PrivateKey)
+		})
+	}
+}
+
+func TestWalletPancakeConfigurationActionsPreserveHTTPFailure(t *testing.T) {
+	keys, err := waffoutils.GenerateKeyPair()
+	require.NoError(t, err)
+	const merchantID = "MER_AbCdEfGhIjKlMnOpQrStUv"
+	const storeID = "STO_AbCdEfGhIjKlMnOpQrStUv"
+	const productID = "PROD_AbCdEfGhIjKlMnOpQrStUv"
+	for _, entry := range []string{"store", "wallet_product", "plan_product", "pair"} {
+		for _, failAt := range []string{"", "first", "publish"} {
+			if entry == "store" && failAt == "publish" {
+				continue
+			}
+			t.Run(entry+"/"+failAt, func(t *testing.T) {
+				originalClient := http.DefaultClient
+				t.Cleanup(func() { http.DefaultClient = originalClient })
+				requests := 0
+				http.DefaultClient = &http.Client{Transport: walletCheckoutTransport(func(request *http.Request) (*http.Response, error) {
+					requests++
+					assert.Equal(t, "api.waffo.ai", request.URL.Host)
+					assert.Equal(t, merchantID, request.Header.Get("X-Merchant-Id"))
+					body := `{"data":{"product":{"id":"` + productID + `"}}}`
+					if request.URL.Path == "/v1/actions/store/create-store" {
+						body = `{"data":{"store":{"id":"` + storeID + `"}}}`
+					}
+					status := http.StatusOK
+					if failAt == "first" && requests == 1 || failAt == "publish" && strings.HasSuffix(request.URL.Path, "/publish-product") {
+						status = http.StatusBadGateway
+					}
+					return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+				})}
+				var id string
+				var callErr error
+				var pair *service.WaffoPancakePairResult
+				switch entry {
+				case "store":
+					id, callErr = service.CreateWaffoPancakePrimaryStore(t.Context(), merchantID, keys.PrivateKey)
+				case "wallet_product":
+					id, callErr = service.CreateWaffoPancakePrimaryProduct(t.Context(), merchantID, keys.PrivateKey, storeID, "")
+				case "plan_product":
+					// This shared-client regression covers only request/result handling.
+					id, callErr = service.CreateWaffoPancakeProductForPlan(t.Context(), merchantID, keys.PrivateKey, storeID, "Fixture", "1.00", "")
+				case "pair":
+					pair, callErr = service.CreateWaffoPancakePrimaryPair(t.Context(), merchantID, keys.PrivateKey, "")
+					if pair != nil {
+						id = pair.ProductID
+					}
+				}
+				if failAt == "" {
+					require.NoError(t, callErr)
+					wantID := productID
+					if entry == "store" {
+						wantID = storeID
+					}
+					assert.Equal(t, wantID, id)
+				} else {
+					require.Error(t, callErr)
+					assert.Contains(t, callErr.Error(), "HTTP 502")
+					assert.Empty(t, id)
+					if entry == "pair" && failAt == "publish" {
+						require.NotNil(t, pair)
+						assert.True(t, pair.OrphanStore)
+						assert.Equal(t, storeID, pair.StoreID)
+					}
+				}
+				wantRequests := 2
+				if entry == "pair" {
+					wantRequests = 3
+				}
+				if entry == "store" || failAt == "first" {
+					wantRequests = 1
+				}
+				assert.Equal(t, wantRequests, requests, "an HTTP failure must stop subsequent configuration actions")
+			})
+		}
+	}
+}
+
+func TestWalletPancakeConcurrentSaveReturnsOwnConfiguration(t *testing.T) {
+	router, _ := walletWebhookFixture(t)
+	oldOptions, oldReturnURL := common.OptionMap, setting.WaffoPancakeReturnURL
+	common.OptionMap = maps.Clone(oldOptions)
+	if common.OptionMap == nil {
+		common.OptionMap = make(map[string]string)
+	}
+	t.Cleanup(func() {
+		common.OptionMap = oldOptions
+		setting.WaffoPancakeReturnURL = oldReturnURL
+	})
+	router.POST("/pancake/save", SaveWaffoPancake)
+	requests := make([]*http.Request, 2)
+	responses := make([]*httptest.ResponseRecorder, 2)
+	for i := range requests {
+		body, err := common.Marshal(saveWaffoPancakeRequest{
+			MerchantID: " MER_AbCdEfGhIjKlMnOpQrStUv ",
+			StoreID:    fmt.Sprintf(" store_%d ", i),
+			ProductID:  fmt.Sprintf(" product_%d ", i),
+		})
+		require.NoError(t, err)
+		requests[i] = httptest.NewRequest(http.MethodPost, "/pancake/save", bytes.NewReader(body))
+		requests[i].Header.Set("Content-Type", "application/json")
+		responses[i] = httptest.NewRecorder()
+	}
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for i := range requests {
+		workers.Go(func() {
+			<-start
+			router.ServeHTTP(responses[i], requests[i])
+		})
+	}
+	close(start)
+	workers.Wait()
+	for i, response := range responses {
+		assert.Equal(t, http.StatusOK, response.Code)
+		var result struct {
+			Message string `json:"message"`
+			Data    struct {
+				StoreID   string `json:"store_id"`
+				ProductID string `json:"product_id"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		assert.Equal(t, "success", result.Message)
+		assert.Equal(t, fmt.Sprintf("store_%d", i), result.Data.StoreID)
+		assert.Equal(t, fmt.Sprintf("product_%d", i), result.Data.ProductID)
+	}
+}
+
+func TestWalletPancakePairRequiresCorrelatedConfigurationResults(t *testing.T) {
+	keys, err := waffoutils.GenerateKeyPair()
+	require.NoError(t, err)
+	const merchantID = "MER_AbCdEfGhIjKlMnOpQrStUv"
+	const storeID = "STO_AbCdEfGhIjKlMnOpQrStUv"
+	const productID = "PROD_AbCdEfGhIjKlMnOpQrStUv"
+	for _, tc := range []struct {
+		name         string
+		responseAt   string
+		body         string
+		wantSuccess  bool
+		wantOrphan   bool
+		wantRequests int
+	}{
+		{name: "valid", wantSuccess: true, wantRequests: 3},
+		{name: "missing_store", responseAt: "create-store", body: `{}`, wantRequests: 1},
+		{name: "missing_product", responseAt: "create-product", body: `{"data":null}`, wantOrphan: true, wantRequests: 2},
+		{name: "missing_publish_data", responseAt: "publish-product", body: `{}`, wantOrphan: true, wantRequests: 3},
+		{name: "null_publish_data", responseAt: "publish-product", body: `{"data":null}`, wantOrphan: true, wantRequests: 3},
+		{name: "missing_published_product", responseAt: "publish-product", body: `{"data":{}}`, wantOrphan: true, wantRequests: 3},
+		{name: "wrong_published_product", responseAt: "publish-product", body: `{"data":{"product":{"id":"PROD_ZyXwVuTsRqPoNmLkJiHgFe"}}}`, wantOrphan: true, wantRequests: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			originalClient := http.DefaultClient
+			t.Cleanup(func() { http.DefaultClient = originalClient })
+			requests := 0
+			http.DefaultClient = &http.Client{Transport: walletCheckoutTransport(func(request *http.Request) (*http.Response, error) {
+				requests++
+				body := `{"data":{"product":{"id":"` + productID + `"}}}`
+				if strings.HasSuffix(request.URL.Path, "/create-store") {
+					body = `{"data":{"store":{"id":"` + storeID + `"}}}`
+				}
+				if tc.responseAt != "" && strings.HasSuffix(request.URL.Path, "/"+tc.responseAt) {
+					body = tc.body
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+			})}
+			router := gin.New()
+			router.POST("/pair", CreateWaffoPancakePair)
+			payload, marshalErr := common.Marshal(map[string]string{"merchant_id": merchantID, "private_key": keys.PrivateKey})
+			require.NoError(t, marshalErr)
+			request := httptest.NewRequest(http.MethodPost, "/pair", bytes.NewReader(payload))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			var result struct {
+				Message    string `json:"message"`
+				MessageKey string `json:"message_key"`
+				Data       struct {
+					StoreID     string `json:"store_id"`
+					ProductID   string `json:"product_id"`
+					OrphanStore bool   `json:"orphan_store"`
+				} `json:"data"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			assert.Equal(t, tc.wantSuccess, result.Message == "success", "only the correlated publication result proves configuration success")
+			assert.Equal(t, tc.wantOrphan, result.Data.OrphanStore)
+			if tc.name == "missing_store" || tc.responseAt == "publish-product" {
+				assert.Equal(t, "Invalid response", result.MessageKey)
+			}
+			if tc.wantSuccess || tc.wantOrphan {
+				assert.Equal(t, storeID, result.Data.StoreID)
+			} else {
+				assert.Empty(t, result.Data.StoreID)
+			}
+			if tc.wantSuccess {
+				assert.Equal(t, productID, result.Data.ProductID)
+			} else {
+				assert.Empty(t, result.Data.ProductID)
+			}
+			assert.Equal(t, tc.wantRequests, requests)
+			assert.NotContains(t, response.Body.String(), keys.PrivateKey)
+		})
+	}
+}
+
+func TestWalletCreemCheckoutDoesNotFollowRedirects(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   int
+		location string
+	}{
+		{"cross_origin_302", http.StatusFound, "https://other.example.invalid/forwarded"},
+		{"cross_origin_307", http.StatusTemporaryRedirect, "https://other.example.invalid/forwarded"},
+		{"scheme_downgrade_307", http.StatusTemporaryRedirect, "http://api.creem.io/forwarded"},
+		{"same_origin_308", http.StatusPermanentRedirect, "https://api.creem.io/forwarded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, keys := walletCheckoutFixture(t)
+			setting.CreemProducts = `[{"productId":"fixture","name":"Wallet fixture","price":100,"currency":"USD","quota":1000}]`
+			router.POST("/creem-pay", func(c *gin.Context) { c.Set("id", 902) }, RequestCreemPay)
+			observed := make(chan string, 1)
+			var received, leakedCredential atomic.Int32
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				received.Add(1)
+				if request.URL.Path == "/v1/checkouts" {
+					var checkout CreemCheckoutRequest
+					if !assert.NoError(t, common.DecodeJson(request.Body, &checkout)) {
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					observed <- checkout.RequestId
+					w.Header().Set("Location", tc.location)
+					w.WriteHeader(tc.status)
+					return
+				}
+				if request.Header.Get("x-api-key") == "fixture" {
+					leakedCredential.Add(1)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"forwarded-checkout","checkout_url":"https://other.example.invalid/payment"}`)
+			}))
+			defer provider.Close()
+			endpoint, err := url.Parse(provider.URL)
+			require.NoError(t, err)
+			originalTransport := http.DefaultTransport
+			t.Cleanup(func() { http.DefaultTransport = originalTransport })
+			localTransport := &http.Transport{DisableKeepAlives: true}
+			defer localTransport.CloseIdleConnections()
+			http.DefaultTransport = walletCheckoutTransport(func(request *http.Request) (*http.Response, error) {
+				local := request.Clone(request.Context())
+				local.URL.Scheme, local.URL.Host = endpoint.Scheme, endpoint.Host
+				return localTransport.RoundTrip(local)
+			})
+			request := httptest.NewRequest(http.MethodPost, "/creem-pay", strings.NewReader(`{"product_id":"fixture","payment_method":"creem"}`))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			var originalOrder string
+			select {
+			case originalOrder = <-observed:
+			default:
+				t.Fatal("checkout did not reach the original provider endpoint")
+			}
+			assert.EqualValues(t, 1, received.Load(), "credential-bearing checkout must not be forwarded after a redirect")
+			assert.Zero(t, leakedCredential.Load(), "redirect destination must never receive the merchant API key")
+			var result struct {
+				Message string `json:"message"`
+				TradeNo string `json:"trade_no"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			assert.Equal(t, "error", result.Message)
+			assert.Equal(t, originalOrder, result.TradeNo, "the first endpoint may have accepted the order; preserve its identity")
+			assert.NotContains(t, response.Body.String(), "other.example.invalid/payment")
+			var order model.TopUp
+			require.NoError(t, model.DB.Where("trade_no = ?", originalOrder).First(&order).Error)
+			assert.Equal(t, common.TopUpStatusPending, order.Status)
+			var buyer, inviter model.User
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			assert.Equal(t, -10, buyer.Quota)
+			for range 2 {
+				callback := httptest.NewRecorder()
+				router.ServeHTTP(callback, walletWebhookRequest(t, keys, model.PaymentProviderCreem, originalOrder, "9000", true))
+				assert.Equal(t, http.StatusOK, callback.Code)
+			}
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			assert.Equal(t, 990, buyer.Quota)
+			assert.Equal(t, 107, inviter.AffQuota)
+			assert.Equal(t, 111, inviter.AffHistoryQuota)
+			var count int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Where("top_up_id = ?", order.Id).Count(&count).Error)
+			assert.EqualValues(t, 1, count)
+		})
+	}
+}
+
+func TestWalletWaffoHTTPTransportPreservesCheckoutBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		redirect int
+	}{
+		{name: "signed_success"},
+		{name: "cross_origin_302", redirect: http.StatusFound},
+		{name: "cross_origin_307", redirect: http.StatusTemporaryRedirect},
+		{name: "cross_origin_308", redirect: http.StatusPermanentRedirect},
+		{name: "request_read_timeout"},
+		{name: "context_cancelled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, keys := walletCheckoutFixture(t)
+			oldPrice, oldMinimum := setting.WaffoUnitPrice, setting.WaffoMinTopUp
+			setting.WaffoUnitPrice, setting.WaffoMinTopUp = 1, 1
+			t.Cleanup(func() { setting.WaffoUnitPrice, setting.WaffoMinTopUp = oldPrice, oldMinimum })
+			var forwarded, leakedCredential atomic.Int32
+			destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				forwarded.Add(1)
+				if request.Header.Get("X-API-KEY") == "fixture" {
+					leakedCredential.Add(1)
+				}
+				w.WriteHeader(http.StatusUnauthorized)
+			}))
+			defer destination.Close()
+			observed := make(chan string, 1)
+			arrived, release := make(chan struct{}), make(chan struct{})
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				body, err := io.ReadAll(request.Body)
+				if !assert.NoError(t, err) {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				assert.Equal(t, "fixture", request.Header.Get("X-API-KEY"))
+				assert.True(t, waffoutils.Verify(string(body), request.Header.Get("X-SIGNATURE"), keys.PublicKey))
+				var checkout order.CreateOrderParams
+				if !assert.NoError(t, common.Unmarshal(body, &checkout)) {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				observed <- checkout.PaymentRequestID
+				close(arrived)
+				if tc.redirect != 0 {
+					w.Header().Set("Location", destination.URL+"/forwarded")
+					w.WriteHeader(tc.redirect)
+					return
+				}
+				if tc.name == "request_read_timeout" || tc.name == "context_cancelled" {
+					<-release
+					return
+				}
+				response, err := common.Marshal(map[string]any{"code": "0", "data": order.CreateOrderData{
+					PaymentRequestID: checkout.PaymentRequestID, MerchantOrderID: checkout.MerchantOrderID,
+					OrderAction: `{"actionType":"REDIRECT","webUrl":"https://checkout.example.invalid/waffo"}`,
+				}})
+				if !assert.NoError(t, err) {
+					return
+				}
+				signature, err := waffoutils.Sign(string(response), keys.PrivateKey)
+				if !assert.NoError(t, err) {
+					return
+				}
+				w.Header().Set("X-SIGNATURE", signature)
+				_, _ = w.Write(response)
+			}))
+			defer provider.Close()
+			inquiryTransport := service.WaffoHTTPTransport
+			httpTransport := service.NewWaffoHTTPTransport(1000, 1000)
+			service.WaffoHTTPTransport = walletWaffoSDKTransport(func(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+				local := *request
+				local.URL = provider.URL + "/order/create"
+				if tc.name == "request_read_timeout" {
+					local.ReadTimeout = 100
+				}
+				if tc.name == "context_cancelled" {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithCancel(ctx)
+					defer cancel()
+					go func() {
+						select {
+						case <-arrived:
+							cancel()
+						case <-ctx.Done():
+						}
+					}()
+				}
+				response, err := httpTransport.Send(ctx, &local)
+				if tc.name == "request_read_timeout" {
+					var timeout net.Error
+					if assert.ErrorAs(t, err, &timeout) {
+						assert.True(t, timeout.Timeout())
+					}
+				} else if tc.name == "context_cancelled" {
+					assert.ErrorIs(t, err, context.Canceled)
+				}
+				return response, err
+			})
+			router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestWaffoPay)
+			request := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(`{"amount":100}`))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			close(release)
+			var originalOrder string
+			select {
+			case originalOrder = <-observed:
+			default:
+				t.Fatal("checkout did not reach its original provider endpoint")
+			}
+			assert.Zero(t, forwarded.Load(), "the merchant-authenticated API must not follow redirects")
+			assert.Zero(t, leakedCredential.Load(), "the redirect destination must not receive the API key")
+			var result struct {
+				Message    string
+				TradeNo    string `json:"trade_no"`
+				MessageKey string `json:"message_key"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			if tc.name == "signed_success" {
+				assert.Equal(t, "success", result.Message)
+				assert.Contains(t, response.Body.String(), "checkout.example.invalid/waffo")
+			} else {
+				assert.Equal(t, "error", result.Message)
+				assert.Equal(t, originalOrder, result.TradeNo)
+				assert.Equal(t, "Payment request result is unknown. Check Order History before trying again.", result.MessageKey)
+			}
+			stored, err := model.GetTopUpByTradeNoWithError(originalOrder)
+			require.NoError(t, err)
+			assert.Equal(t, common.TopUpStatusPending, stored.Status)
+			var buyer, inviter model.User
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			assert.Equal(t, -10, buyer.Quota)
+			service.WaffoHTTPTransport = inquiryTransport
+			for range 2 {
+				callback := httptest.NewRecorder()
+				router.ServeHTTP(callback, walletWebhookRequest(t, keys, model.PaymentProviderWaffo, originalOrder, "90", true))
+				assert.JSONEq(t, `{"message":"success"}`, callback.Body.String())
+			}
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			assert.Equal(t, 990, buyer.Quota)
+			assert.Equal(t, 107, inviter.AffQuota)
+			assert.Equal(t, 111, inviter.AffHistoryQuota)
+			var count int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Where("top_up_id = ?", stored.Id).Count(&count).Error)
+			assert.EqualValues(t, 1, count)
+		})
+	}
+}
+
+func TestWalletStripeCheckoutDoesNotFollowRedirects(t *testing.T) {
+	for _, status := range []int{http.StatusFound, http.StatusTemporaryRedirect} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			router, keys := walletCheckoutFixture(t)
+			router.POST("/stripe-pay", func(c *gin.Context) { c.Set("id", 902) }, RequestStripePay)
+			var forwarded, leakedCredential atomic.Int32
+			destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				forwarded.Add(1)
+				if request.Header.Get("Authorization") == "Bearer "+setting.StripeApiSecret {
+					leakedCredential.Add(1)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"forwarded_checkout","object":"checkout.session","url":"https://checkout.example.invalid/forwarded"}`)
+			}))
+			defer destination.Close()
+			observed := make(chan string, 1)
+			provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				if !assert.Equal(t, "/v1/checkout/sessions", request.URL.Path) || !assert.NoError(t, request.ParseForm()) {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				assert.True(t, request.Header.Get("Authorization") == "Bearer "+setting.StripeApiSecret)
+				observed <- request.Form.Get("client_reference_id")
+				w.Header().Set("Location", destination.URL+"/forwarded")
+				w.WriteHeader(status)
+			}))
+			defer provider.Close()
+			original := stripe.GetBackend(stripe.APIBackend)
+			t.Cleanup(func() { stripe.SetBackend(stripe.APIBackend, original) })
+			providerClient := provider.Client()
+			shared := stripe.GetBackendWithConfig(stripe.APIBackend, &stripe.BackendConfig{URL: stripe.String(provider.URL), HTTPClient: providerClient, MaxNetworkRetries: stripe.Int64(0), EnableTelemetry: stripe.Bool(false)})
+			stripe.SetBackend(stripe.APIBackend, shared)
+			request := httptest.NewRequest(http.MethodPost, "/stripe-pay", strings.NewReader(`{"amount":100,"payment_method":"stripe"}`))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			var tradeNo string
+			select {
+			case tradeNo = <-observed:
+			default:
+				t.Fatal("original Stripe checkout was not requested")
+			}
+			require.NotEmpty(t, tradeNo)
+			assert.Zero(t, forwarded.Load(), "Stripe wallet checkout must not follow HTTPS-to-HTTP redirects")
+			assert.Zero(t, leakedCredential.Load(), "redirect destination must not receive the merchant Authorization header")
+			assert.Nil(t, providerClient.CheckRedirect, "wallet redirect policy must not mutate the shared SDK client")
+			var result struct {
+				Message string `json:"message"`
+				TradeNo string `json:"trade_no"`
+			}
+			require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+			assert.Equal(t, "error", result.Message)
+			assert.Equal(t, tradeNo, result.TradeNo)
+			assert.NotContains(t, response.Body.String(), "/forwarded")
+			var order model.TopUp
+			require.NoError(t, model.DB.Where("trade_no = ?", tradeNo).First(&order).Error)
+			assert.Equal(t, common.TopUpStatusPending, order.Status)
+			var buyer, inviter model.User
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			assert.Equal(t, -10, buyer.Quota)
+			for range 2 {
+				callback := httptest.NewRecorder()
+				router.ServeHTTP(callback, walletWebhookRequest(t, keys, model.PaymentProviderStripe, tradeNo, "9000", true))
+				assert.Equal(t, http.StatusOK, callback.Code)
+			}
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			assert.Equal(t, 990, buyer.Quota)
+			assert.Equal(t, 107, inviter.AffQuota)
+			var rebates int64
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Where("top_up_id = ?", order.Id).Count(&rebates).Error)
+			assert.EqualValues(t, 1, rebates)
 		})
 	}
 }

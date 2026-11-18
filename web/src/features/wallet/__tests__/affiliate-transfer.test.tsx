@@ -1988,6 +1988,95 @@ test('deleting an unresolved durable key in another tab retains and retries the 
   expect(localStorage.getItem(key)).toBeNull()
 })
 
+test.each([
+  'higher minimum',
+  'lower rewards',
+  'paused compliance',
+  'paused compliance with an unpersisted rejection',
+])(
+  'an unresolved transfer after %s keeps its original identity until a durable server result',
+  async (change) => {
+    const operation = {
+      request_id: 'original-before-settings-change',
+      quota: 500000,
+    }
+    const key = `new-api:affiliate-transfer:1:${operation.request_id}`
+    const persisted =
+      change !== 'paused compliance with an unpersisted rejection'
+    localStorage.setItem(key, JSON.stringify(operation))
+    if (change === 'higher minimum') {
+      useSystemConfigStore.getState().setConfig({
+        currency: { ...DEFAULT_CURRENCY_CONFIG, quotaPerUnit: 1000000 },
+      })
+    }
+    const posts: unknown[] = []
+    const successToast = vi.spyOn(toast, 'success')
+    vi.spyOn(api, 'request').mockImplementation(async (config) => {
+      if (config.method === 'post') {
+        posts.push(config.data)
+        return {
+          data: {
+            success: false,
+            message_key: 'Invalid parameters',
+            data: {
+              transfer_status: 'rejected',
+              result_persisted: persisted,
+              ...operation,
+            },
+          },
+        }
+      }
+      if (config.url?.includes('/aff_transfer/')) {
+        return success({ found: false, transfer: null })
+      }
+      if (config.url === '/api/user/aff') return success('invite-first')
+      return success({
+        ...summary,
+        aff_quota: change === 'lower rewards' ? '0' : summary.aff_quota,
+        compliance_confirmed: !change.startsWith('paused compliance'),
+      })
+    })
+    mountCard()
+    await screen.findByRole('textbox', { name: 'Invitation link' })
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Check transfer result' })
+    )
+    const dialog = within(
+      await screen.findByRole('dialog', { name: 'Transfer Rewards' })
+    )
+    const retry = dialog.getByRole('button', {
+      name: 'Retry original transfer',
+    })
+    expect(retry).toBeDisabled()
+    expect(
+      dialog.getByRole('spinbutton', { name: 'Transfer Amount' })
+    ).toBeDisabled()
+    await userEvent.click(
+      dialog.getByRole('button', { name: 'Check transfer result' })
+    )
+    await waitFor(() => expect(retry).toBeEnabled())
+    await userEvent.click(retry)
+    if (persisted) {
+      await waitFor(() => expect(localStorage.getItem(key)).toBeNull())
+      if (change === 'higher minimum') {
+        fireEvent.change(
+          dialog.getByRole('spinbutton', { name: 'Transfer Amount' }),
+          {
+            target: { value: '0.5' },
+          }
+        )
+      }
+      expect(dialog.getByRole('button', { name: 'Transfer' })).toBeDisabled()
+    } else {
+      await waitFor(() => expect(retry).toBeDisabled())
+      expect(localStorage.getItem(key)).toBe(JSON.stringify(operation))
+      expect(dialog.getByText(operation.request_id)).toBeVisible()
+    }
+    expect(posts).toEqual([operation])
+    expect(successToast).not.toHaveBeenCalledWith('Transfer successful')
+  }
+)
+
 test.each(['confirmed', 'rejected'] as const)(
   'another tab retires a %s key while local cleanup failed without deleting its next operation',
   async (terminal) => {

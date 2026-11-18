@@ -84,15 +84,20 @@ export function TransferDialog({
     pending &&
     parseAffiliateTransferQuota(String(pendingAmount)) !== pending.quota
   const canTransfer =
-    complianceConfirmed &&
     !storageError &&
     !confirmed &&
     !rejected &&
-    Number.isFinite(Number(amount)) &&
     Number.isSafeInteger(transferQuota) &&
-    (!pending || checkedAbsent === true) &&
-    transferQuota >= minimumQuota &&
-    transferQuota <= availableQuota
+    transferQuota > 0 &&
+    // Recover the original identity even if current eligibility changed. The
+    // server returns its committed result or persists the current rejection;
+    // applying new-transfer limits here would leave an absent result stuck.
+    (pending
+      ? checkedAbsent === true
+      : complianceConfirmed &&
+        Number.isFinite(Number(amount)) &&
+        transferQuota >= minimumQuota &&
+        transferQuota <= availableQuota)
 
   useEffect(() => {
     if (open) {

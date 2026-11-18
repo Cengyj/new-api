@@ -499,11 +499,16 @@ func shouldRetryStripeSubscriptionEvent(event stripe.Event, err error) bool {
 
 // The SDK's error logger includes provider response bodies. Keep its configured
 // transport, retry and telemetry behavior, while silencing only these checkout
-// calls. Revisit this adapter when upgrading the SDK's deprecated backend type.
+// calls. Redirects must not forward checkout credentials or accept a session
+// from another endpoint. Revisit this adapter when upgrading the SDK's
+// deprecated backend type.
 func stripeCheckoutBackend() stripe.Backend {
 	backend := stripe.GetBackend(stripe.APIBackend)
 	if sdkBackend, ok := backend.(*stripe.BackendImplementation); ok {
 		local := *sdkBackend
+		client := *sdkBackend.HTTPClient
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		local.HTTPClient = &client
 		local.LeveledLogger = &stripe.LeveledLogger{Level: stripe.LevelNull}
 		return &local
 	}

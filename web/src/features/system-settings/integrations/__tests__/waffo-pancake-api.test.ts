@@ -16,9 +16,11 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { act, render, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { AxiosError, AxiosHeaders, type AxiosAdapter } from 'axios'
-import { createElement } from 'react'
+import i18next from 'i18next'
+import { createElement, StrictMode } from 'react'
+import { toast } from 'sonner'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
 
 import {
@@ -26,6 +28,7 @@ import {
   listWaffoPancakeCatalog,
   saveWaffoPancakeConfig,
 } from '@/features/system-settings/integrations/waffo-pancake-api'
+import zh from '@/i18n/locales/zh.json'
 import { api } from '@/lib/api'
 import { applyAuthBundle, clearAuthentication } from '@/lib/auth-session'
 import type { AuthBundle } from '@/stores/auth-store'
@@ -54,11 +57,13 @@ beforeEach(() => applyAuthBundle(adminBundle, false))
 const originalAdapter = api.defaults.adapter
 const catalogPath = '/api/option/waffo-pancake/catalog'
 
-afterEach(() => {
+afterEach(async () => {
   api.defaults.adapter = originalAdapter
   clearAuthentication(false)
   vi.useRealTimers()
   vi.restoreAllMocks()
+  await i18next.changeLanguage('en')
+  i18next.removeResourceBundle('zh', 'translation')
 })
 
 test.each([
@@ -327,5 +332,296 @@ test.each(['typed credentials', 'saved credentials'] as const)(
 
     expect(adapter).not.toHaveBeenCalled()
     expect(select).not.toHaveBeenCalled()
+  }
+)
+
+test.each(['edited credentials', 'cleared credentials', 'unmounted form'])(
+  'a catalog response cannot replace the binding after %s',
+  async (change) => {
+    vi.useFakeTimers()
+    let release!: () => void
+    const responseReady = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const adapter = vi.fn<AxiosAdapter>(async (config) => {
+      const { merchant_id: merchant } = JSON.parse(config.data as string) as {
+        merchant_id: string
+      }
+      if (!merchant) await responseReady
+      return {
+        config,
+        data: {
+          message: 'success',
+          data: {
+            stores: [
+              {
+                id: merchant ? 'new-store' : 'old-store',
+                name: merchant ? 'New store' : 'Old store',
+                status: 'active',
+                prodEnabled: false,
+                onetimeProducts: [
+                  {
+                    id: merchant ? 'new-product' : 'old-product',
+                    name: merchant ? 'New product' : 'Old product',
+                    status: 'active',
+                  },
+                ],
+              },
+            ],
+          },
+        },
+        status: 200,
+        statusText: 'OK',
+        headers: new AxiosHeaders(),
+      }
+    })
+    api.defaults.adapter = adapter
+    const defaults = {
+      WaffoPancakeMerchantID: 'saved-merchant',
+      WaffoPancakePrivateKey: '',
+      WaffoPancakeReturnURL: 'https://gateway.example.com',
+    }
+    const select = vi.fn()
+    const props = {
+      defaultValues: defaults,
+      values: defaults,
+      onValueChange: vi.fn(),
+      selectedBinding: { storeID: 'saved-store', productID: 'saved-product' },
+      savedBinding: { storeID: 'saved-store', productID: 'saved-product' },
+      onSelectedBindingChange: select,
+    }
+    const view = render(createElement(WaffoPancakeSettingsSection, props))
+    await act(async () => vi.advanceTimersByTimeAsync(0))
+    expect(adapter).toHaveBeenCalledTimes(1)
+
+    if (change === 'unmounted form') {
+      view.unmount()
+    } else {
+      view.rerender(
+        createElement(WaffoPancakeSettingsSection, {
+          ...props,
+          values: {
+            ...defaults,
+            WaffoPancakeMerchantID:
+              change === 'cleared credentials' ? '' : 'new-merchant',
+            WaffoPancakePrivateKey:
+              change === 'cleared credentials' ? '' : 'new-private-key',
+          },
+        })
+      )
+    }
+    await act(async () => release())
+    expect(select).not.toHaveBeenCalled()
+
+    if (change === 'edited credentials') {
+      await act(async () => vi.advanceTimersByTimeAsync(800))
+      expect(adapter).toHaveBeenCalledTimes(2)
+      expect(select).toHaveBeenCalledExactlyOnceWith({
+        storeID: 'new-store',
+        productID: 'new-product',
+      })
+    }
+  }
+)
+
+test('saved credentials still load their catalog after a StrictMode effect restart', async () => {
+  vi.useFakeTimers()
+  const adapter = vi.fn<AxiosAdapter>(async (config) => ({
+    config,
+    data: { message: 'success', data: { stores: [] } },
+    status: 200,
+    statusText: 'OK',
+    headers: new AxiosHeaders(),
+  }))
+  api.defaults.adapter = adapter
+  const values = {
+    WaffoPancakeMerchantID: 'saved-merchant',
+    WaffoPancakePrivateKey: '',
+    WaffoPancakeReturnURL: 'https://gateway.example.com',
+  }
+  const select = vi.fn()
+  render(
+    createElement(
+      StrictMode,
+      null,
+      createElement(WaffoPancakeSettingsSection, {
+        defaultValues: values,
+        values,
+        onValueChange: vi.fn(),
+        selectedBinding: { storeID: '', productID: '' },
+        savedBinding: { storeID: '', productID: '' },
+        onSelectedBindingChange: select,
+      })
+    )
+  )
+  await act(async () => vi.advanceTimersByTimeAsync(0))
+  expect(adapter).toHaveBeenCalledTimes(1)
+  expect(select).toHaveBeenCalledExactlyOnceWith({
+    storeID: '',
+    productID: '',
+  })
+})
+
+test('restoring saved credentials reloads their catalog after discarding a typed draft', async () => {
+  vi.useFakeTimers()
+  const adapter = vi.fn<AxiosAdapter>(async (config) => ({
+    config,
+    data: { message: 'success', data: { stores: [] } },
+    status: 200,
+    statusText: 'OK',
+    headers: new AxiosHeaders(),
+  }))
+  api.defaults.adapter = adapter
+  const values = {
+    WaffoPancakeMerchantID: 'saved-merchant',
+    WaffoPancakePrivateKey: '',
+    WaffoPancakeReturnURL: 'https://gateway.example.com',
+  }
+  const select = vi.fn()
+  const props = {
+    defaultValues: values,
+    values,
+    onValueChange: vi.fn(),
+    selectedBinding: { storeID: '', productID: '' },
+    savedBinding: { storeID: '', productID: '' },
+    onSelectedBindingChange: select,
+  }
+  const view = render(createElement(WaffoPancakeSettingsSection, props))
+  await act(async () => vi.advanceTimersByTimeAsync(0))
+  expect(adapter).toHaveBeenCalledTimes(1)
+  view.rerender(
+    createElement(WaffoPancakeSettingsSection, {
+      ...props,
+      values: { ...values, WaffoPancakeMerchantID: 'discarded-draft' },
+    })
+  )
+  view.rerender(createElement(WaffoPancakeSettingsSection, props))
+  await act(async () => vi.advanceTimersByTimeAsync(0))
+  expect(adapter).toHaveBeenCalledTimes(2)
+  expect(select).toHaveBeenCalledTimes(2)
+  expect(JSON.parse(adapter.mock.calls[1][0].data as string)).toEqual({
+    merchant_id: '',
+    private_key: '',
+  })
+})
+
+test('an old merchant pair creation cannot bind its result after credentials change', async () => {
+  vi.useFakeTimers()
+  let release!: () => void
+  const pairReady = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const adapter = vi.fn<AxiosAdapter>(async (config) => {
+    const pair = config.url?.endsWith('/pair')
+    if (pair) await pairReady
+    return {
+      config,
+      data: {
+        message: 'success',
+        data: pair
+          ? { store_id: 'old-created-store', product_id: 'old-created-product' }
+          : { stores: [] },
+      },
+      status: 200,
+      statusText: 'OK',
+      headers: new AxiosHeaders(),
+    }
+  })
+  api.defaults.adapter = adapter
+  const defaults = {
+    WaffoPancakeMerchantID: 'saved-merchant',
+    WaffoPancakePrivateKey: '',
+    WaffoPancakeReturnURL: 'https://gateway.example.com',
+  }
+  const select = vi.fn()
+  const props = {
+    defaultValues: defaults,
+    values: defaults,
+    onValueChange: vi.fn(),
+    selectedBinding: { storeID: '', productID: '' },
+    savedBinding: { storeID: '', productID: '' },
+    onSelectedBindingChange: select,
+  }
+  const view = render(createElement(WaffoPancakeSettingsSection, props))
+  await act(async () => vi.advanceTimersByTimeAsync(0))
+  select.mockClear()
+  await act(async () =>
+    fireEvent.click(
+      screen.getByRole('button', { name: /Create new-api-store/ })
+    )
+  )
+  expect(adapter).toHaveBeenCalledTimes(2)
+  view.rerender(
+    createElement(WaffoPancakeSettingsSection, {
+      ...props,
+      values: {
+        ...defaults,
+        WaffoPancakeMerchantID: 'new-merchant',
+        WaffoPancakePrivateKey: 'new-private-key',
+      },
+    })
+  )
+  await act(async () => release())
+  expect(adapter).toHaveBeenCalledTimes(2)
+  expect(select).not.toHaveBeenCalled()
+  expect(
+    screen.getByRole('button', { name: /Create new-api-store/ })
+  ).toBeEnabled()
+})
+
+test.each([true, false])(
+  'pair creation preserves the orphan store and translated error when message_key is %s',
+  async (translated) => {
+    vi.useFakeTimers()
+    i18next.addResourceBundle('zh', 'translation', zh.translation)
+    await i18next.changeLanguage('zh')
+    const errorToast = vi.spyOn(toast, 'error').mockImplementation(() => '')
+    api.defaults.adapter = async (config) => ({
+      config,
+      data: config.url?.endsWith('/pair')
+        ? {
+            message: 'error',
+            ...(translated ? { message_key: 'Invalid response' } : {}),
+            data: {
+              orphan_store: true,
+              store_id: 'recoverable-store',
+              error: translated
+                ? 'create primary product: Invalid response'
+                : 'Remote catalog busy',
+            },
+          }
+        : { message: 'success', data: { stores: [] } },
+      status: 200,
+      statusText: 'OK',
+      headers: new AxiosHeaders(),
+    })
+    const values = {
+      WaffoPancakeMerchantID: 'saved-merchant',
+      WaffoPancakePrivateKey: '',
+      WaffoPancakeReturnURL: 'https://gateway.example.com',
+    }
+    const select = vi.fn()
+    render(
+      createElement(WaffoPancakeSettingsSection, {
+        defaultValues: values,
+        values,
+        onValueChange: vi.fn(),
+        selectedBinding: { storeID: '', productID: '' },
+        savedBinding: { storeID: '', productID: '' },
+        onSelectedBindingChange: select,
+      })
+    )
+    await act(async () => vi.advanceTimersByTimeAsync(0))
+    select.mockClear()
+    await act(async () =>
+      fireEvent.click(screen.getByRole('button', { name: /new-api-store/ }))
+    )
+    expect(select).toHaveBeenCalledExactlyOnceWith({
+      storeID: 'recoverable-store',
+      productID: '',
+    })
+    expect(errorToast).toHaveBeenCalledExactlyOnceWith(
+      `${zh.translation['Creation failed']}: ${translated ? zh.translation['Invalid response'] : 'Remote catalog busy'}`
+    )
   }
 )

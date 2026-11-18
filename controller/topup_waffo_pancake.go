@@ -143,8 +143,8 @@ func SaveWaffoPancake(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message": "success",
 		"data": gin.H{
-			"product_id": setting.WaffoPancakeProductID,
-			"store_id":   setting.WaffoPancakeStoreID,
+			"product_id": strings.TrimSpace(req.ProductID),
+			"store_id":   strings.TrimSpace(req.StoreID),
 		},
 	})
 }
@@ -200,7 +200,14 @@ func CreateWaffoPancakePair(c *gin.Context) {
 			data["store_name"] = result.StoreName
 			data["orphan_store"] = true
 		}
-		c.JSON(http.StatusOK, gin.H{"success": false, "message": "error", "data": data})
+		response := gin.H{"success": false, "message": "error", "data": data}
+		var message *common.Message
+		if errors.As(err, &message) {
+			for key, value := range message.Fields() {
+				response[key] = value
+			}
+		}
+		c.JSON(http.StatusOK, response)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{

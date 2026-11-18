@@ -1043,3 +1043,86 @@ func TestAffiliateTransferRejectedIdentityCannotBecomeMoney(t *testing.T) {
 	assert.Equal(t, 105, current.AffQuota)
 	assert.Equal(t, 105, current.AffHistoryQuota)
 }
+
+func TestAffiliateTransferMinimumMessageKeepsWalletPrecision(t *testing.T) {
+	setupAffiliateTransferCompliance(t)
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		for _, tc := range []struct {
+			name            string
+			unit            float64
+			minimum         int
+			unrepresentable bool
+		}{
+			{"large_wallet_unit", 3_000_000_000, 3_000_000_000, false},
+			{"fractional_unit", 10.25, 11, false},
+			{"unrepresentable_unit", common.MaxWalletQuota + 1, 1, true},
+		} {
+			t.Run(dialect+"/"+tc.name, func(t *testing.T) {
+				db, _ := newReferralIntegrationDatabase(t, dialect)
+				previousDB, previousUnit, previousRedis := DB, common.QuotaPerUnit, common.RedisEnabled
+				previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+				general := operation_setting.GetGeneralSetting()
+				previousDisplay := general.QuotaDisplayType
+				DB, common.QuotaPerUnit, common.RedisEnabled = db, tc.unit, false
+				general.QuotaDisplayType = operation_setting.QuotaDisplayTypeTokens
+				kind := map[string]common.DatabaseType{"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL}[dialect]
+				common.SetDatabaseTypes(kind, kind)
+				t.Cleanup(func() {
+					DB, common.QuotaPerUnit, common.RedisEnabled = previousDB, previousUnit, previousRedis
+					general.QuotaDisplayType = previousDisplay
+					common.SetDatabaseTypes(previousMain, previousLog)
+				})
+				require.NoError(t, db.AutoMigrate(&User{}, &AffiliateTransfer{}))
+				owner := User{Username: "precise-minimum-owner", AffCode: "precise-minimum-owner", Status: common.UserStatusEnabled, Quota: 7, AffQuota: tc.minimum * 2, AffHistoryQuota: tc.minimum * 2}
+				require.NoError(t, db.Create(&owner).Error)
+				const requestID = "precise-minimum-rejected"
+				if tc.unrepresentable {
+					result, err := owner.TransferAffQuotaToQuota(1, requestID)
+					require.ErrorIs(t, err, ErrWalletQuotaLimitExceeded)
+					assert.Nil(t, result)
+					var rejected *AffiliateTransferRejectedError
+					assert.False(t, errors.As(err, &rejected), "an unrepresentable configuration is not a durable business rejection")
+					known, err := GetAffiliateTransfer(owner.Id, requestID)
+					require.NoError(t, err)
+					assert.Nil(t, known)
+					require.NoError(t, db.First(&owner, owner.Id).Error)
+					assert.Equal(t, 7, owner.Quota)
+					assert.Equal(t, 2, owner.AffQuota)
+					// A technical failure leaves the original identity retryable;
+					// preserve the existing zero-unit minimum compatibility too.
+					common.QuotaPerUnit = 0
+					result, err = owner.TransferAffQuotaToQuota(1, requestID)
+					require.NoError(t, err)
+					require.NotNil(t, result)
+					require.NoError(t, db.First(&owner, owner.Id).Error)
+					assert.Equal(t, 8, owner.Quota)
+					assert.Equal(t, 1, owner.AffQuota)
+					assert.Equal(t, 2, owner.AffHistoryQuota)
+					return
+				}
+				result, err := owner.TransferAffQuotaToQuota(tc.minimum-1, requestID)
+				var rejected *AffiliateTransferRejectedError
+				require.ErrorAs(t, err, &rejected)
+				require.True(t, rejected.Persisted)
+				require.NotNil(t, result)
+				var message *common.Message
+				require.ErrorAs(t, err, &message)
+				assert.Equal(t, "Minimum transfer quota is {{min}}!", message.Key)
+				assert.Equal(t, strconv.Itoa(tc.minimum), message.Params["min"], "the message must state the least accepted integer wallet amount")
+				common.QuotaPerUnit = 1
+				repeated, err := owner.TransferAffQuotaToQuota(tc.minimum-1, requestID)
+				require.ErrorAs(t, err, &rejected)
+				require.ErrorAs(t, err, &message)
+				assert.Equal(t, result.ID, repeated.ID)
+				assert.Equal(t, strconv.Itoa(tc.minimum), message.Params["min"], "a committed rejection retains the original minimum after configuration changes")
+				common.QuotaPerUnit = tc.unit
+				_, err = owner.TransferAffQuotaToQuota(tc.minimum, "precise-minimum-accepted")
+				require.NoError(t, err)
+				require.NoError(t, db.First(&owner, owner.Id).Error)
+				assert.Equal(t, tc.minimum+7, owner.Quota)
+				assert.Equal(t, tc.minimum, owner.AffQuota)
+				assert.Equal(t, tc.minimum*2, owner.AffHistoryQuota)
+			})
+		}
+	}
+}

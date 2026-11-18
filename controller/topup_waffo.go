@@ -65,7 +65,7 @@ func (snapshot waffoConfigSnapshot) newSDK() (*waffo.Waffo, error) {
 	}
 	cfg.CustomTransport = service.WaffoHTTPTransport
 	if cfg.CustomTransport == nil {
-		cfg.CustomTransport = waffonet.NewDefaultHttpTransportWithTimeouts(cfg.ConnectTimeout, cfg.ReadTimeout)
+		cfg.CustomTransport = service.NewWaffoHTTPTransport(cfg.ConnectTimeout, cfg.ReadTimeout)
 	}
 	cfg.CustomTransport = waffoResponseTransport{transport: cfg.CustomTransport}
 	return waffo.New(cfg), nil

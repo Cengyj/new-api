@@ -8,6 +8,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/shopspring/decimal"
 	"gorm.io/gorm"
 )
 
@@ -138,8 +139,19 @@ func (user *User) TransferAffQuotaToQuota(quota int, requestID string) (*Affilia
 		compliant := operation_setting.IsPaymentComplianceConfirmed()
 		minimum := common.QuotaPerUnit
 		minimumLabel := ""
+		var minimumErr error
 		if float64(quota) < minimum {
-			minimumLabel = logger.FormatQuota(common.QuotaFromFloat(minimum))
+			// State the least accepted integer wallet amount. The consumption
+			// converter truncates fractions and saturates at the smaller int32 cap.
+			if minimum > common.MaxWalletQuota {
+				minimumErr = ErrWalletQuotaLimitExceeded
+			} else {
+				var minimumQuota int
+				minimumQuota, minimumErr = common.WalletQuotaFromDecimalStrict(decimal.NewFromFloat(minimum).Ceil())
+				if minimumErr == nil {
+					minimumLabel = logger.FormatQuota(minimumQuota)
+				}
+			}
 		}
 		common.OptionMapRWMutex.RUnlock()
 		var rejection *common.Message
@@ -149,6 +161,9 @@ func (user *User) TransferAffQuotaToQuota(quota int, requestID string) (*Affilia
 		case quota <= 0 || quota > common.MaxWalletQuota, current.Status != common.UserStatusEnabled:
 			rejection = common.NewMessage("Invalid parameters")
 		case float64(quota) < minimum:
+			if minimumErr != nil {
+				return minimumErr
+			}
 			rejection = common.NewMessage("Minimum transfer quota is {{min}}!", map[string]any{"min": minimumLabel})
 		case current.AffQuota < quota:
 			rejection = common.NewMessage("Invitation quota is insufficient!")

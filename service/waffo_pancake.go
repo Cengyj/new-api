@@ -139,9 +139,18 @@ func newWaffoPancakeClientFromCreds(merchantID, privateKey string) (*pancake.Cli
 	if strings.TrimSpace(merchantID) == "" || strings.TrimSpace(privateKey) == "" {
 		return nil, fmt.Errorf("merchant id and private key are required")
 	}
+	// Configuration probes use the same HTTP success boundary as checkout
+	// and inquiry; SDK v0.3.1 can otherwise return data from HTTP failures.
+	httpClient := *http.DefaultClient
+	transport := httpClient.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	httpClient.Transport = &waffoPancakeResponseTransport{transport: transport}
 	return pancake.New(pancake.Config{
 		MerchantID: merchantID,
 		PrivateKey: privateKey,
+		HTTPClient: &httpClient,
 	})
 }
 
@@ -477,6 +486,9 @@ func CreateWaffoPancakePrimaryStore(ctx context.Context, merchantID, privateKey 
 	if err != nil {
 		return "", fmt.Errorf("create Waffo Pancake store: %w", err)
 	}
+	if storeRes == nil || strings.TrimSpace(storeRes.Store.ID) == "" {
+		return "", common.NewMessage("Invalid response")
+	}
 	return storeRes.Store.ID, nil
 }
 
@@ -552,15 +564,21 @@ func CreateWaffoPancakePrimaryProduct(ctx context.Context, merchantID, privateKe
 		return "", fmt.Errorf("create Waffo Pancake product: %w", err)
 	}
 	productID := prodRes.Product.ID
-	if _, err := client.OnetimeProducts.Publish(ctx, pancake.PublishOnetimeProductParams{ID: productID}); err != nil {
+	published, err := client.OnetimeProducts.Publish(ctx, pancake.PublishOnetimeProductParams{ID: productID})
+	if err != nil {
 		return "", fmt.Errorf("publish Waffo Pancake product: %w", err)
+	}
+	// SDK v0.3.1 returns an empty result when a successful HTTP response
+	// omits data. Only publication of this exact product completes the pair.
+	if published == nil || published.Product.ID != productID {
+		return "", common.NewMessage("Invalid response")
 	}
 	return productID, nil
 }
 
 // WaffoPancakePairResult is the response of CreateWaffoPancakePrimaryPair.
-// When OrphanStore is true the store was created but the product wasn't,
-// so the caller can surface a partial-failure message with StoreID.
+// When OrphanStore is true the store was created, but product creation or
+// publication was not confirmed. Keep StoreID for catalog lookup and recovery.
 type WaffoPancakePairResult struct {
 	StoreID     string
 	StoreName   string
@@ -675,6 +693,9 @@ func ListWaffoPancakeCatalog(ctx context.Context, merchantID, privateKey string)
 	if len(resp.Errors) > 0 {
 		return nil, fmt.Errorf("waffo pancake catalog query returned %d errors: %s",
 			len(resp.Errors), resp.Errors[0].Message)
+	}
+	if resp.Data.Stores == nil {
+		return nil, fmt.Errorf("waffo pancake catalog response is missing stores")
 	}
 	// Drop non-active products. Operators should only see items they can
 	// actually bind without later hitting "product unavailable" at checkout.

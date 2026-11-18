@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/alicebob/miniredis/v2"
 	miniredisserver "github.com/alicebob/miniredis/v2/server"
 	"github.com/go-redis/redis/v8"
@@ -2357,186 +2358,262 @@ func TestReferralWalletRecoversExpiredPendingCreditsAfterRedisRestart(t *testing
 		t.Skip("set isolated Redis address and dedicated new-api-test-cache-* restart container")
 	}
 	require.True(t, strings.HasPrefix(container, "new-api-test-cache-"))
-	previousDB, previousClient := DB, common.RDB
-	previousRedis, previousBatch := common.RedisEnabled, common.BatchUpdateEnabled
-	previousUnit, previousFrequency := common.QuotaPerUnit, common.SyncFrequency
-	common.RedisEnabled, common.BatchUpdateEnabled = false, false
-	common.QuotaPerUnit, common.SyncFrequency = 1, 60
-	t.Cleanup(func() {
-		DB, common.RDB = previousDB, previousClient
-		common.RedisEnabled, common.BatchUpdateEnabled = previousRedis, previousBatch
-		common.QuotaPerUnit, common.SyncFrequency = previousUnit, previousFrequency
-	})
-	inviter, invitee := referralFixture(t, 1000)
-	require.NoError(t, DB.AutoMigrate(&AffiliateTransfer{}))
-	client := redis.NewClient(&redis.Options{Addr: address, DB: 12, PoolSize: 1, MaxRetries: -1})
-	require.NoError(t, client.Ping(t.Context()).Err())
-	common.RDB, common.RedisEnabled = client, true
-	keys := []string{
-		getUserCacheKey(invitee.Id), getUserAuthFenceKey(invitee.Id), getUserAuthVersionKey(invitee.Id), getWalletCacheFillKey(invitee.Id),
-		getUserCacheKey(inviter.Id), getUserAuthFenceKey(inviter.Id), getUserAuthVersionKey(inviter.Id), getWalletCacheFillKey(inviter.Id),
-	}
-	exists, err := client.Exists(t.Context(), keys...).Result()
-	require.NoError(t, err)
-	require.Zero(t, exists, "never overwrite another Redis fixture")
-	t.Cleanup(func() {
-		// Fixture disposal only: recovery below must observe natural expiration.
-		assert.NoError(t, client.Del(context.Background(), keys...).Err())
-		assert.NoError(t, client.Close())
-	})
-	for _, userID := range []int{invitee.Id, inviter.Id} {
-		cached, err := GetUserCache(userID)
-		require.NoError(t, err)
-		require.Zero(t, cached.Quota)
-	}
-	unavailable := redis.NewClient(&redis.Options{Addr: address, DB: 12, MaxRetries: -1})
-	require.NoError(t, unavailable.Close())
-	commits := 0
-	interrupted := DB.Session(&gorm.Session{Context: t.Context()})
-	interrupted.Statement.ConnPool = creditCommitPool{ConnPool: previousDB.Statement.ConnPool, afterCommit: func() error {
-		commits++
-		common.RDB = unavailable
-		return nil
-	}}
-	credit := 10000
-	order := TopUp{UserId: invitee.Id, TradeNo: "restart-ttl-pending-credit", CreditedQuota: &credit, PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending}
-	require.NoError(t, order.Insert())
-	DB = interrupted
-	settled, credited, duplicate, err := settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", TopUpSettlementAudit{Source: "payment"})
-	require.Error(t, err, "SQL commits before the cache finalization failure")
-	require.NotNil(t, settled)
-	require.False(t, duplicate)
-	require.Equal(t, credit, credited)
-	DB, common.RDB = previousDB, client
-	require.NoError(t, DB.First(&order, order.Id).Error)
-	require.NotNil(t, order.SettlementAudit)
-	firstSettlement := *order.SettlementAudit
-	const requestID = "restart-ttl-original-transfer"
-	DB = interrupted
-	transfer, err := inviter.TransferAffQuotaToQuota(250, requestID)
-	require.Error(t, err)
-	require.NotNil(t, transfer)
-	DB, common.RDB = previousDB, client
-	require.Equal(t, 2, commits)
-	markers := map[int]string{
-		invitee.Id: "WalletCredit:topup:" + strconv.Itoa(order.Id),
-		inviter.Id: "WalletCredit:affiliate:" + requestID,
-	}
-	for userID, marker := range markers {
-		value, err := client.HGet(t.Context(), getUserCacheKey(userID), marker).Result()
-		require.NoError(t, err)
-		require.NotEmpty(t, value)
-		require.NotEqual(t, "done", value)
-		quota, err := client.HGet(t.Context(), getUserCacheKey(userID), "Quota").Int()
-		require.NoError(t, err)
-		require.Zero(t, quota)
-	}
-	before, err := client.Info(t.Context(), "server").Result()
-	require.NoError(t, err)
-	_, beforeSuffix, found := strings.Cut(before, "run_id:")
-	require.True(t, found)
-	beforeID, _, _ := strings.Cut(beforeSuffix, "\r\n")
-	require.NoError(t, client.Save(t.Context()).Err())
-	output, err := exec.CommandContext(t.Context(), "docker", "restart", container).CombinedOutput()
-	require.NoError(t, err, "%s", output)
-	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		output, err := exec.CommandContext(t.Context(), "docker", "exec", container, "redis-cli", "PING").CombinedOutput()
-		assert.NoError(collect, err, "%s", output)
-		assert.Equal(collect, "PONG", strings.TrimSpace(string(output)))
-	}, 15*time.Second, 100*time.Millisecond, "wait for Redis to finish loading its persisted dataset")
-	after, err := client.Info(t.Context(), "server").Result()
-	if err != nil {
-		require.ErrorIs(t, err, io.EOF)
-		after, err = client.Info(t.Context(), "server").Result()
-	}
-	require.NoError(t, err)
-	_, afterSuffix, found := strings.Cut(after, "run_id:")
-	require.True(t, found)
-	afterID, _, _ := strings.Cut(afterSuffix, "\r\n")
-	require.NotEqual(t, beforeID, afterID)
-	t.Logf("real Redis restart changed run ID from %s to %s; SQL transactions committed=%d", beforeID, afterID, commits)
-	var remaining time.Duration
-	for _, user := range []User{invitee, inviter} {
-		key := getUserCacheKey(user.Id)
-		storedRun, err := client.HGet(t.Context(), key, "WalletRedisRunID").Result()
-		require.NoError(t, err)
-		require.Equal(t, beforeID, storedRun)
-		ttl, err := client.PTTL(t.Context(), key).Result()
-		require.NoError(t, err)
-		require.Positive(t, ttl)
-		require.LessOrEqual(t, ttl, time.Minute, "use the application's unshortened default TTL")
-		beforeHash, err := client.HGetAll(t.Context(), key).Result()
-		require.NoError(t, err)
-		require.NotEmpty(t, beforeHash[markers[user.Id]])
-		require.NotEqual(t, "done", beforeHash[markers[user.Id]])
-		require.Equal(t, "0", beforeHash["Quota"])
-		_, err = GetUserCache(user.Id)
-		require.ErrorIs(t, err, ErrWalletCacheRecoveryRequired)
-		require.ErrorIs(t, updateUserCache(user), ErrWalletCacheRecoveryRequired)
-		afterHash, err := client.HGetAll(t.Context(), key).Result()
-		require.NoError(t, err)
-		assert.Equal(t, beforeHash, afterHash, "rejected reads and metadata updates must not change the restored hash")
-		afterTTL, err := client.PTTL(t.Context(), key).Result()
-		require.NoError(t, err)
-		require.Positive(t, afterTTL)
-		assert.LessOrEqual(t, afterTTL, ttl, "old-run metadata cannot renew the expiry")
-		t.Logf("restored %s: pending marker=%s, quota=%s, TTL before rejection=%s, after=%s", key, beforeHash[markers[user.Id]], beforeHash["Quota"], ttl, afterTTL)
-		remaining = max(remaining, afterTTL)
-	}
-	_, _, duplicate, err = settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", TopUpSettlementAudit{Source: "payment"})
-	require.True(t, duplicate)
-	require.ErrorIs(t, err, ErrWalletCacheRecoveryRequired)
-	foundTransfer, err := GetAffiliateTransfer(inviter.Id, requestID)
-	require.NotNil(t, foundTransfer)
-	require.Equal(t, transfer.ID, foundTransfer.ID)
-	require.ErrorIs(t, err, ErrWalletCacheRecoveryRequired)
-	// Wait for the observed real TTL, without DEL, EXPIRE, run-ID rewriting,
-	// or manually rebasing SQL/cache quota. This fixture has no other writers.
-	timer := time.NewTimer(remaining + time.Millisecond)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-	case <-t.Context().Done():
-		t.Fatal(t.Context().Err())
-	}
-	exists, err = client.Exists(t.Context(), keys[0], keys[4]).Result()
-	require.NoError(t, err)
-	require.Zero(t, exists, "both restored balances and pending markers must expire naturally")
-	for range 2 {
-		_, _, duplicate, err = settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", TopUpSettlementAudit{Source: "payment"})
-		require.NoError(t, err)
-		require.True(t, duplicate)
-		foundTransfer, err = GetAffiliateTransfer(inviter.Id, requestID)
-		require.NoError(t, err)
-		require.Equal(t, transfer, foundTransfer)
-		retried, err := inviter.TransferAffQuotaToQuota(250, requestID)
-		require.NoError(t, err)
-		require.Equal(t, transfer, retried)
-		for userID, expectedQuota := range map[int]int{invitee.Id: 10000, inviter.Id: 250} {
-			cached, err := GetUserCache(userID)
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			db, _ := newReferralIntegrationDatabase(t, dialect)
+			previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
+			previousLogDB := LOG_DB
+			kind := map[string]common.DatabaseType{"sqlite": common.DatabaseTypeSQLite, "mysql": common.DatabaseTypeMySQL, "postgres": common.DatabaseTypePostgreSQL}[dialect]
+			common.SetDatabaseTypes(kind, kind)
+			t.Cleanup(func() {
+				common.SetDatabaseTypes(previousMain, previousLog)
+				LOG_DB = previousLogDB
+			})
+			previousDB, previousClient := DB, common.RDB
+			previousRedis, previousBatch := common.RedisEnabled, common.BatchUpdateEnabled
+			previousUnit, previousFrequency := common.QuotaPerUnit, common.SyncFrequency
+			common.RedisEnabled, common.BatchUpdateEnabled = false, false
+			common.QuotaPerUnit, common.SyncFrequency = 1, 60
+			t.Cleanup(func() {
+				DB, common.RDB = previousDB, previousClient
+				common.RedisEnabled, common.BatchUpdateEnabled = previousRedis, previousBatch
+				common.QuotaPerUnit, common.SyncFrequency = previousUnit, previousFrequency
+			})
+			DB, LOG_DB = db, db
+			require.NoError(t, db.AutoMigrate(&User{}, &TopUp{}, &Option{}, &ReferralRebate{}, &AffiliateTransfer{}, &SubscriptionOrder{}, &Log{}))
+			previousPayment := *operation_setting.GetPaymentSetting()
+			operation_setting.GetPaymentSetting().ComplianceConfirmed = true
+			operation_setting.GetPaymentSetting().ComplianceTermsVersion = operation_setting.CurrentComplianceTermsVersion
+			t.Cleanup(func() { *operation_setting.GetPaymentSetting() = previousPayment })
+			require.NoError(t, InitializeReferralRebateRule(db))
+			require.NoError(t, SaveReferralRebateRule(ReferralRebateRule{Enabled: true, RateBPS: 1000, ValidDays: 1}))
+			inviter := User{Username: "restart-inviter", AffCode: "restart-inviter", Status: common.UserStatusEnabled}
+			require.NoError(t, db.Create(&inviter).Error)
+			invitee := User{Username: "restart-invitee", AffCode: "restart-invitee", Status: common.UserStatusEnabled, InviterId: inviter.Id, CreatedAt: time.Now().Unix(), ReferralRateBPS: 1000, ReferralExpiresAt: time.Now().Unix() + 86400}
+			require.NoError(t, db.Create(&invitee).Error)
+			client := redis.NewClient(&redis.Options{Addr: address, DB: 12, PoolSize: 1, MaxRetries: -1})
+			require.NoError(t, client.Ping(t.Context()).Err())
+			common.RDB, common.RedisEnabled = client, true
+			keys := []string{
+				getUserCacheKey(invitee.Id), getUserAuthFenceKey(invitee.Id), getUserAuthVersionKey(invitee.Id), getWalletCacheFillKey(invitee.Id),
+				getUserCacheKey(inviter.Id), getUserAuthFenceKey(inviter.Id), getUserAuthVersionKey(inviter.Id), getWalletCacheFillKey(inviter.Id),
+			}
+			exists, err := client.Exists(t.Context(), keys...).Result()
 			require.NoError(t, err)
-			assert.Equal(t, expectedQuota, cached.Quota)
-			storedRun, err := client.HGet(t.Context(), getUserCacheKey(userID), "WalletRedisRunID").Result()
+			require.Zero(t, exists, "never overwrite another Redis fixture")
+			t.Cleanup(func() {
+				// Fixture disposal only: recovery below must observe natural expiration.
+				assert.NoError(t, client.Del(context.Background(), keys...).Err())
+				assert.NoError(t, client.Close())
+			})
+			for _, userID := range []int{invitee.Id, inviter.Id} {
+				cached, err := GetUserCache(userID)
+				require.NoError(t, err)
+				require.Zero(t, cached.Quota)
+			}
+			unavailable := redis.NewClient(&redis.Options{Addr: address, DB: 12, MaxRetries: -1})
+			require.NoError(t, unavailable.Close())
+			connection, err := db.DB()
 			require.NoError(t, err)
-			assert.Equal(t, afterID, storedRun)
-		}
+			commits := 0
+			interrupted := DB.Session(&gorm.Session{Context: t.Context()})
+			interrupted.Statement.ConnPool = creditCommitPool{ConnPool: connection, afterCommit: func() error {
+				commits++
+				common.RDB = unavailable
+				return nil
+			}}
+			credit := 10000
+			order := TopUp{UserId: invitee.Id, TradeNo: "restart-ttl-pending-credit", CreditedQuota: &credit, PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending}
+			require.NoError(t, order.Insert())
+			DB = interrupted
+			settled, credited, duplicate, err := settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", TopUpSettlementAudit{Source: "payment"})
+			require.Error(t, err, "SQL commits before the cache finalization failure")
+			require.NotNil(t, settled)
+			require.False(t, duplicate)
+			require.Equal(t, credit, credited)
+			DB, common.RDB = db, client
+			require.NoError(t, DB.First(&order, order.Id).Error)
+			require.NotNil(t, order.SettlementAudit)
+			firstSettlement := *order.SettlementAudit
+			const requestID = "restart-ttl-original-transfer"
+			DB = interrupted
+			transfer, err := inviter.TransferAffQuotaToQuota(250, requestID)
+			require.Error(t, err)
+			require.NotNil(t, transfer)
+			DB, common.RDB = db, client
+			require.Equal(t, 2, commits)
+			markers := map[int]string{
+				invitee.Id: "WalletCredit:topup:" + strconv.Itoa(order.Id),
+				inviter.Id: "WalletCredit:affiliate:" + requestID,
+			}
+			for userID, marker := range markers {
+				value, err := client.HGet(t.Context(), getUserCacheKey(userID), marker).Result()
+				require.NoError(t, err)
+				require.NotEmpty(t, value)
+				require.NotEqual(t, "done", value)
+				quota, err := client.HGet(t.Context(), getUserCacheKey(userID), "Quota").Int()
+				require.NoError(t, err)
+				require.Zero(t, quota)
+			}
+			before, err := client.Info(t.Context(), "server").Result()
+			require.NoError(t, err)
+			_, beforeSuffix, found := strings.Cut(before, "run_id:")
+			require.True(t, found)
+			beforeID, _, _ := strings.Cut(beforeSuffix, "\r\n")
+			require.NoError(t, client.Save(t.Context()).Err())
+			output, err := exec.CommandContext(t.Context(), "docker", "stop", container).CombinedOutput()
+			require.NoError(t, err, "%s", output)
+			t.Cleanup(func() {
+				output, err := exec.Command("docker", "start", container).CombinedOutput()
+				assert.NoError(t, err, "%s", output)
+			})
+			require.Error(t, client.Ping(t.Context()).Err(), "the real dedicated Redis must be unavailable")
+			blockedCredit := 100
+			blockedOrder := TopUp{UserId: invitee.Id, TradeNo: "redis-down-original-order", CreditedQuota: &blockedCredit, PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending}
+			require.NoError(t, blockedOrder.Insert())
+			_, err = RechargeEpay(blockedOrder.TradeNo, "", "")
+			require.Error(t, err, "pre-commit coordination must reject a genuinely stopped Redis")
+			require.NoError(t, db.First(&blockedOrder, blockedOrder.Id).Error)
+			assert.Equal(t, common.TopUpStatusPending, blockedOrder.Status)
+			assert.Zero(t, blockedOrder.CompleteTime)
+			const blockedRequestID = "redis-down-original-transfer"
+			_, err = inviter.TransferAffQuotaToQuota(100, blockedRequestID)
+			require.Error(t, err)
+			var blockedTransferCount int64
+			require.NoError(t, db.Model(&AffiliateTransfer{}).Where("request_id = ?", blockedRequestID).Count(&blockedTransferCount).Error)
+			assert.Zero(t, blockedTransferCount, "a technical coordination failure is not a persisted rejection")
+			require.NoError(t, db.First(&invitee, invitee.Id).Error)
+			require.NoError(t, db.First(&inviter, inviter.Id).Error)
+			assert.Equal(t, 10000, invitee.Quota)
+			assert.Equal(t, 250, inviter.Quota)
+			assert.Equal(t, 750, inviter.AffQuota)
+			assert.Equal(t, 1000, inviter.AffHistoryQuota)
+			t.Log("real Redis stopped: new original top-up and transfer both rolled back without a durable outcome")
+			output, err = exec.CommandContext(t.Context(), "docker", "start", container).CombinedOutput()
+			require.NoError(t, err, "%s", output)
+			require.EventuallyWithT(t, func(collect *assert.CollectT) {
+				output, err := exec.CommandContext(t.Context(), "docker", "exec", container, "redis-cli", "PING").CombinedOutput()
+				assert.NoError(collect, err, "%s", output)
+				assert.Equal(collect, "PONG", strings.TrimSpace(string(output)))
+				assert.NoError(collect, client.Ping(t.Context()).Err(), "the published endpoint must be reachable from the application process")
+			}, 15*time.Second, 100*time.Millisecond, "wait for Redis and its published endpoint to finish restarting")
+			after, err := client.Info(t.Context(), "server").Result()
+			if err != nil {
+				require.ErrorIs(t, err, io.EOF)
+				after, err = client.Info(t.Context(), "server").Result()
+			}
+			require.NoError(t, err)
+			_, afterSuffix, found := strings.Cut(after, "run_id:")
+			require.True(t, found)
+			afterID, _, _ := strings.Cut(afterSuffix, "\r\n")
+			require.NotEqual(t, beforeID, afterID)
+			t.Logf("real Redis restart changed run ID from %s to %s; SQL transactions committed=%d", beforeID, afterID, commits)
+			var remaining time.Duration
+			for _, user := range []User{invitee, inviter} {
+				key := getUserCacheKey(user.Id)
+				storedRun, err := client.HGet(t.Context(), key, "WalletRedisRunID").Result()
+				require.NoError(t, err)
+				require.Equal(t, beforeID, storedRun)
+				ttl, err := client.PTTL(t.Context(), key).Result()
+				require.NoError(t, err)
+				require.Positive(t, ttl)
+				require.LessOrEqual(t, ttl, time.Minute, "use the application's unshortened default TTL")
+				beforeHash, err := client.HGetAll(t.Context(), key).Result()
+				require.NoError(t, err)
+				require.NotEmpty(t, beforeHash[markers[user.Id]])
+				require.NotEqual(t, "done", beforeHash[markers[user.Id]])
+				require.Equal(t, "0", beforeHash["Quota"])
+				_, err = GetUserCache(user.Id)
+				require.ErrorIs(t, err, ErrWalletCacheRecoveryRequired)
+				require.ErrorIs(t, updateUserCache(user), ErrWalletCacheRecoveryRequired)
+				afterHash, err := client.HGetAll(t.Context(), key).Result()
+				require.NoError(t, err)
+				assert.Equal(t, beforeHash, afterHash, "rejected reads and metadata updates must not change the restored hash")
+				afterTTL, err := client.PTTL(t.Context(), key).Result()
+				require.NoError(t, err)
+				require.Positive(t, afterTTL)
+				assert.LessOrEqual(t, afterTTL, ttl, "old-run metadata cannot renew the expiry")
+				t.Logf("restored %s: pending marker=%s, quota=%s, TTL before rejection=%s, after=%s", key, beforeHash[markers[user.Id]], beforeHash["Quota"], ttl, afterTTL)
+				remaining = max(remaining, afterTTL)
+			}
+			_, _, duplicate, err = settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", TopUpSettlementAudit{Source: "payment"})
+			require.True(t, duplicate)
+			require.ErrorIs(t, err, ErrWalletCacheRecoveryRequired)
+			foundTransfer, err := GetAffiliateTransfer(inviter.Id, requestID)
+			require.NotNil(t, foundTransfer)
+			require.Equal(t, transfer.ID, foundTransfer.ID)
+			require.ErrorIs(t, err, ErrWalletCacheRecoveryRequired)
+			// Wait for the observed real TTL, without DEL, EXPIRE, run-ID rewriting,
+			// or manually rebasing SQL/cache quota. This fixture has no other writers.
+			timer := time.NewTimer(remaining + time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-t.Context().Done():
+				t.Fatal(t.Context().Err())
+			}
+			exists, err = client.Exists(t.Context(), keys[0], keys[4]).Result()
+			require.NoError(t, err)
+			require.Zero(t, exists, "both restored balances and pending markers must expire naturally")
+			for range 2 {
+				_, _, duplicate, err = settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", TopUpSettlementAudit{Source: "payment"})
+				require.NoError(t, err)
+				require.True(t, duplicate)
+				foundTransfer, err = GetAffiliateTransfer(inviter.Id, requestID)
+				require.NoError(t, err)
+				require.Equal(t, transfer, foundTransfer)
+				retried, err := inviter.TransferAffQuotaToQuota(250, requestID)
+				require.NoError(t, err)
+				require.Equal(t, transfer, retried)
+				for userID, expectedQuota := range map[int]int{invitee.Id: 10000, inviter.Id: 250} {
+					cached, err := GetUserCache(userID)
+					require.NoError(t, err)
+					assert.Equal(t, expectedQuota, cached.Quota)
+					storedRun, err := client.HGet(t.Context(), getUserCacheKey(userID), "WalletRedisRunID").Result()
+					require.NoError(t, err)
+					assert.Equal(t, afterID, storedRun)
+				}
+			}
+			require.NoError(t, DB.First(&invitee, invitee.Id).Error)
+			require.NoError(t, DB.First(&inviter, inviter.Id).Error)
+			assert.Equal(t, 10000, invitee.Quota)
+			assert.Equal(t, 250, inviter.Quota)
+			assert.Equal(t, 750, inviter.AffQuota)
+			assert.Equal(t, 1000, inviter.AffHistoryQuota)
+			require.NoError(t, DB.First(&order, order.Id).Error)
+			assert.Equal(t, common.TopUpStatusSuccess, order.Status)
+			require.NotNil(t, order.SettlementAudit)
+			assert.Equal(t, firstSettlement, *order.SettlementAudit)
+			var rebates, transfers int64
+			require.NoError(t, DB.Model(&ReferralRebate{}).Count(&rebates).Error)
+			require.NoError(t, DB.Model(&AffiliateTransfer{}).Count(&transfers).Error)
+			assert.EqualValues(t, 1, rebates)
+			assert.EqualValues(t, 1, transfers)
+			t.Logf("recovered original identities after natural expiry: invitee quota=%d, inviter quota=%d, aff=%d, history=%d, rebate facts=%d, transfers=%d", invitee.Quota, inviter.Quota, inviter.AffQuota, inviter.AffHistoryQuota, rebates, transfers)
+			for range 2 {
+				_, err := RechargeEpay(blockedOrder.TradeNo, "", "")
+				require.NoError(t, err)
+				_, err = inviter.TransferAffQuotaToQuota(100, blockedRequestID)
+				require.NoError(t, err)
+			}
+			require.NoError(t, db.First(&invitee, invitee.Id).Error)
+			require.NoError(t, db.First(&inviter, inviter.Id).Error)
+			assert.Equal(t, 10100, invitee.Quota)
+			assert.Equal(t, 350, inviter.Quota)
+			assert.Equal(t, 660, inviter.AffQuota)
+			assert.Equal(t, 1010, inviter.AffHistoryQuota)
+			require.NoError(t, db.Model(&ReferralRebate{}).Count(&rebates).Error)
+			require.NoError(t, db.Model(&AffiliateTransfer{}).Count(&transfers).Error)
+			assert.EqualValues(t, 2, rebates)
+			assert.EqualValues(t, 2, transfers)
+			for _, user := range []User{invitee, inviter} {
+				cached, err := GetUserCache(user.Id)
+				require.NoError(t, err)
+				assert.Equal(t, user.Quota, cached.Quota)
+			}
+			t.Log("original identities rejected during Redis downtime recovered exactly once after the same natural-expiry recovery")
+		})
 	}
-	require.NoError(t, DB.First(&invitee, invitee.Id).Error)
-	require.NoError(t, DB.First(&inviter, inviter.Id).Error)
-	assert.Equal(t, 10000, invitee.Quota)
-	assert.Equal(t, 250, inviter.Quota)
-	assert.Equal(t, 750, inviter.AffQuota)
-	assert.Equal(t, 1000, inviter.AffHistoryQuota)
-	require.NoError(t, DB.First(&order, order.Id).Error)
-	assert.Equal(t, common.TopUpStatusSuccess, order.Status)
-	require.NotNil(t, order.SettlementAudit)
-	assert.Equal(t, firstSettlement, *order.SettlementAudit)
-	var rebates, transfers int64
-	require.NoError(t, DB.Model(&ReferralRebate{}).Count(&rebates).Error)
-	require.NoError(t, DB.Model(&AffiliateTransfer{}).Count(&transfers).Error)
-	assert.EqualValues(t, 1, rebates)
-	assert.EqualValues(t, 1, transfers)
-	t.Logf("recovered original identities after natural expiry: invitee quota=%d, inviter quota=%d, aff=%d, history=%d, rebate facts=%d, transfers=%d", invitee.Quota, inviter.Quota, inviter.AffQuota, inviter.AffHistoryQuota, rebates, transfers)
 }
 
 // The peer executable is built from the preserved release source with this same

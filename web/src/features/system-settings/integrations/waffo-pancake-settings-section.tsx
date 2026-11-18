@@ -96,6 +96,22 @@ export function WaffoPancakeSettingsSection({
   // skips when nothing changed.
   const lastVerifiedSignature = React.useRef('')
   const fetchSerialRef = React.useRef(0)
+  const credentialsVersionRef = React.useRef(0)
+  const initialLoadRef = React.useRef(false)
+  const watchedMerchantID = values.WaffoPancakeMerchantID || ''
+  const watchedPrivateKey = values.WaffoPancakePrivateKey || ''
+
+  React.useEffect(() => {
+    setCatalog([])
+    setPhase('idle')
+    return () => {
+      // Invalidate immediately on edits or unmount, before another debounced
+      // request starts. Old catalog and creation results belong to old creds.
+      credentialsVersionRef.current += 1
+      lastVerifiedSignature.current = ''
+      initialLoadRef.current = false
+    }
+  }, [watchedMerchantID, watchedPrivateKey])
 
   // Mount-only — never re-sync from props after the first render. The
   // backend strips PrivateKey from GET /api/option/, so a re-sync would
@@ -150,12 +166,14 @@ export function WaffoPancakeSettingsSection({
       preselect?: { storeID?: string; productID?: string }
     ) => {
       const authIdentity = authenticationIdentity()
+      const credentialsVersion = credentialsVersionRef.current
       const serial = ++fetchSerialRef.current
       let stores: CatalogStore[]
       try {
         const body = await listWaffoPancakeCatalog(merchantID, privateKey)
         if (
           serial !== fetchSerialRef.current ||
+          credentialsVersion !== credentialsVersionRef.current ||
           authIdentity !== authenticationIdentity()
         ) {
           return
@@ -183,6 +201,7 @@ export function WaffoPancakeSettingsSection({
       } catch (err) {
         if (
           serial !== fetchSerialRef.current ||
+          credentialsVersion !== credentialsVersionRef.current ||
           authIdentity !== authenticationIdentity()
         ) {
           return
@@ -234,8 +253,6 @@ export function WaffoPancakeSettingsSection({
     [onSelectedBindingChange, productID, t]
   )
 
-  const watchedMerchantID = values.WaffoPancakeMerchantID || ''
-  const watchedPrivateKey = values.WaffoPancakePrivateKey || ''
   React.useEffect(() => {
     const m = watchedMerchantID.trim()
     const k = watchedPrivateKey.trim()
@@ -255,19 +272,30 @@ export function WaffoPancakeSettingsSection({
   // Initial-load verify: GET /api/option/ strips PrivateKey so a returning
   // admin opens the page with empty key. Send blank creds in the body —
   // the catalog controller falls back to the persisted OptionMap creds.
-  const initialLoadRef = React.useRef(false)
   React.useEffect(() => {
     if (initialLoadRef.current) return
     if (!defaultValues.WaffoPancakeMerchantID.trim()) return
-    initialLoadRef.current = true
+    if (
+      watchedMerchantID.trim() !==
+        defaultValues.WaffoPancakeMerchantID.trim() ||
+      watchedPrivateKey.trim()
+    ) {
+      return
+    }
     const authIdentity = authenticationIdentity()
     const timer = window.setTimeout(() => {
       if (!authIdentity || authIdentity !== authenticationIdentity()) return
+      initialLoadRef.current = true
       setPhase('verifying')
       void verifyAndFetchCatalog('', '')
     }, 0)
     return () => window.clearTimeout(timer)
-  }, [defaultValues.WaffoPancakeMerchantID, verifyAndFetchCatalog])
+  }, [
+    defaultValues.WaffoPancakeMerchantID,
+    watchedMerchantID,
+    watchedPrivateKey,
+    verifyAndFetchCatalog,
+  ])
 
   // Returns typed creds when the operator edited either field; otherwise
   // blanks so the backend falls back to persisted creds. Without this,
@@ -286,6 +314,7 @@ export function WaffoPancakeSettingsSection({
   // field, so we prompt before creating when that field is empty.
   const handleCreatePair = async () => {
     const authIdentity = authenticationIdentity()
+    const credentialsVersion = credentialsVersionRef.current
     if (!authIdentity) return
     if (!credsReady) {
       toast.error(
@@ -313,7 +342,12 @@ export function WaffoPancakeSettingsSection({
         privateKey,
         returnURL: trimmedReturn,
       })
-      if (authIdentity !== authenticationIdentity()) return
+      if (
+        authIdentity !== authenticationIdentity() ||
+        credentialsVersion !== credentialsVersionRef.current
+      ) {
+        return
+      }
       if (
         body?.message === 'success' &&
         typeof body.data === 'object' &&
@@ -327,7 +361,12 @@ export function WaffoPancakeSettingsSection({
           storeID: created.store_id,
           productID: created.product_id,
         })
-        if (authIdentity !== authenticationIdentity()) return
+        if (
+          authIdentity !== authenticationIdentity() ||
+          credentialsVersion !== credentialsVersionRef.current
+        ) {
+          return
+        }
         toast.success(
           `${t('Store + product created')}: ${created.store_id} / ${created.product_id}`
         )
@@ -343,11 +382,16 @@ export function WaffoPancakeSettingsSection({
           storeID: errData.store_id,
           productID: '',
         })
-        if (authIdentity !== authenticationIdentity()) return
+        if (
+          authIdentity !== authenticationIdentity() ||
+          credentialsVersion !== credentialsVersionRef.current
+        ) {
+          return
+        }
       }
       const reason =
-        errData?.error ??
         getPaymentErrorTranslation(body) ??
+        errData?.error ??
         (typeof body?.data === 'string' ? body.data : undefined)
       handleServerError(body, undefined, {
         title: reason
@@ -355,7 +399,12 @@ export function WaffoPancakeSettingsSection({
           : t('Creation failed'),
       })
     } catch (err) {
-      if (authIdentity !== authenticationIdentity()) return
+      if (
+        authIdentity !== authenticationIdentity() ||
+        credentialsVersion !== credentialsVersionRef.current
+      ) {
+        return
+      }
       handleServerError(
         err,
         `${t('Creation failed')}: ${err instanceof Error ? err.message : String(err)}`

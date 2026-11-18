@@ -456,6 +456,11 @@ func (config creemCheckoutConfig) link(ctx context.Context, referenceId string, 
 	// 发送请求
 	client := &http.Client{
 		Timeout: 30 * time.Second,
+		// Checkout uses a fixed API endpoint. Do not forward the merchant key
+		// or replay its POST after a redirect; the original outcome is unknown.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 	resp, err := client.Do(req)
 	if err != nil {
