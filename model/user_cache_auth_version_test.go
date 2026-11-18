@@ -1856,7 +1856,7 @@ func TestReferralWalletCreditRejectsDamagedCacheMetadataAcrossDatabases(t *testi
 	setupAffiliateTransferCompliance(t)
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		for _, operation := range []string{"topup", "transfer"} {
-			for _, damage := range []string{"missing_id", "wrong_id", "missing_schema", "old_schema", "quota:corrupted", "quota:01", "quota:+1", "quota:-0", "quota:9223372036854775808", "quota:-9223372036854775809"} {
+			for _, damage := range []string{"missing_id", "wrong_id", "decimal_id", "missing_schema", "old_schema", "exponent_schema", "quota:corrupted", "quota:01", "quota:+1", "quota:-0", "quota:9223372036854775808", "quota:-9223372036854775809"} {
 				t.Run(dialect+"/"+operation+"/"+damage, func(t *testing.T) {
 					db, _ := newReferralIntegrationDatabase(t, dialect)
 					previousDB, previousLogDB := DB, LOG_DB
@@ -1897,10 +1897,14 @@ func TestReferralWalletCreditRejectsDamagedCacheMetadataAcrossDatabases(t *testi
 						require.NoError(t, client.HDel(t.Context(), keys[0], "Id").Err())
 					case "wrong_id":
 						require.NoError(t, client.HSet(t.Context(), keys[0], "Id", userID+1).Err())
+					case "decimal_id":
+						require.NoError(t, client.HSet(t.Context(), keys[0], "Id", strconv.Itoa(userID)+".0").Err())
 					case "missing_schema":
 						require.NoError(t, client.HDel(t.Context(), keys[0], "CacheSchema").Err())
 					case "old_schema":
 						require.NoError(t, client.HSet(t.Context(), keys[0], "CacheSchema", 1).Err())
+					case "exponent_schema":
+						require.NoError(t, client.HSet(t.Context(), keys[0], "CacheSchema", strconv.Itoa(userCacheSchemaVersion)+"e0").Err())
 					default:
 						quota, ok := strings.CutPrefix(damage, "quota:")
 						require.True(t, ok)

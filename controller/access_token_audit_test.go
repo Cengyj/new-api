@@ -826,6 +826,13 @@ type releasedAuditLog struct {
 
 func (releasedAuditLog) TableName() string { return "logs" }
 
+func closeAuditTestPoolOnCleanup(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	connection, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, connection.Close()) })
+}
+
 // External tests create a new database per case on a loopback-only disposable
 // instance. They never drop databases or tables supplied through an environment variable.
 func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
@@ -834,6 +841,7 @@ func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
 		path := t.TempDir() + "/audit.db"
 		db, err := gorm.Open(sqlite.Open(path), &gorm.Config{})
 		require.NoError(t, err)
+		closeAuditTestPoolOnCleanup(t, db)
 		return db, path
 	}
 	require.NotEmpty(t, dsn)
@@ -867,24 +875,23 @@ func newAuditTestDatabase(t *testing.T, kind, dsn string) (*gorm.DB, string) {
 	}
 	admin, err := gorm.Open(original, &gorm.Config{})
 	require.NoError(t, err)
+	adminPool, err := admin.DB()
+	require.NoError(t, err)
+	adminPool.SetMaxIdleConns(0)
+	t.Cleanup(func() { assert.NoError(t, adminPool.Close()) })
 	// No IF NOT EXISTS: a collision fails before any test data can be written.
 	createSQL := "CREATE DATABASE " + name
 	if kind == "mysql" {
 		createSQL += " CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
 	}
 	require.NoError(t, admin.Exec(createSQL).Error)
-	sqlDB, err := admin.DB()
-	require.NoError(t, err)
-	require.NoError(t, sqlDB.Close())
+	// Drop only the generated database whose CREATE succeeded. Later cleanups
+	// close its handles first, including on setup or assertion failures.
+	t.Cleanup(func() { assert.NoError(t, admin.Exec("DROP DATABASE "+name).Error) })
 	db, err := gorm.Open(isolated, &gorm.Config{})
 	require.NoError(t, err)
 	t.Logf("isolated database: %s (%s)", name, kind)
-	t.Cleanup(func() {
-		connection, err := db.DB()
-		if err == nil {
-			_ = connection.Close()
-		}
-	})
+	closeAuditTestPoolOnCleanup(t, db)
 	return db, newDSN
 }
 
@@ -983,6 +990,9 @@ func verifyAuditJSONStorage(t *testing.T) {
 	assert.JSONEq(t, `{}`, string(empty))
 	for range 2 {
 		require.NoError(t, model.InitLogDB())
+		if model.LOG_DB != model.DB {
+			closeAuditTestPoolOnCleanup(t, model.LOG_DB)
+		}
 	}
 	entries, total, err = model.GetAuditLogs(filter, 0, 20, common.RoleRootUser)
 	require.NoError(t, err)
@@ -1076,6 +1086,7 @@ func TestAuditDatabaseMatrix(t *testing.T) {
 					}
 					for range 2 {
 						require.NoError(t, model.InitDB())
+						closeAuditTestPoolOnCleanup(t, model.DB)
 						require.NoError(t, model.InitLogDB())
 					}
 					if !upgrade {
@@ -1188,8 +1199,10 @@ func TestIndependentAuditLogStores(t *testing.T) {
 				}
 				t.Setenv("LOG_SQL_DSN", isolatedDSN)
 				t.Setenv("LOG_SQL_CLICKHOUSE_TTL_DAYS", "7")
-				require.NoError(t, model.InitLogDB())
-				require.NoError(t, model.InitLogDB())
+				for range 2 {
+					require.NoError(t, model.InitLogDB())
+					closeAuditTestPoolOnCleanup(t, model.LOG_DB)
+				}
 				if upgrade {
 					var old model.Log
 					require.NoError(t, model.LOG_DB.Where("request_id = ?", "legacy-split-request").Take(&old).Error)

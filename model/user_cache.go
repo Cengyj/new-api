@@ -392,8 +392,8 @@ local validQuota = quota == '0' or (magnitude and
 -- Metadata repair preserves an existing counter. Treating that counter as a
 -- cache miss would omit this credit's marker while later repair kept the old balance.
 if hasQuota and (not validQuota
-  or tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[1])
-  or tonumber(redis.call('HGET', KEYS[1], 'CacheSchema') or '0') ~= tonumber(ARGV[2])) then
+  or redis.call('HGET', KEYS[1], 'Id') ~= ARGV[1]
+  or redis.call('HGET', KEYS[1], 'CacheSchema') ~= ARGV[2]) then
   return redis.error_reply('WALLET_CACHE_RECOVERY_REQUIRED')
 end
 if not hasQuota then

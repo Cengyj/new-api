@@ -52,6 +52,7 @@ export function usePaymentOperation(onUnknownCheckout?: () => void) {
       activeController.current = controller
       const auth = useAuthStore.getState().auth
       let changed = false
+      let unresolvedOrder: string | undefined
       const unsubscribe = useAuthStore.subscribe((state) => {
         if (
           state.auth.user?.id !== auth.user?.id ||
@@ -76,35 +77,26 @@ export function usePaymentOperation(onUnknownCheckout?: () => void) {
             typeof source.trade_no === 'string' &&
             /^[a-zA-Z0-9_-]{1,128}$/.test(source.trade_no)
         )
-        if (unknownOrder && auth.user?.id) {
-          usePaymentRecoveryStore
-            .getState()
-            .remember(auth.user.id, unknownOrder.trade_no as string)
-          onUnknownCheckout?.()
-        }
-        const completed = handleResponse(response)
-        if (completed || unknownOrder || !auth.user?.id) return completed
-
-        // A created checkout whose redirect cannot be used still has a
-        // pending order. Preserve the local ID returned by the existing
-        // channel response, without treating it as proof of payment.
+        // Capture the reference before browser navigation, which can throw
+        // even when the server successfully created the checkout.
         const checkout = sources.find(
           (source) => source.success === true || source.message === 'success'
         )
         const data = checkout?.data
-        if (!data || typeof data !== 'object') return false
-        let tradeNo: unknown
-        if ('order_id' in data) tradeNo = data.order_id
-        else if ('out_trade_no' in data) tradeNo = data.out_trade_no
-        if (
-          typeof tradeNo !== 'string' ||
-          !/^[a-zA-Z0-9_-]{1,128}$/.test(tradeNo)
-        ) {
-          return false
+        let tradeNo = unknownOrder?.trade_no
+        if (!tradeNo && data && typeof data === 'object') {
+          if ('order_id' in data) tradeNo = data.order_id
+          else if ('out_trade_no' in data) tradeNo = data.out_trade_no
         }
-        usePaymentRecoveryStore.getState().remember(auth.user.id, tradeNo)
-        onUnknownCheckout?.()
-        return false
+        if (
+          typeof tradeNo === 'string' &&
+          /^[a-zA-Z0-9_-]{1,128}$/.test(tradeNo)
+        ) {
+          unresolvedOrder = tradeNo
+        }
+        const completed = handleResponse(response)
+        if (completed && !unknownOrder) unresolvedOrder = undefined
+        return completed
       } catch (error) {
         if (!mounted.current || changed) return false
         const status = isAxiosError(error) ? error.response?.status : undefined
@@ -123,6 +115,12 @@ export function usePaymentOperation(onUnknownCheckout?: () => void) {
         activeController.current = null
         pending.current = false
         if (mounted.current) setProcessing(false)
+        if (unresolvedOrder && mounted.current && !changed && auth.user?.id) {
+          usePaymentRecoveryStore
+            .getState()
+            .remember(auth.user.id, unresolvedOrder)
+          onUnknownCheckout?.()
+        }
       }
     },
     [onUnknownCheckout]

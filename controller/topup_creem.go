@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/QuantumNous/new-api/common"
@@ -85,7 +86,10 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 	}
 
 	// 解析产品列表
-	var products []CreemProduct
+	var products []struct {
+		CreemProduct
+		CurrencyJSON json.RawMessage `json:"currency"`
+	}
 	err := common.Unmarshal([]byte(productConfig), &products)
 	if err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Creem failed to parse product config user_id=%d error=%q", c.GetInt("id"), err.Error()))
@@ -97,13 +101,25 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 	var selectedProduct *CreemProduct
 	for _, product := range products {
 		if product.ProductId == req.ProductId {
-			selectedProduct = &product
+			// Only a missing currency has the historical USD default. A bad
+			// product must not prevent purchasing another valid catalog item.
+			if product.CurrencyJSON == nil {
+				product.Currency = "USD"
+			} else if err := common.Unmarshal(product.CurrencyJSON, &product.Currency); err != nil || (product.Currency != "USD" && product.Currency != "EUR") {
+				paymentError(c, common.NewMessage("Product configuration error"))
+				return
+			}
+			selectedProduct = &product.CreemProduct
 			break
 		}
 	}
 
 	if selectedProduct == nil {
 		paymentError(c, common.NewMessage("Product does not exist"))
+		return
+	}
+	if err := validateTopUpPaymentAmount(selectedProduct.Price); err != nil {
+		paymentError(c, common.NewMessage("Product configuration error"))
 		return
 	}
 
@@ -241,6 +257,7 @@ func CreemWebhook(c *gin.Context) {
 	common.OptionMapRWMutex.RLock()
 	secret := setting.CreemWebhookSecret
 	enabled := isCreemWebhookEnabled()
+	walletOnly := !isCreemTopUpEnabled()
 	common.OptionMapRWMutex.RUnlock()
 	if !enabled || strings.TrimSpace(secret) == "" {
 		logger.LogWarn(c.Request.Context(), common.LogText("Creem webhook rejected reason=webhook_disabled path=%q client_ip=%s", c.Request.URL.Path, c.ClientIP()))
@@ -290,6 +307,9 @@ func CreemWebhook(c *gin.Context) {
 	// 根据事件类型处理不同的webhook
 	switch webhookEvent.EventType {
 	case "checkout.completed":
+		if walletOnly && !requireIssuedWalletOrder(c, webhookEvent.Object.RequestId, model.PaymentProviderCreem) {
+			return
+		}
 		handleCheckoutCompleted(c, &webhookEvent)
 	default:
 		logger.LogInfo(c.Request.Context(), common.LogText("Creem webhook ignored event event_type=%s event_id=%s", webhookEvent.EventType, webhookEvent.Id))

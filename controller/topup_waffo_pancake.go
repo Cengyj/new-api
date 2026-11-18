@@ -474,6 +474,7 @@ func RequestWaffoPancakePay(c *gin.Context) {
 func WaffoPancakeWebhook(c *gin.Context) {
 	common.OptionMapRWMutex.RLock()
 	enabled := isWaffoPancakeWebhookEnabled()
+	walletOnly := !isWaffoPancakeTopUpEnabled()
 	common.OptionMapRWMutex.RUnlock()
 	if !enabled {
 		logger.LogWarn(c.Request.Context(), common.LogText("Waffo Pancake webhook rejected reason=webhook_disabled path=%q client_ip=%s", c.Request.URL.Path, c.ClientIP()))
@@ -532,6 +533,10 @@ func WaffoPancakeWebhook(c *gin.Context) {
 	isSubscription := strings.HasPrefix(rawTradeNo, "WAFFO_PANCAKE_SUB-")
 
 	if isSubscription {
+		if walletOnly {
+			c.String(http.StatusForbidden, "webhook disabled")
+			return
+		}
 		tradeNo, err := service.ResolveWaffoPancakeSubscriptionTradeNo(event)
 		if err != nil {
 			logger.LogError(c.Request.Context(), common.LogText(

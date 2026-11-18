@@ -251,7 +251,93 @@ func TestWalletWaffoCheckoutBindsSelectedMethodIdentity(t *testing.T) {
 	}
 }
 
-func TestStripeWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
+func TestWalletDelistingRejectsNewOrdersButSettlesIssuedOrders(t *testing.T) {
+	for _, provider := range []string{model.PaymentProviderStripe, model.PaymentProviderCreem, model.PaymentProviderWaffo, model.PaymentProviderWaffoPancake} {
+		t.Run(provider, func(t *testing.T) {
+			router, keys := walletCheckoutFixture(t)
+			original := walletWebhookOrder(t, provider, "issued_wallet_order")
+			var handler gin.HandlerFunc
+			var body string
+			switch provider {
+			case model.PaymentProviderStripe:
+				setting.StripePriceId = ""
+				for _, event := range []struct {
+					typeName string
+					status   int
+				}{
+					{"customer.created", http.StatusOK},
+					{"checkout.session.completed", http.StatusBadRequest},
+				} {
+					ack := httptest.NewRecorder()
+					router.ServeHTTP(ack, signedWalletWebhookRequest(t, keys, provider, map[string]any{"object": "event", "type": event.typeName}))
+					assert.Equal(t, event.status, ack.Code)
+				}
+				old := stripe.GetBackend(stripe.APIBackend)
+				t.Cleanup(func() { stripe.SetBackend(stripe.APIBackend, old) })
+				transport := walletCheckoutTransport(func(*http.Request) (*http.Response, error) {
+					t.Error("delisted Price reached Stripe")
+					return nil, errors.New("unexpected checkout")
+				})
+				stripe.SetBackend(stripe.APIBackend, stripe.GetBackendWithConfig(stripe.APIBackend, &stripe.BackendConfig{HTTPClient: &http.Client{Transport: transport}, MaxNetworkRetries: stripe.Int64(0), EnableTelemetry: stripe.Bool(false)}))
+				handler, body = RequestStripePay, `{"amount":100,"payment_method":"stripe"}`
+			case model.PaymentProviderCreem:
+				setting.CreemProducts = "[]"
+				handler, body = RequestCreemPay, `{"product_id":"fixture","payment_method":"creem"}`
+			case model.PaymentProviderWaffo:
+				setting.WaffoEnabled = false
+				handler, body = RequestWaffoPay, `{"amount":100}`
+			case model.PaymentProviderWaffoPancake:
+				setting.WaffoPancakeProductID = ""
+				handler, body = RequestWaffoPancakePay, `{"amount":100}`
+			}
+			router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, handler)
+			req := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			denied := httptest.NewRecorder()
+			router.ServeHTTP(denied, req)
+			assert.NotContains(t, denied.Body.String(), `"message":"success"`)
+			var count int64
+			require.NoError(t, model.DB.Model(&model.TopUp{}).Count(&count).Error)
+			assert.EqualValues(t, 1, count)
+			if provider != model.PaymentProviderWaffo {
+				subRef := "sub_ref_issued"
+				if provider == model.PaymentProviderWaffoPancake {
+					subRef = "WAFFO_PANCAKE_SUB-issued"
+				}
+				// Even a subscription history row in top_ups is not a wallet sale.
+				walletWebhookOrder(t, provider, subRef)
+				sub := &model.SubscriptionOrder{TradeNo: subRef, UserId: 902, PaymentProvider: provider, Status: common.TopUpStatusPending}
+				require.NoError(t, sub.Insert())
+				ack := httptest.NewRecorder()
+				router.ServeHTTP(ack, walletWebhookRequest(t, keys, provider, subRef, "90", true))
+				assert.Equal(t, http.StatusForbidden, ack.Code)
+				require.NoError(t, model.DB.First(sub, sub.Id).Error)
+				assert.Equal(t, common.TopUpStatusPending, sub.Status)
+			}
+			for range 2 {
+				ack := httptest.NewRecorder()
+				router.ServeHTTP(ack, walletWebhookRequest(t, keys, provider, original.TradeNo, "90", true))
+				require.Equal(t, http.StatusOK, ack.Code)
+				if provider == model.PaymentProviderWaffo {
+					assert.JSONEq(t, `{"message":"success"}`, ack.Body.String())
+					assert.True(t, waffoutils.Verify(ack.Body.String(), ack.Header().Get("X-SIGNATURE"), keys.PublicKey))
+				}
+			}
+			var buyer, inviter model.User
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			require.NoError(t, model.DB.First(&inviter, 901).Error)
+			require.NoError(t, model.DB.First(original, original.Id).Error)
+			assert.Equal(t, common.TopUpStatusSuccess, original.Status)
+			assert.Equal(t, 990, buyer.Quota)
+			assert.Equal(t, 107, inviter.AffQuota)
+			assert.Equal(t, 111, inviter.AffHistoryQuota)
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Where("top_up_id = ?", original.Id).Count(&count).Error)
+			assert.EqualValues(t, 1, count)
+		})
+	}
+}
+
+func TestStripeWebhookRequiresCredentialsButNotNewSales(t *testing.T) {
 	confirmPaymentComplianceForTest(t)
 	originalAPISecret := setting.StripeApiSecret
 	originalWebhookSecret := setting.StripeWebhookSecret
@@ -271,10 +357,13 @@ func TestStripeWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 	require.True(t, isStripeWebhookEnabled())
 
 	setting.StripePriceId = ""
+	require.False(t, isStripeTopUpEnabled())
+	require.True(t, isStripeWebhookEnabled())
+	setting.StripeApiSecret = ""
 	require.False(t, isStripeWebhookEnabled())
 }
 
-func TestCreemWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
+func TestCreemWebhookRequiresCredentialsButNotNewSales(t *testing.T) {
 	confirmPaymentComplianceForTest(t)
 	originalAPIKey := setting.CreemApiKey
 	originalProducts := setting.CreemProducts
@@ -294,10 +383,13 @@ func TestCreemWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 	require.True(t, isCreemWebhookEnabled())
 
 	setting.CreemProducts = "[]"
+	require.False(t, isCreemTopUpEnabled())
+	require.True(t, isCreemWebhookEnabled())
+	setting.CreemApiKey = ""
 	require.False(t, isCreemWebhookEnabled())
 }
 
-func TestWaffoWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
+func TestWaffoWebhookRequiresCredentialsButNotNewSales(t *testing.T) {
 	confirmPaymentComplianceForTest(t)
 	originalEnabled := setting.WaffoEnabled
 	originalSandbox := setting.WaffoSandbox
@@ -329,7 +421,8 @@ func TestWaffoWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 	require.True(t, isWaffoWebhookEnabled())
 
 	setting.WaffoEnabled = false
-	require.False(t, isWaffoWebhookEnabled())
+	require.False(t, isWaffoTopUpEnabled())
+	require.True(t, isWaffoWebhookEnabled())
 
 	setting.WaffoEnabled = true
 	setting.WaffoSandbox = true
@@ -342,7 +435,7 @@ func TestWaffoWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 	require.True(t, isWaffoWebhookEnabled())
 }
 
-func TestWaffoPancakeWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
+func TestWaffoPancakeWebhookRequiresCredentialsButNotNewSales(t *testing.T) {
 	confirmPaymentComplianceForTest(t)
 	originalMerchantID := setting.WaffoPancakeMerchantID
 	originalPrivateKey := setting.WaffoPancakePrivateKey
@@ -353,9 +446,8 @@ func TestWaffoPancakeWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 		setting.WaffoPancakeProductID = originalProductID
 	})
 
-	// Presence of all three credentials enables the gateway. Webhook public
-	// keys are bundled in the SDK and there is no separate Enabled toggle —
-	// clear any of the three fields to disable.
+	// Merchant credentials also serve authenticated inquiry; the product is
+	// required only for a new wallet checkout.
 	setting.WaffoPancakeMerchantID = ""
 	setting.WaffoPancakePrivateKey = "private"
 	setting.WaffoPancakeProductID = "product"
@@ -365,14 +457,15 @@ func TestWaffoPancakeWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 	require.True(t, isWaffoPancakeWebhookEnabled())
 
 	setting.WaffoPancakeProductID = ""
-	require.False(t, isWaffoPancakeWebhookEnabled())
+	require.False(t, isWaffoPancakeTopUpEnabled())
+	require.True(t, isWaffoPancakeWebhookEnabled())
 
 	setting.WaffoPancakeProductID = "product"
 	setting.WaffoPancakePrivateKey = ""
 	require.False(t, isWaffoPancakeWebhookEnabled())
 }
 
-func TestEpayWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
+func TestEpayWebhookRequiresCredentialsButNotNewSales(t *testing.T) {
 	confirmPaymentComplianceForTest(t)
 	originalPayAddress := operation_setting.PayAddress
 	originalEpayID := operation_setting.EpayId
@@ -404,7 +497,8 @@ func TestEpayWebhookEnabledRequiresTopUpAndWebhookConfig(t *testing.T) {
 	require.True(t, isEpayWebhookEnabled())
 
 	operation_setting.PayMethods = nil
-	require.False(t, isEpayWebhookEnabled())
+	require.False(t, isEpayTopUpEnabled())
+	require.True(t, isEpayWebhookEnabled())
 
 	// RSA needs both keys, and the MD5 key no longer counts.
 	operation_setting.PayMethods = []map[string]string{{"type": "alipay"}}
@@ -1933,6 +2027,43 @@ func TestWalletPaymentCheckoutLogsExcludeCustomerAndCheckoutSecrets(t *testing.T
 			assert.Contains(t, output.String(), order.TradeNo)
 		})
 	}
+}
+
+func TestWalletCreemCheckoutHonorsDisplayCurrency(t *testing.T) {
+	router, _ := walletCheckoutFixture(t)
+	router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestCreemPay)
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	var visits int
+	http.DefaultTransport = walletCheckoutTransport(func(*http.Request) (*http.Response, error) {
+		visits++
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"checkout_url":"https://checkout.example.invalid/creem"}`))}, nil
+	})
+	for _, tc := range []struct {
+		name, price, currency string
+		allowed               bool
+	}{
+		{"omitted_currency", "10", "", true}, {"euro", "0.01", `,"currency":"EUR"`, true},
+		{"unknown", "10", `,"currency":"XYZ"`, false}, {"null", "10", `,"currency":null`, false}, {"empty", "10", `,"currency":""`, false},
+		{"negative_price", "-1", "", false}, {"sub_cent_price", "0.009", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setting.CreemProducts = `[{"productId":"fixture","price":` + tc.price + `,"quota":100` + tc.currency + `}]`
+			before := visits
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(`{"product_id":"fixture","payment_method":"creem"}`)))
+			if tc.allowed {
+				assert.Contains(t, w.Body.String(), `"message":"success"`)
+				assert.Equal(t, before+1, visits)
+			} else {
+				assert.Contains(t, w.Body.String(), "Product configuration error")
+				assert.Equal(t, before, visits)
+			}
+		})
+	}
+	var count int64
+	require.NoError(t, model.DB.Model(&model.TopUp{}).Count(&count).Error)
+	assert.EqualValues(t, 2, count)
 }
 
 // Only the network endpoint is replaced. Production JSON generation, HTTP
@@ -5267,6 +5398,13 @@ func TestWalletStripeProductQuantityQuoteAndFrozenCredit(t *testing.T) {
 			require.NoError(t, model.DB.Find(&orders).Error)
 			require.Len(t, orders, 1)
 			assert.EqualValues(t, 1, orders[0].Amount)
+			var checkout struct {
+				Data struct {
+					OrderID string `json:"order_id"`
+				}
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &checkout))
+			assert.Equal(t, orders[0].TradeNo, checkout.Data.OrderID)
 			assert.Equal(t, scenario.ratio, orders[0].Money, "preserve the historical Stripe wallet credit basis")
 			require.NotNil(t, orders[0].CreditedQuota)
 			assert.Equal(t, credit, *orders[0].CreditedQuota)
@@ -5490,6 +5628,33 @@ func TestWalletStripeRejectsNonFiniteCreditBeforeCheckout(t *testing.T) {
 
 // Quote endpoints must not reject the one-cent boundary accepted by the
 // checkout endpoints. Provider-specific quantities and credit remain unchanged.
+func TestWalletEpayTokenMinimumMustFitWallet(t *testing.T) {
+	router, _ := walletCheckoutFixture(t)
+	operation_setting.GetGeneralSetting().QuotaDisplayType = operation_setting.QuotaDisplayTypeTokens
+	router.POST("/quote", func(c *gin.Context) { c.Set("id", 902) }, RequestAmount)
+	router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestEpay)
+	for _, tc := range []struct {
+		quotaPerUnit float64
+		message      string
+		orders       int64
+	}{
+		{1e16, "error", 0},
+		{common.MaxWalletQuota, "success", 1},
+	} {
+		common.QuotaPerUnit = tc.quotaPerUnit
+		for _, path := range []string{"/quote", "/checkout"} {
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"amount":9007199254740991,"payment_method":"alipay"}`)))
+			var result struct{ Message string }
+			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &result))
+			assert.Equal(t, tc.message, result.Message, path)
+		}
+		var orders int64
+		require.NoError(t, model.DB.Model(&model.TopUp{}).Count(&orders).Error)
+		assert.Equal(t, tc.orders, orders)
+	}
+}
+
 func TestWalletCheckoutMinimumChargeQuoteMatchesCheckout(t *testing.T) {
 	for _, provider := range []string{model.PaymentProviderEpay, model.PaymentProviderStripe, model.PaymentProviderWaffo, model.PaymentProviderWaffoPancake} {
 		t.Run(provider, func(t *testing.T) {
@@ -6006,9 +6171,15 @@ func TestWalletPaymentMethodRejectedSavePreservesPendingOrder(t *testing.T) {
 			assert.Contains(t, response.Body.String(), fmt.Sprintf(`"success":%t`, scenario.valid))
 			var stored model.Option
 			require.NoError(t, model.DB.Where(&model.Option{Key: "PayMethods"}).First(&stored).Error)
-			wantedMethods, wantedACK := initialMethods, "success"
+			wantedMethods := initialMethods
 			if scenario.valid {
-				wantedMethods, wantedACK = scenario.value, "fail"
+				wantedMethods = scenario.value
+				router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestEpay)
+				request := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(`{"amount":21,"payment_method":"alipay"}`))
+				request.Header.Set("Content-Type", "application/json")
+				denied := httptest.NewRecorder()
+				router.ServeHTTP(denied, request)
+				require.Contains(t, denied.Body.String(), "Payment method does not exist")
 			}
 			t.Logf("attempt=%s durable=%q effective=%s", scenario.name, stored.Value, operation_setting.PayMethods2JsonString())
 			assert.Equal(t, wantedMethods, stored.Value)
@@ -6017,23 +6188,14 @@ func TestWalletPaymentMethodRejectedSavePreservesPendingOrder(t *testing.T) {
 			for range 2 {
 				notification := httptest.NewRecorder()
 				router.ServeHTTP(notification, walletWebhookRequest(t, keys, model.PaymentProviderEpay, original.TradeNo, "100.00", true))
-				assert.Equal(t, wantedACK, notification.Body.String())
+				assert.Equal(t, "success", notification.Body.String())
 			}
 			var buyer, inviter model.User
 			require.NoError(t, model.DB.First(&buyer, 902).Error)
 			require.NoError(t, model.DB.First(&inviter, 901).Error)
-			if scenario.valid {
-				assert.Equal(t, -10, buyer.Quota, "an explicit disable retains the existing webhook gate")
-				assert.Equal(t, 7, inviter.AffQuota)
-				assert.Equal(t, 11, inviter.AffHistoryQuota)
-				storedOrder, err := model.GetTopUpByTradeNoWithError(original.TradeNo)
-				require.NoError(t, err)
-				assert.Equal(t, common.TopUpStatusPending, storedOrder.Status)
-			} else {
-				assert.Equal(t, 990, buyer.Quota)
-				assert.Equal(t, 107, inviter.AffQuota)
-				assert.Equal(t, 111, inviter.AffHistoryQuota)
-			}
+			assert.Equal(t, 990, buyer.Quota)
+			assert.Equal(t, 107, inviter.AffQuota)
+			assert.Equal(t, 111, inviter.AffHistoryQuota)
 			// Restore an explicitly disabled channel, or repeat the unchanged
 			// valid configuration after a rejected save, then replay the same order.
 			restored := accessTokenRequest(router, http.MethodPut, "/api/option/", rootToken, "", string(initialBody))
@@ -6658,8 +6820,8 @@ func TestWalletPricingReadersSynchronizeWithSaveAndReload(t *testing.T) {
 			{"creem_mode", "CreemTestMode", "false", "true", "api.creem.io", "test-api.creem.io"},
 			{"epay_checkout_method", "PayMethods", `[]`, `[{"type":"alipay"}]`, "false", "true"},
 			{"epay_webhook_gate", "PayMethods", `[]`, `[{"type":"alipay"}]`, "fail", "fail"},
-			{"waffo_webhook_gate", "WaffoEnabled", "false", "true", "403", "400"},
-			{"pancake_webhook_gate", "WaffoPancakeProductID", "", "product_fixture", "403", "401"},
+			{"waffo_webhook_gate", "WaffoApiKey", "", "fixture", "403", "400"},
+			{"pancake_webhook_gate", "WaffoPancakeMerchantID", "", "fixture", "403", "401"},
 		} {
 			t.Run(mode+"/"+scenario.reader+"/"+scenario.key, func(t *testing.T) {
 				router, keys := walletCheckoutFixture(t)
@@ -6769,7 +6931,8 @@ func TestWalletPricingReadersSynchronizeWithSaveAndReload(t *testing.T) {
 						router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/pricing-compliance", nil))
 						return strconv.FormatBool(response.Code == http.StatusNoContent), nil
 					case "epay_min":
-						amount = float64(getMinTopup(operation_setting.QuotaDisplayTypeUSD, 10))
+						minimum, err := getMinTopup(operation_setting.QuotaDisplayTypeUSD, 10)
+						return strconv.FormatInt(minimum, 10), err
 					case "stripe_min":
 						amount = float64(getStripeMinTopup())
 					case "waffo_min":

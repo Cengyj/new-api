@@ -1,10 +1,15 @@
 package controller
 
 import (
+	"errors"
+	"net/http"
 	"strings"
 
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 func isPaymentComplianceConfirmed() bool {
@@ -25,7 +30,7 @@ func isStripeWebhookConfigured() bool {
 }
 
 func isStripeWebhookEnabled() bool {
-	return isStripeTopUpEnabled()
+	return isPaymentComplianceConfirmed() && strings.TrimSpace(setting.StripeApiSecret) != "" && isStripeWebhookConfigured()
 }
 
 func isCreemTopUpEnabled() bool {
@@ -44,7 +49,7 @@ func isCreemWebhookConfigured() bool {
 }
 
 func isCreemWebhookEnabled() bool {
-	return isCreemTopUpEnabled()
+	return isPaymentComplianceConfirmed() && strings.TrimSpace(setting.CreemApiKey) != "" && isCreemWebhookConfigured()
 }
 
 func isWaffoTopUpEnabled() bool {
@@ -71,7 +76,7 @@ func isWaffoWebhookConfigured() bool {
 }
 
 func isWaffoWebhookEnabled() bool {
-	return isWaffoTopUpEnabled()
+	return isPaymentComplianceConfirmed() && isWaffoWebhookConfigured()
 }
 
 func isWaffoPancakeTopUpEnabled() bool {
@@ -80,17 +85,38 @@ func isWaffoPancakeTopUpEnabled() bool {
 	}
 	// Presence-of-credentials = enabled. Webhook public keys ship inside
 	// the SDK; mode (test/prod) is read from each event.
-	return strings.TrimSpace(setting.WaffoPancakeMerchantID) != "" &&
-		strings.TrimSpace(setting.WaffoPancakePrivateKey) != "" &&
-		strings.TrimSpace(setting.WaffoPancakeProductID) != ""
+	return isWaffoPancakeWebhookConfigured() && strings.TrimSpace(setting.WaffoPancakeProductID) != ""
 }
 
 func isWaffoPancakeWebhookConfigured() bool {
-	return isWaffoPancakeTopUpEnabled()
+	return strings.TrimSpace(setting.WaffoPancakeMerchantID) != "" && strings.TrimSpace(setting.WaffoPancakePrivateKey) != ""
 }
 
 func isWaffoPancakeWebhookEnabled() bool {
-	return isWaffoPancakeTopUpEnabled()
+	return isPaymentComplianceConfirmed() && isWaffoPancakeWebhookConfigured()
+}
+
+// Stripe and Creem share their notification endpoints with subscriptions. The
+// delisting exception admits only an issued wallet order, never a subscription
+// (including its top-up history row). Retriable lookup errors are not absence.
+func requireIssuedWalletOrder(c *gin.Context, tradeNo, provider string) bool {
+	order, err := model.GetTopUpByTradeNoWithError(tradeNo)
+	if errors.Is(err, gorm.ErrRecordNotFound) || err == nil && order.PaymentProvider != provider {
+		c.AbortWithStatus(http.StatusForbidden)
+		return false
+	}
+	if err == nil {
+		_, err = model.GetSubscriptionOrderByTradeNoWithError(tradeNo)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return true
+		}
+		if err == nil {
+			c.AbortWithStatus(http.StatusForbidden)
+			return false
+		}
+	}
+	c.AbortWithStatus(http.StatusInternalServerError)
+	return false
 }
 
 func isEpayTopUpEnabled() bool {
@@ -117,5 +143,6 @@ func isEpayWebhookConfigured() bool {
 }
 
 func isEpayWebhookEnabled() bool {
-	return isEpayTopUpEnabled()
+	// Removing checkout methods stops new sales, not payments on issued forms.
+	return isPaymentComplianceConfirmed() && isEpayWebhookConfigured()
 }

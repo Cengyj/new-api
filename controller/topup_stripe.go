@@ -96,6 +96,10 @@ func (*StripeAdaptor) RequestPay(c *gin.Context, req *StripePayRequest) {
 		paymentError(c, common.NewMessage("Stripe webhook is not configured"))
 		return
 	}
+	if strings.TrimSpace(checkoutConfig.priceID) == "" {
+		paymentError(c, common.NewMessage("Failed to start payment"))
+		return
+	}
 	minTopup := pricing.minTopUp
 	if req.Amount < minTopup {
 		common.ApiErrorStatus(c, http.StatusOK, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": minTopup}), gin.H{"data": 10})
@@ -187,6 +191,7 @@ func (*StripeAdaptor) RequestPay(c *gin.Context, req *StripePayRequest) {
 		"message": "success",
 		"data": gin.H{
 			"pay_link": payLink,
+			"order_id": referenceId,
 		},
 	})
 }
@@ -220,6 +225,7 @@ func StripeWebhook(c *gin.Context) {
 	common.OptionMapRWMutex.RLock()
 	secret := setting.StripeWebhookSecret
 	enabled := isStripeWebhookEnabled()
+	walletOnly := !isStripeTopUpEnabled()
 	common.OptionMapRWMutex.RUnlock()
 	if !enabled || strings.TrimSpace(secret) == "" {
 		logger.LogWarn(ctx, common.LogText("Stripe webhook rejected reason=webhook_disabled path=%q client_ip=%s", c.Request.URL.Path, c.ClientIP()))
@@ -248,20 +254,29 @@ func StripeWebhook(c *gin.Context) {
 
 	callerIp := c.ClientIP()
 	logger.LogInfo(ctx, common.LogText("Stripe webhook signature verified event_type=%s client_ip=%s path=%q", string(event.Type), callerIp, c.Request.URL.Path))
+	var handle func(context.Context, stripe.Event, string) error
 	switch event.Type {
 	case stripe.EventTypeCheckoutSessionCompleted:
-		err = sessionCompleted(ctx, event, callerIp)
+		handle = sessionCompleted
 	case stripe.EventTypeCheckoutSessionExpired:
-		err = sessionExpired(ctx, event)
+		handle = sessionExpired
 	case stripe.EventTypeCheckoutSessionAsyncPaymentSucceeded:
-		err = sessionAsyncPaymentSucceeded(ctx, event, callerIp)
+		handle = sessionAsyncPaymentSucceeded
 	case stripe.EventTypeCheckoutSessionAsyncPaymentFailed:
-		err = sessionAsyncPaymentFailed(ctx, event, callerIp)
+		handle = sessionAsyncPaymentFailed
 	default:
 		logger.LogInfo(ctx, common.LogText("Stripe webhook ignored event event_type=%s client_ip=%s", string(event.Type), callerIp))
+		c.Status(http.StatusOK)
+		return
 	}
-
-	if err != nil {
+	if event.Data == nil || event.Data.Object == nil {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	if walletOnly && !requireIssuedWalletOrder(c, event.GetObjectValue("client_reference_id"), model.PaymentProviderStripe) {
+		return
+	}
+	if err := handle(ctx, event, callerIp); err != nil {
 		c.AbortWithStatus(http.StatusInternalServerError)
 		return
 	}
@@ -401,7 +416,7 @@ func fulfillOrder(ctx context.Context, event stripe.Event, referenceId string, c
 	return nil
 }
 
-func sessionExpired(ctx context.Context, event stripe.Event) error {
+func sessionExpired(ctx context.Context, event stripe.Event, _ string) error {
 	referenceId := event.GetObjectValue("client_reference_id")
 	status := event.GetObjectValue("status")
 	if "expired" != status {

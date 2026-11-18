@@ -111,6 +111,7 @@ func TestLogExportDatabaseMatrix(t *testing.T) {
 			if tc.kind == "clickhouse" {
 				t.Setenv("LOG_SQL_DSN", isolatedDSN)
 				require.NoError(t, model.InitLogDB())
+				closeAuditTestPoolOnCleanup(t, model.LOG_DB)
 			} else {
 				require.NoError(t, db.AutoMigrate(&model.Log{}))
 			}

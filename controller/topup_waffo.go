@@ -191,20 +191,13 @@ func RequestWaffoPay(c *gin.Context) {
 		return
 	}
 
-	common.OptionMapRWMutex.RLock()
-	enabled := setting.WaffoEnabled
-	common.OptionMapRWMutex.RUnlock()
-	if !enabled {
-		paymentError(c, common.NewMessage("Waffo payment is not enabled"))
-		return
-	}
-
 	var req WaffoPayRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		paymentError(c, common.NewMessage("Invalid parameters"))
 		return
 	}
 	common.OptionMapRWMutex.RLock()
+	enabled := setting.WaffoEnabled
 	pricing := walletTopUpPricingLocked(setting.WaffoUnitPrice, setting.WaffoMinTopUp)
 	sdkConfig := waffoConfigLocked()
 	methodsConfig := common.OptionMap["WaffoPayMethods"]
@@ -212,6 +205,10 @@ func RequestWaffoPay(c *gin.Context) {
 	callbackAddress, serverAddress := operation_setting.CustomCallbackAddress, system_setting.ServerAddress
 	currency := setting.WaffoCurrency
 	common.OptionMapRWMutex.RUnlock()
+	if !enabled {
+		paymentError(c, common.NewMessage("Waffo payment is not enabled"))
+		return
+	}
 	displayType, quotaPerUnit := pricing.displayType, pricing.quotaPerUnit
 	waffoMinTopup := pricing.minTopUp
 	if req.Amount < waffoMinTopup {

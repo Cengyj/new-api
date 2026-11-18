@@ -92,7 +92,9 @@ func TestTopUpQuotaValidation(t *testing.T) {
 			if tc.displayType == operation_setting.QuotaDisplayTypeTokens {
 				operation_setting.GetGeneralSetting().QuotaDisplayType = operation_setting.QuotaDisplayTypeUSD
 			}
-			assert.Equal(t, tc.wantMin, getMinTopup(tc.displayType, common.QuotaPerUnit))
+			minimum, err := getMinTopup(tc.displayType, common.QuotaPerUnit)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantMin, minimum)
 			quota, err := getTopUpQuota(tc.amount, tc.displayType, common.QuotaPerUnit)
 			if tc.wantErr {
 				require.Error(t, err)

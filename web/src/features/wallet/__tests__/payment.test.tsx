@@ -1108,6 +1108,30 @@ test('the real HTTP interceptor does not refresh or replay a payment rejected wi
   }
 })
 
+test('a browser exception after receiving the checkout preserves the original order', async () => {
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: {
+      message: 'success',
+      data: {
+        order_id: 'issued_creem',
+        checkout_url: 'https://checkout.example.invalid/creem',
+      },
+    },
+  })
+  vi.spyOn(window, 'open').mockImplementation(() => {
+    throw new DOMException('Navigation blocked', 'SecurityError')
+  })
+  const onUnknown = vi.fn()
+  const { result } = renderHook(() => useCreemPayment(onUnknown))
+  render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+  await act(async () => {
+    expect(await result.current.processCreemPayment('fixture')).toBe(false)
+  })
+  expect(screen.getByText('issued_creem')).toBeVisible()
+  expect(post).toHaveBeenCalledOnce()
+  expect(onUnknown).toHaveBeenCalledOnce()
+})
+
 test.each(['alipay', 'stripe', 'creem', 'waffo', 'waffo_pancake'])(
   '%s cancels order creation when the payer changes before the real request interceptor runs',
   async (provider) => {
@@ -1917,7 +1941,7 @@ test.each(['alipay', 'stripe', 'creem', 'waffo', 'waffo_pancake'])(
   }
 )
 
-test.each(['alipay', 'creem', 'waffo', 'waffo_pancake'])(
+test.each(['alipay', 'stripe', 'creem', 'waffo', 'waffo_pancake'])(
   '%s retains its received original order when the checkout URL cannot be opened',
   async (provider) => {
     const original = `unusable_${provider}_checkout`
@@ -1931,6 +1955,7 @@ test.each(['alipay', 'creem', 'waffo', 'waffo_pancake'])(
             ? { out_trade_no: original }
             : {
                 order_id: original,
+                pay_link: invalidURL,
                 checkout_url: invalidURL,
                 payment_url: invalidURL,
               },

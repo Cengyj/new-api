@@ -227,15 +227,15 @@ func (pricing walletTopUpPricing) payMoney(amount int64, group string) float64 {
 		Mul(decimal.NewFromFloat(pricing.groupRatio(group))).Mul(decimal.NewFromFloat(discount)).InexactFloat64()
 }
 
-func (pricing walletTopUpPricing) epayMinimum() int64 {
+func (pricing walletTopUpPricing) epayMinimum() (int64, error) {
 	if pricing.displayType != operation_setting.QuotaDisplayTypeTokens {
-		return pricing.minTopUp
+		return pricing.minTopUp, nil
 	}
 	quota, err := common.WalletQuotaFromDecimalStrict(decimal.NewFromInt(pricing.minTopUp).Mul(decimal.NewFromFloat(pricing.quotaPerUnit)))
 	if err != nil {
-		return common.MaxWalletQuota
+		return 0, common.NewMessage("Invalid top-up amount")
 	}
-	return int64(quota)
+	return int64(quota), nil
 }
 
 // walletTopUpUnits freezes the amount unit and conversion rate before validation.
@@ -254,7 +254,7 @@ func getPayMoney(amount int64, group, displayType string, quotaPerUnit float64) 
 	return pricing.payMoney(amount, group)
 }
 
-func getMinTopup(displayType string, quotaPerUnit float64) int64 {
+func getMinTopup(displayType string, quotaPerUnit float64) (int64, error) {
 	common.OptionMapRWMutex.RLock()
 	pricing := walletTopUpPricingLocked(operation_setting.Price, operation_setting.MinTopUp)
 	common.OptionMapRWMutex.RUnlock()
@@ -400,8 +400,10 @@ func RequestEpay(c *gin.Context) {
 	callbackAddress, serverAddress := operation_setting.CustomCallbackAddress, system_setting.ServerAddress
 	common.OptionMapRWMutex.RUnlock()
 	displayType, quotaPerUnit := pricing.displayType, pricing.quotaPerUnit
-	minTopup := pricing.epayMinimum()
-	if req.Amount < minTopup {
+	if minTopup, err := pricing.epayMinimum(); err != nil {
+		paymentError(c, err)
+		return
+	} else if req.Amount < minTopup {
 		paymentError(c, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": minTopup}))
 		return
 	}
@@ -657,8 +659,10 @@ func RequestAmount(c *gin.Context) {
 	pricing := walletTopUpPricingLocked(operation_setting.Price, operation_setting.MinTopUp)
 	common.OptionMapRWMutex.RUnlock()
 	displayType, quotaPerUnit := pricing.displayType, pricing.quotaPerUnit
-	minTopup := pricing.epayMinimum()
-	if req.Amount < minTopup {
+	if minTopup, err := pricing.epayMinimum(); err != nil {
+		paymentError(c, err)
+		return
+	} else if req.Amount < minTopup {
 		paymentError(c, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": minTopup}))
 		return
 	}
