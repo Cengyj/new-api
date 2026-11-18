@@ -629,7 +629,13 @@ test('an order completion rejected with 401 is not automatically refreshed and r
   }
 })
 
-test.each(['response lost', 'timeout', 'HTTP 503', 'HTTP 408 proxy page'])(
+test.each([
+  'response lost',
+  'timeout',
+  'HTTP 503',
+  'HTTP 408 proxy page',
+  'HTTP 200 proxy page',
+])(
   'order completion with %s stays unknown until the original order is refreshed without another credit request',
   async (failure) => {
     const previousAdapter = api.defaults.adapter
@@ -639,6 +645,15 @@ test.each(['response lost', 'timeout', 'HTTP 503', 'HTTP 408 proxy page'])(
       requests.push(config)
       if (config.method === 'post') {
         submitted = true
+        if (failure === 'HTTP 200 proxy page') {
+          return {
+            config,
+            status: 200,
+            statusText: 'OK',
+            headers: { 'content-type': 'text/html' },
+            data: '<html>Gateway maintenance</html>',
+          }
+        }
         const response = failure.startsWith('HTTP')
           ? {
               config,

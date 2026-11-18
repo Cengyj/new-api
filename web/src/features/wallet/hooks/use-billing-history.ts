@@ -157,37 +157,40 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
 
       pendingCompletion.current = true
       setCompleting(true)
+      let unconfirmed: unknown
       try {
         const response = await completeOrder({ trade_no: tradeNo }, signal)
         if (signal.aborted) return false
-        if (isApiSuccess(response)) {
+        if (response?.success === true) {
           toast.success(i18next.t('Order completed successfully'))
           // Refresh the current search/page, not the values at confirmation.
           // Completion already succeeded; a refresh failure cannot undo it.
           setRefreshVersion((version) => version + 1)
           return true
-        } else {
+        }
+        if (response?.success === false) {
           handleServerError(response, i18next.t('Failed to complete order'))
           return false
         }
+        unconfirmed = response
       } catch (error) {
         if (signal.aborted) return false
         if (hasPaymentDeclineResponse(error)) {
           handleServerError(error, i18next.t('Failed to complete order'))
-        } else {
-          // The database may have committed before the response was lost.
-          // Keep this order available for reconciliation and same-order retry.
-          handleServerError(error, undefined, {
-            title: i18next.t(
-              'Order completion result is unknown. Refresh Order History before retrying this order.'
-            ),
-          })
+          return false
         }
-        return false
+        unconfirmed = error
       } finally {
         pendingCompletion.current = false
         if (!signal.aborted) setCompleting(false)
       }
+      // A proxy can lose or replace the receipt even after the order was credited.
+      handleServerError(unconfirmed, undefined, {
+        title: i18next.t(
+          'Order completion result is unknown. Refresh Order History before retrying this order.'
+        ),
+      })
+      return false
     },
     [identity, isAdmin]
   )
