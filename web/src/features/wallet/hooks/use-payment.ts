@@ -68,8 +68,17 @@ export async function requestPaymentAmount(
     calculator = calculators.waffoPancake
   }
   const response = await calculator({ amount: topupAmount })
-  if (!isApiSuccess(response) || !response.data) return 0
-  const amount = Number(response.data)
+  if (!isApiSuccess(response)) return 0
+  const value: unknown = response.data
+  // Legacy numeric quotes and the channels' decimal strings are amounts;
+  // truthy flags, arrays and JavaScript numeric literals are not.
+  if (
+    typeof value !== 'number' &&
+    (typeof value !== 'string' || !/^\d+(?:\.\d+)?$/.test(value.trim()))
+  ) {
+    return 0
+  }
+  const amount = Number(value)
   return Number.isFinite(amount) && amount > 0 ? amount : 0
 }
 
@@ -155,15 +164,32 @@ export function usePayment(onUnknownCheckout?: (tradeNo?: string) => void) {
           }
           if (stripe) {
             window.open(url, '_blank', 'noopener,noreferrer')
-          } else if (response.data && typeof response.data === 'object') {
-            submitPaymentForm(url, response.data)
           } else {
-            toast.error(
-              i18next.t(
-                'Payment request result is unknown. Check Order History before trying again.'
+            const form = response.data
+            const required = [
+              'pid',
+              'type',
+              'out_trade_no',
+              'name',
+              'money',
+              'notify_url',
+              'sign',
+            ]
+            if (
+              !form ||
+              !required.every((key) => {
+                const value = form[key]
+                return typeof value === 'string' && value.trim() !== ''
+              })
+            ) {
+              toast.error(
+                i18next.t(
+                  'Payment request result is unknown. Check Order History before trying again.'
+                )
               )
-            )
-            return false
+              return false
+            }
+            submitPaymentForm(url, form)
           }
           toast.success(i18next.t('Redirecting to payment page...'))
           return true

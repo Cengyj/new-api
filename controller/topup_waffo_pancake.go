@@ -63,7 +63,7 @@ func RequestWaffoPancakeAmount(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "success", "data": fmt.Sprintf("%.2f", payMoney)})
+	c.JSON(http.StatusOK, gin.H{"message": "success", "data": formatWaffoPancakeAmount(payMoney)})
 }
 
 func getWaffoPancakePayMoney(amount int64, group, displayType string, quotaPerUnit float64) float64 {

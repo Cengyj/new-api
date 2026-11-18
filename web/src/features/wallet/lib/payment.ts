@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { isAxiosError } from 'axios'
+
 import { getServerMessage } from '@/lib/server-error-message'
 
 import {
@@ -24,7 +26,12 @@ import {
   DEFAULT_PAYMENT_TYPE,
   DEFAULT_MIN_TOPUP,
 } from '../constants'
-import type { PaymentMethod, PresetAmount, TopupInfo } from '../types'
+import type {
+  ApiResponse,
+  PaymentMethod,
+  PresetAmount,
+  TopupInfo,
+} from '../types'
 
 // ============================================================================
 // Payment Processing Functions
@@ -44,6 +51,19 @@ export function getPaymentErrorTranslation(
     return undefined
   }
   return getServerMessage(body)
+}
+
+// An intermediary can replace the response after the write. An HTTP status
+// alone is not an application refusal, even for a client-error response.
+export function hasPaymentDeclineResponse(error: unknown): boolean {
+  if (!isAxiosError<ApiResponse>(error)) return false
+  const response = error.response
+  return (
+    !!response &&
+    response.status >= 400 &&
+    response.status < 500 &&
+    (response.data?.success === false || response.data?.message === 'error')
+  )
 }
 
 export function isValidTopupAmount(amount: number): boolean {

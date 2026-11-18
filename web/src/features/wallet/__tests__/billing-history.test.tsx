@@ -629,7 +629,7 @@ test('an order completion rejected with 401 is not automatically refreshed and r
   }
 })
 
-test.each(['response lost', 'timeout', 'HTTP 503'])(
+test.each(['response lost', 'timeout', 'HTTP 503', 'HTTP 408 proxy page'])(
   'order completion with %s stays unknown until the original order is refreshed without another credit request',
   async (failure) => {
     const previousAdapter = api.defaults.adapter
@@ -639,16 +639,18 @@ test.each(['response lost', 'timeout', 'HTTP 503'])(
       requests.push(config)
       if (config.method === 'post') {
         submitted = true
-        const response =
-          failure === 'HTTP 503'
-            ? {
-                config,
-                status: 503,
-                statusText: 'Service Unavailable',
-                headers: {},
-                data: { message: 'Service unavailable' },
-              }
-            : undefined
+        const response = failure.startsWith('HTTP')
+          ? {
+              config,
+              status: failure === 'HTTP 503' ? 503 : 408,
+              statusText: failure,
+              headers: {},
+              data:
+                failure === 'HTTP 503'
+                  ? { message: 'Service unavailable' }
+                  : '<html>Request timeout</html>',
+            }
+          : undefined
         throw new AxiosError(
           failure,
           failure === 'timeout' ? 'ECONNABORTED' : 'ERR_NETWORK',

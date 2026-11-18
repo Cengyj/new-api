@@ -384,9 +384,20 @@ func rejectInvalidTopUpQuota(c *gin.Context, userId int, amount int64, displayTy
 
 // Epay signs these addresses as supplied. A relative path or a path appended
 // after a query/fragment cannot route the provider to the configured endpoint.
+func usableEpayHTTPEndpoint(u *url.URL) bool {
+	if (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
+		return false
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.ParseUint(port, 10, 16)
+		return err == nil && n != 0
+	}
+	return true
+}
+
 func epayCheckoutURL(base, route string) (*url.URL, error) {
 	u, err := url.Parse(strings.TrimRight(base, "/") + route)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if err != nil || !usableEpayHTTPEndpoint(u) || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return nil, common.NewMessage("Payment configuration error")
 	}
 	return u, nil
@@ -405,7 +416,10 @@ func RequestEpay(c *gin.Context) {
 	}
 	common.OptionMapRWMutex.RLock()
 	pricing := walletTopUpPricingLocked(operation_setting.Price, operation_setting.MinTopUp)
-	allowedPayMethod := operation_setting.ContainsPayMethod(req.PaymentMethod)
+	method, allowedPayMethod := lo.Find(operation_setting.PayMethods, func(method map[string]string) bool {
+		return method["type"] == req.PaymentMethod
+	})
+	methodMinimum := strings.TrimSpace(method["min_topup"])
 	address, config := operation_setting.PayAddress, epayConfigLocked()
 	callbackAddress, serverAddress := operation_setting.CustomCallbackAddress, system_setting.ServerAddress
 	common.OptionMapRWMutex.RUnlock()
@@ -439,6 +453,21 @@ func RequestEpay(c *gin.Context) {
 		return
 	}
 
+	if methodMinimum != "" {
+		minimum, err := decimal.NewFromString(methodMinimum)
+		if err != nil {
+			paymentError(c, common.NewMessage("Payment configuration error"))
+			return
+		}
+		// Method minima apply to the selected input quantity, as in the wallet.
+		// Positive integer requests need no decimal rescaling outside 1..MaxInt64.
+		integerDigits := int64(minimum.NumDigits()) + int64(minimum.Exponent())
+		if minimum.IsPositive() && (integerDigits > 19 || integerDigits > 0 && decimal.NewFromInt(req.Amount).LessThan(minimum)) {
+			paymentError(c, common.NewMessage("Top-up amount cannot be less than {{min}}", map[string]any{"min": methodMinimum}))
+			return
+		}
+	}
+
 	if callbackAddress == "" {
 		callbackAddress = serverAddress
 	}
@@ -457,6 +486,12 @@ func RequestEpay(c *gin.Context) {
 	client := newEpayClient(config, address)
 	if client == nil {
 		paymentError(c, common.NewMessage("Payment information has not been configured by administrator"))
+		return
+	}
+	// The SDK also accepts relative and opaque base URLs. They cannot deliver
+	// this checkout form; this is a new-sale check, not a callback prerequisite.
+	if !usableEpayHTTPEndpoint(client.BaseUrl) {
+		paymentError(c, common.NewMessage("Payment configuration error"))
 		return
 	}
 	// Purchase only validates/signs local parameters; it makes no network call.

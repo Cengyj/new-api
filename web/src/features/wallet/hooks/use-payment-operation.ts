@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { isAxiosError } from 'axios'
 import i18next from 'i18next'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
@@ -24,6 +23,15 @@ import { handleServerError } from '@/lib/handle-server-error'
 import { getServerErrorSources } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 import { usePaymentRecoveryStore } from '@/stores/payment-recovery-store'
+
+import { hasPaymentDeclineResponse } from '../lib/payment'
+
+function isUnknownCheckout(source: Record<string | symbol, unknown>): boolean {
+  return (
+    source.message_key ===
+    'Payment request result is unknown. Check Order History before trying again.'
+  )
+}
 
 // A lost response does not cancel an order already created by the server.
 // Prevent concurrent submissions and discard delivery after payer changes.
@@ -54,7 +62,7 @@ export function usePaymentOperation(
       activeController.current = controller
       const auth = useAuthStore.getState().auth
       let changed = false
-      let unresolvedOrder: string | undefined
+      let unresolvedOrder: unknown
       let checkHistory = false
       const unsubscribe = useAuthStore.subscribe((state) => {
         if (
@@ -73,11 +81,7 @@ export function usePaymentOperation(
         // Keep delivery synchronous with the identity check: an await between
         // checking the payer and opening checkout allows another account to win.
         const sources = getServerErrorSources(response)
-        const unknownOrder = sources.find(
-          (source) =>
-            source.message_key ===
-            'Payment request result is unknown. Check Order History before trying again.'
-        )
+        const unknownOrder = sources.find(isUnknownCheckout)
         // Capture the reference before browser navigation, which can throw
         // even when the server successfully created the checkout.
         const checkout = sources.find(
@@ -89,12 +93,7 @@ export function usePaymentOperation(
           if ('order_id' in data) tradeNo = data.order_id
           else if ('out_trade_no' in data) tradeNo = data.out_trade_no
         }
-        if (
-          typeof tradeNo === 'string' &&
-          /^[a-zA-Z0-9_-]{1,128}$/.test(tradeNo)
-        ) {
-          unresolvedOrder = tradeNo
-        }
+        unresolvedOrder = tradeNo
         // A proxy can return a document instead of the checkout receipt after
         // the order was created. Only a recognized decline is safe to present as one.
         if (
@@ -116,8 +115,10 @@ export function usePaymentOperation(
         return completed
       } catch (error) {
         if (!mounted.current || changed) return false
-        const status = isAxiosError(error) ? error.response?.status : undefined
-        if (status !== undefined && status >= 400 && status < 500) {
+        const unknownOrder =
+          getServerErrorSources(error).find(isUnknownCheckout)
+        if (unknownOrder) unresolvedOrder = unknownOrder.trade_no
+        if (!unknownOrder && hasPaymentDeclineResponse(error)) {
           handleServerError(error, i18next.t('Payment request failed'))
         } else {
           checkHistory = true
@@ -134,7 +135,10 @@ export function usePaymentOperation(
         pending.current = false
         if (mounted.current) setProcessing(false)
         if (mounted.current && !changed && auth.user?.id) {
-          if (unresolvedOrder) {
+          if (
+            typeof unresolvedOrder === 'string' &&
+            /^[a-zA-Z0-9_-]{1,128}$/.test(unresolvedOrder)
+          ) {
             usePaymentRecoveryStore
               .getState()
               .remember(auth.user.id, unresolvedOrder)

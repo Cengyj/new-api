@@ -2621,6 +2621,21 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 	for _, scenario := range []string{"late_callback", "manual_then_callback", "callback_before_response_loss", "non_json_remote_error", "session_http500", "session_http401", "token_http500", "token_http401", "session_timeout", "token_timeout", "missing_session_id", "blank_session_id", "empty_checkout_url", "blank_checkout_url", "empty_buyer_token", "blank_buyer_token", "successful_checkout"} {
 		t.Run(scenario, func(t *testing.T) {
 			router, keys := walletCheckoutFixture(t)
+			var quoted string
+			if scenario == "successful_checkout" {
+				// 100.125 USD is exactly halfway between two cents, even in binary.
+				setting.WaffoPancakeUnitPrice = 1.00125
+				router.POST("/quote", func(c *gin.Context) { c.Set("id", 902) }, RequestWaffoPancakeAmount)
+				r := httptest.NewRequest(http.MethodPost, "/quote", strings.NewReader(`{"amount":100}`))
+				r.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, r)
+				var quote struct {
+					Data string `json:"data"`
+				}
+				require.NoError(t, common.Unmarshal(w.Body.Bytes(), &quote))
+				quoted = quote.Data
+			}
 			observed := make(chan model.TopUp, 1)
 			providerDone := make(chan struct{})
 			var observeCheckout, completeProvider sync.Once
@@ -2667,10 +2682,17 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 				}
 				var payload struct {
 					OrderMerchantExternalID string `json:"orderMerchantExternalId"`
+					PriceSnapshot           struct {
+						Amount string `json:"amount"`
+					} `json:"priceSnapshot"`
 				}
 				if !assert.NoError(t, common.DecodeJson(request.Body, &payload)) {
 					w.WriteHeader(http.StatusBadRequest)
 					return
+				}
+				if scenario == "successful_checkout" {
+					assert.Equal(t, "100.13", payload.PriceSnapshot.Amount)
+					assert.Equal(t, payload.PriceSnapshot.Amount, quoted, "unchanged pricing must quote the provider's cents")
 				}
 				var order model.TopUp
 				if !assert.NoError(t, model.DB.Where("trade_no = ?", payload.OrderMerchantExternalID).First(&order).Error) {
@@ -8111,6 +8133,7 @@ func TestWalletEpayCheckoutRequiresUsableCallbackAddresses(t *testing.T) {
 	for _, tc := range []struct{ name, callback, server string }{
 		{"invalid return address", "https://notify.example.invalid", "https://wallet.example.invalid/%"},
 		{"relative callback", "/proxy", "https://wallet.example.invalid/base"},
+		{"unusable callback port", "https://notify.example.invalid:70000", "https://wallet.example.invalid"},
 		{"query is not a base path", "https://notify.example.invalid/?site=1", "https://wallet.example.invalid"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -8123,6 +8146,58 @@ func TestWalletEpayCheckoutRequiresUsableCallbackAddresses(t *testing.T) {
 			var rows int64
 			require.NoError(t, model.DB.Model(&model.TopUp{}).Count(&rows).Error)
 			assert.Zero(t, rows)
+		})
+	}
+}
+
+// A broken new-sale destination or a more restrictive method minimum must not
+// prevent an already issued order from receiving its original paid callback.
+func TestWalletEpayNewSaleRestrictionsPreserveIssuedOrder(t *testing.T) {
+	for _, tc := range []struct{ name, base, minimum string }{
+		{"relative gateway", "/cashier", ""},
+		{"opaque gateway", "https:cashier", ""},
+		{"non-browser gateway", "ftp://gateway.example.invalid", ""},
+		{"invalid gateway port", "https://gateway.example.invalid:70000", ""},
+		{"method minimum", "https://gateway.example.invalid", "100.01"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, keys := walletCheckoutFixture(t)
+			router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestEpay)
+			checkout := func(quantity int) *httptest.ResponseRecorder {
+				r := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(fmt.Sprintf(`{"amount":%d,"payment_method":"alipay"}`, quantity)))
+				r.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, r)
+				return w
+			}
+			require.Contains(t, checkout(100).Body.String(), `"message":"success"`)
+			var issued model.TopUp
+			require.NoError(t, model.DB.First(&issued).Error)
+			operation_setting.PayAddress = tc.base
+			operation_setting.PayMethods = []map[string]string{{"name": "Alipay", "type": "alipay", "min_topup": tc.minimum}}
+			w := checkout(100)
+			var reply struct {
+				Message string `json:"message"`
+				URL     string `json:"url"`
+			}
+			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &reply))
+			assert.Equal(t, "error", reply.Message)
+			assert.Empty(t, reply.URL)
+			var count int64
+			require.NoError(t, model.DB.Model(&model.TopUp{}).Count(&count).Error)
+			assert.EqualValues(t, 1, count, "no new pending order")
+			if tc.minimum != "" {
+				assert.Contains(t, checkout(101).Body.String(), `"message":"success"`)
+			}
+			for range 2 {
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, walletWebhookRequest(t, keys, model.PaymentProviderEpay, issued.TradeNo, "100.00", true))
+				assert.Equal(t, "success", w.Body.String())
+			}
+			require.NoError(t, model.DB.First(&issued, issued.Id).Error)
+			assert.Equal(t, common.TopUpStatusSuccess, issued.Status)
+			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Where("top_up_id = ?", issued.Id).Count(&count).Error)
+			assert.EqualValues(t, 1, count)
 		})
 	}
 }

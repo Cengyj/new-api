@@ -94,6 +94,16 @@ beforeEach(() => {
   })
 })
 
+const signedEpayForm = {
+  pid: '1001',
+  type: 'alipay',
+  out_trade_no: 'issued_Epay',
+  name: 'TUC10',
+  money: '10.00',
+  notify_url: 'https://wallet.example.test/api/user/epay/notify',
+  sign: 'fixture',
+}
+
 const topupInfo: TopupInfo = {
   enable_online_topup: true,
   enable_stripe_topup: false,
@@ -241,7 +251,7 @@ test.each([
           ? {
               success: true,
               url: 'https://payments.example.test/checkout',
-              data: { out_trade_no: 'test-display-order' },
+              data: { ...signedEpayForm, out_trade_no: 'test-display-order' },
             }
           : { success: true, data: '10' },
     }))
@@ -766,7 +776,7 @@ const paymentCases = [
     body: {
       message: 'success',
       url: 'https://pay.example.test/pay',
-      data: { trade_no: 'test' },
+      data: signedEpayForm,
     },
   },
   {
@@ -976,15 +986,22 @@ test.each([
   expect(post).not.toHaveBeenCalled()
 })
 
-test.each(['NaN', 'Infinity', '10invalid', '0', '-1'])(
-  'invalid quote %s cannot become a payable amount',
-  async (quoted) => {
-    vi.spyOn(api, 'post').mockResolvedValue({
-      data: { success: true, data: quoted },
-    })
-    expect(await requestPaymentAmount(10, 'alipay')).toBe(0)
-  }
-)
+test.each([
+  'NaN',
+  'Infinity',
+  '10invalid',
+  '0',
+  '-1',
+  true,
+  { value: 1 },
+  ['19.99'],
+  '0x10',
+])('invalid quote %s cannot become a payable amount', async (quoted) => {
+  vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: true, data: quoted },
+  })
+  expect(await requestPaymentAmount(10, 'alipay')).toBe(0)
+})
 
 test.each([
   { calculating: true, amount: 10 },
@@ -1119,6 +1136,56 @@ test.each([
   }
 )
 
+test.each([
+  ['a proxy timeout document', '<html>Request timeout</html>', []],
+  [
+    'an identified uncertain order',
+    {
+      success: false,
+      trade_no: 'issued_original',
+      message_key:
+        'Payment request result is unknown. Check Order History before trying again.',
+    },
+    ['issued_original'],
+  ],
+] as const)(
+  'a 4xx response containing %s preserves checkout recovery',
+  async (_label, body, references) => {
+    const previous = api.defaults.adapter
+    const posts: string[] = []
+    api.defaults.adapter = async (config) => {
+      posts.push(config.url ?? '')
+      throw new AxiosError(
+        'Request timeout',
+        'ERR_BAD_REQUEST',
+        config,
+        undefined,
+        {
+          config,
+          headers: {},
+          status: 408,
+          statusText: 'Request Timeout',
+          data: body,
+        }
+      )
+    }
+    try {
+      const onUnknown = vi.fn()
+      const { result } = renderHook(() => usePayment(onUnknown))
+      await act(async () => {
+        expect(await result.current.processPayment(10, 'alipay')).toBe(false)
+      })
+      expect(onUnknown.mock.calls).toEqual([references])
+      expect(posts).toEqual(['/api/user/pay'])
+      expect(usePaymentRecoveryStore.getState().orders[1] ?? []).toEqual(
+        references
+      )
+    } finally {
+      api.defaults.adapter = previous
+    }
+  }
+)
+
 test('the real HTTP interceptor does not refresh or replay a payment rejected with 401', async () => {
   const originalAdapter = api.defaults.adapter
   const requests: AxiosRequestConfig[] = []
@@ -1151,6 +1218,45 @@ test('the real HTTP interceptor does not refresh or replay a payment rejected wi
     api.defaults.adapter = originalAdapter
   }
 })
+
+test.each([
+  { label: 'absent fields', data: {}, original: undefined },
+  {
+    label: 'missing signature',
+    data: { ...signedEpayForm, sign: ' ' },
+    original: 'issued_Epay',
+  },
+  {
+    label: 'missing original ID',
+    data: { ...signedEpayForm, out_trade_no: '' },
+    original: undefined,
+  },
+])(
+  'an incomplete Epay form ($label) opens recovery without submitting it',
+  async ({ data, original }) => {
+    const post = vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        message: 'success',
+        url: 'https://pay.example.test/submit.php',
+        data,
+      },
+    })
+    const submit = vi
+      .spyOn(HTMLFormElement.prototype, 'submit')
+      .mockImplementation(() => {})
+    const onUnknown = vi.fn()
+    const { result } = renderHook(() => usePayment(onUnknown))
+    await act(async () => {
+      expect(await result.current.processPayment(10, 'alipay')).toBe(false)
+    })
+    expect(post).toHaveBeenCalledOnce()
+    expect(submit).not.toHaveBeenCalled()
+    expect(onUnknown.mock.calls).toEqual([original ? [original] : []])
+    expect(usePaymentRecoveryStore.getState().orders[1] ?? []).toEqual(
+      original ? [original] : []
+    )
+  }
+)
 
 test('a browser exception after receiving the checkout preserves the original order', async () => {
   const post = vi.spyOn(api, 'post').mockResolvedValue({

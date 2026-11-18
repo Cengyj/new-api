@@ -16,7 +16,6 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { isAxiosError } from 'axios'
 import i18next from 'i18next'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { toast } from 'sonner'
@@ -33,6 +32,7 @@ import {
   completeOrder,
   isApiSuccess,
 } from '../api'
+import { hasPaymentDeclineResponse } from '../lib/payment'
 import type { TopupRecord } from '../types'
 
 // ============================================================================
@@ -172,8 +172,7 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
         }
       } catch (error) {
         if (signal.aborted) return false
-        const status = isAxiosError(error) ? error.response?.status : undefined
-        if (status !== undefined && status >= 400 && status < 500) {
+        if (hasPaymentDeclineResponse(error)) {
           handleServerError(error, i18next.t('Failed to complete order'))
         } else {
           // The database may have committed before the response was lost.
