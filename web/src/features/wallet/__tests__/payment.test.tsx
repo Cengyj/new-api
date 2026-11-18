@@ -1077,6 +1077,48 @@ test('a lost order response opens recovery without a guessed reference or anothe
   )
 })
 
+test.each([
+  [
+    'a proxy document',
+    '<!doctype html><title>Temporarily unavailable</title>',
+    true,
+  ],
+  [
+    'an unknown result without an order number',
+    {
+      success: false,
+      message_key:
+        'Payment request result is unknown. Check Order History before trying again.',
+    },
+    true,
+  ],
+  [
+    'a definite decline',
+    { message: 'error', data: 'Unsupported payment method' },
+    false,
+  ],
+] as const)(
+  '%s after submission opens history only when the outcome is uncertain',
+  async (_case, body, unknown) => {
+    const post = vi.spyOn(api, 'post').mockResolvedValue({ data: body })
+    const onUnknown = vi.fn()
+    const error = vi.spyOn(toast, 'error')
+    const { result } = renderHook(() => usePayment(onUnknown))
+    await act(async () => {
+      expect(await result.current.processPayment(10, 'stripe')).toBe(false)
+    })
+    if (unknown) {
+      expect(onUnknown).toHaveBeenCalledExactlyOnceWith()
+      expect(error).toHaveBeenCalledWith(
+        'Payment request result is unknown. Check Order History before trying again.'
+      )
+    } else {
+      expect(onUnknown).not.toHaveBeenCalled()
+    }
+    expect(post).toHaveBeenCalledOnce()
+  }
+)
+
 test('the real HTTP interceptor does not refresh or replay a payment rejected with 401', async () => {
   const originalAdapter = api.defaults.adapter
   const requests: AxiosRequestConfig[] = []

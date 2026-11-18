@@ -76,9 +76,7 @@ export function usePaymentOperation(
         const unknownOrder = sources.find(
           (source) =>
             source.message_key ===
-              'Payment request result is unknown. Check Order History before trying again.' &&
-            typeof source.trade_no === 'string' &&
-            /^[a-zA-Z0-9_-]{1,128}$/.test(source.trade_no)
+            'Payment request result is unknown. Check Order History before trying again.'
         )
         // Capture the reference before browser navigation, which can throw
         // even when the server successfully created the checkout.
@@ -97,8 +95,23 @@ export function usePaymentOperation(
         ) {
           unresolvedOrder = tradeNo
         }
+        // A proxy can return a document instead of the checkout receipt after
+        // the order was created. Only a recognized decline is safe to present as one.
+        if (
+          unknownOrder ||
+          (!checkout &&
+            !sources.some((s) => s.success === false || s.message === 'error'))
+        ) {
+          checkHistory = true
+          handleServerError(response, undefined, {
+            title: i18next.t(
+              'Payment request result is unknown. Check Order History before trying again.'
+            ),
+          })
+          return false
+        }
         const completed = handleResponse(response)
-        if (completed && !unknownOrder) unresolvedOrder = undefined
+        if (completed) unresolvedOrder = undefined
         checkHistory = !completed && !!checkout
         return completed
       } catch (error) {
