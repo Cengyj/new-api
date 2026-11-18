@@ -384,14 +384,11 @@ func RequestWaffoPay(c *gin.Context) {
 	}
 	paymentUrl, err := resolveWaffoCheckoutResponse(topUp, resp)
 	if err != nil {
-		if resp != nil && strings.TrimSpace(resp.Code) != "" && !resp.IsSuccess() {
+		if errors.Is(err, errWaffoCheckoutRejected) {
 			logger.LogWarn(c.Request.Context(), common.LogText("Waffo order creation rejected user_id=%d trade_no=%s code=%s", id, merchantOrderId, resp.Code))
-		} else {
-			logger.LogError(c.Request.Context(), common.LogText("Waffo failed to create order user_id=%d trade_no=%s error_type=%T", id, merchantOrderId, err))
-		}
-		if resp != nil && strings.TrimSpace(resp.Code) != "" && !resp.IsSuccess() {
 			paymentError(c, common.NewMessage("Failed to start payment"))
 		} else {
+			logger.LogError(c.Request.Context(), common.LogText("Waffo failed to create order user_id=%d trade_no=%s error_type=%T", id, merchantOrderId, err))
 			paymentCheckoutUnknown(c, merchantOrderId)
 		}
 		return
@@ -407,6 +404,8 @@ func RequestWaffoPay(c *gin.Context) {
 	})
 }
 
+var errWaffoCheckoutRejected = errors.New("Waffo rejected order creation")
+
 // resolveWaffoCheckoutResponse only fails the stored order when the provider
 // supplies an explicit rejection. Missing results must remain recoverable by
 // a later verified notification, including JSON null decoded by the SDK.
@@ -414,9 +413,22 @@ func resolveWaffoCheckoutResponse(topUp *model.TopUp, resp *core.ApiResponse[ord
 	if resp == nil || strings.TrimSpace(resp.Code) == "" {
 		return "", common.NewMessage("Failed to start payment")
 	}
-	if !resp.IsSuccess() {
+	// v1.3.2 also returns a nonzero code for an idempotency conflict
+	// (A0011) or a concurrent create (A0040). Neither rules out a paid order.
+	// Only documented create-time input, credential or policy rejections
+	// are terminal; leave other outcomes open for the authenticated inquiry.
+	switch resp.Code {
+	case "0":
+	case "A0001", "A0002", "A0003", "A0004", "A0005", "A0006", "A0007", "A0008",
+		"A0010", "A0012", "A0018", "A0020", "A0021", "A0022", "A0023", "A0024", "A0026",
+		"A0029", "A0030", "A0031", "A0032", "A0033", "A0034", "A0037", "A0038", "A0045", "D0001":
 		topUp.Status = common.TopUpStatusFailed
-		return "", errors.Join(common.NewMessage("Failed to start payment"), topUp.Update())
+		if err := topUp.Update(); err != nil {
+			return "", err
+		}
+		return "", errWaffoCheckoutRejected
+	default:
+		return "", common.NewMessage("Failed to start payment")
 	}
 
 	orderData := resp.GetData()

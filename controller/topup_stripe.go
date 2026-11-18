@@ -412,7 +412,7 @@ func fulfillOrder(ctx context.Context, event stripe.Event, referenceId string, c
 		return err
 	}
 	currency := strings.ToUpper(event.GetObjectValue("currency"))
-	logger.LogInfo(ctx, common.LogText("Stripe top-up succeeded trade_no=%s amount_total=%.2f currency=%s event_type=%s client_ip=%s", referenceId, float64(total)/100, currency, string(event.Type), callerIp))
+	logger.LogInfo(ctx, common.LogText("Stripe top-up succeeded trade_no=%s amount_total_minor=%d currency=%s event_type=%s client_ip=%s", referenceId, total, currency, string(event.Type), callerIp))
 	return nil
 }
 

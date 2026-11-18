@@ -204,7 +204,7 @@
   "Stripe top-up order marked as failed trade_no=%s client_ip=%s": "Stripe 充值订单已标记为失败 trade_no=%s client_ip=%s",
   "Stripe top-up order not found, cannot mark as expired trade_no=%s": "Stripe 充值订单不存在，无法标记过期 trade_no=%s",
   "Stripe top-up processing failed trade_no=%s event_type=%s client_ip=%s error=%q": "Stripe 充值处理失败 trade_no=%s event_type=%s client_ip=%s error=%q",
-  "Stripe top-up succeeded trade_no=%s amount_total=%.2f currency=%s event_type=%s client_ip=%s": "Stripe 充值成功 trade_no=%s amount_total=%.2f currency=%s event_type=%s client_ip=%s",
+  "Stripe top-up succeeded trade_no=%s amount_total_minor=%d currency=%s event_type=%s client_ip=%s": "Stripe 充值成功 trade_no=%s amount_total_minor=%d currency=%s event_type=%s client_ip=%s",
   "Stripe wallet event ignored reason=checkout_source_mismatch trade_no=%s event_type=%s mode=%q payment_link=%t": "Stripe 钱包事件已忽略 reason=checkout_source_mismatch trade_no=%s event_type=%s mode=%q payment_link=%t",
   "Stripe webhook failed to read request body path=%q client_ip=%s error=%q": "Stripe webhook 读取请求体失败 path=%q client_ip=%s error=%q",
   "Stripe webhook ignored event event_type=%s client_ip=%s": "Stripe webhook 忽略事件 event_type=%s client_ip=%s",

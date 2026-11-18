@@ -214,6 +214,7 @@ function BillingHistoryContent({
                   // Frozen quota is authoritative. Only legacy orders need
                   // the provider's historical Amount units (Creem uses quota).
                   const creditedQuota = record.credited_quota
+                  const isStripe = record.payment_provider === 'stripe'
                   const formatAmount =
                     creditedQuota != null || record.payment_provider === 'creem'
                       ? formatQuotaWithCurrency
@@ -288,18 +289,23 @@ function BillingHistoryContent({
                         </div>
                         <div className='space-y-1'>
                           <Label className='text-muted-foreground text-xs'>
-                            {t('Amount')}
+                            {t('Quota')}
                           </Label>
                           <div className='text-sm font-semibold'>
-                            {displayAmount}
+                            {isStripe && creditedQuota == null
+                              ? t('Not recorded')
+                              : displayAmount}
                           </div>
                         </div>
                         <div className='space-y-1'>
                           <Label className='text-muted-foreground text-xs'>
-                            {t('Payment')}
+                            {isStripe ? t('Quantity') : t('Price')}
                           </Label>
                           <div className='text-sm font-semibold text-red-600'>
-                            {formatNumber(record.money, locale)}
+                            {formatNumber(
+                              isStripe ? record.amount : record.money,
+                              locale
+                            )}
                           </div>
                         </div>
                       </div>

@@ -1929,6 +1929,9 @@ func TestWalletPaymentWebhookLogsExcludeRequestSecrets(t *testing.T) {
 					var payload map[string]any
 					require.NoError(t, common.DecodeJson(request.Body, &payload))
 					payload["private_customer_data"] = privateBody
+					if provider == model.PaymentProviderStripe {
+						payload["data"].(map[string]any)["object"].(map[string]any)["currency"] = "jpy"
+					}
 					request = signedWalletWebhookRequest(t, keys, provider, payload)
 					header, path, handler := "Stripe-Signature", "/api/stripe/webhook", StripeWebhook
 					switch provider {
@@ -1965,6 +1968,9 @@ func TestWalletPaymentWebhookLogsExcludeRequestSecrets(t *testing.T) {
 					assert.Equal(t, http.StatusOK, recorder.Code)
 					assert.Equal(t, common.TopUpStatusSuccess, order.Status)
 					assert.Contains(t, output.String(), order.TradeNo)
+					if provider == model.PaymentProviderStripe {
+						assert.Contains(t, output.String(), "amount_total_minor=100 currency=JPY")
+					}
 				} else {
 					assert.Equal(t, common.TopUpStatusPending, order.Status)
 				}
@@ -5905,6 +5911,7 @@ func TestWalletCreemOptionalPaidAmountPreservesDocumentedCheckout(t *testing.T) 
 				"id": "evt_documented_optional_amount_paid", "eventType": "checkout.completed", "created_at": time.Now().UnixMilli(),
 				"object": map[string]any{
 					"id": "ch_documented", "mode": "test", "object": "checkout", "status": "completed", "request_id": topUp.TradeNo, "order": order,
+					"customer": map[string]any{"email": "receipt@example.invalid"},
 					"product": map[string]any{
 						"id": "prod_documented", "mode": "test", "object": "product", "name": "Wallet credits", "description": "Wallet credits",
 						"price": 9000, "currency": "USD", "billing_type": "onetime", "billing_period": "once", "status": "active", "tax_mode": "inclusive", "tax_category": "saas",
@@ -5943,6 +5950,7 @@ func TestWalletCreemOptionalPaidAmountPreservesDocumentedCheckout(t *testing.T) 
 				assert.Equal(t, 107, inviter.AffQuota)
 				assert.Equal(t, 111, inviter.AffHistoryQuota)
 				assert.Equal(t, common.TopUpStatusSuccess, topUp.Status)
+				assert.Empty(t, buyer.Email, "settling a receipt must not bind an account email")
 				require.Len(t, facts, 1)
 				assert.EqualValues(t, 1000, facts[0].CreditedQuota)
 				assert.EqualValues(t, 100, facts[0].RewardQuota)
@@ -7350,6 +7358,9 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 		{name: "nil_response", status: 200, signature: "valid", code: "0"},
 		{name: "network_failure", status: 200, signature: "valid", code: "0"},
 		{name: "unknown_status", status: 200, signature: "valid", code: "E0001"},
+		{name: "idempotency_conflict", status: 200, signature: "valid", code: "A0011"},
+		{name: "creation_in_progress", status: 200, signature: "valid", code: "A0040"},
+		{name: "unclassified_response_code", status: 200, signature: "valid", code: "unknown"},
 		{name: "missing_signature", status: 200, signature: "missing", code: "0"},
 		{name: "empty_signature", status: 200, signature: "empty", code: "0"},
 		{name: "blank_signature", status: 200, signature: "blank", code: "0"},

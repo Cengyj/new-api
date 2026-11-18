@@ -281,7 +281,7 @@ func UpdatePendingTopUpStatus(tradeNo string, expectedPaymentProvider string, ta
 // across processes. Subscription display rows are never wallet orders.
 // A non-nil order confirms SQL success; an accompanying error means its cache
 // completion still needs retrying with this same order, never a new credit.
-func settleWalletTopUp(tradeNo, expectedProvider, actualMethod, customerID, customerEmail string, settlement TopUpSettlementAudit) (*TopUp, int, bool, error) {
+func settleWalletTopUp(tradeNo, expectedProvider, actualMethod, customerID string, settlement TopUpSettlementAudit) (*TopUp, int, bool, error) {
 	if tradeNo == "" {
 		return nil, 0, false, errors.New("payment order number not provided")
 	}
@@ -345,12 +345,6 @@ func settleWalletTopUp(tradeNo, expectedProvider, actualMethod, customerID, cust
 		if expectedProvider == PaymentProviderStripe {
 			updates["stripe_customer"] = customerID
 		}
-		if expectedProvider == PaymentProviderCreem && customerEmail != "" {
-			// Only fill an empty email; do not overwrite a concurrent profile edit.
-			if err := tx.Model(&User{}).Where("id = ? AND email = ?", topUp.UserId, "").Update("email", customerEmail).Error; err != nil {
-				return err
-			}
-		}
 		if err := creditTopUpQuota(tx, topUp.UserId, quota, updates); err != nil {
 			return err
 		}
@@ -406,7 +400,7 @@ func formatTopUpLogQuota(quota int) string {
 }
 
 func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (bool, error) {
-	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, PaymentProviderEpay, actualPaymentMethod, "", "", TopUpSettlementAudit{Source: "payment"})
+	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, PaymentProviderEpay, actualPaymentMethod, "", TopUpSettlementAudit{Source: "payment"})
 	if topUp == nil || alreadyDone {
 		return alreadyDone, err
 	}
@@ -415,11 +409,11 @@ func RechargeEpay(tradeNo string, actualPaymentMethod string, callerIp string) (
 }
 
 func Recharge(referenceId string, customerId string, callerIp string) error {
-	topUp, quota, alreadyDone, err := settleWalletTopUp(referenceId, PaymentProviderStripe, "", customerId, "", TopUpSettlementAudit{Source: "payment"})
+	topUp, quota, alreadyDone, err := settleWalletTopUp(referenceId, PaymentProviderStripe, "", customerId, TopUpSettlementAudit{Source: "payment"})
 	if topUp == nil || alreadyDone {
 		return err
 	}
-	RecordTopupLog(topUp.UserId, common.NewMessage("Online top-up succeeded, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"quota": formatTopUpLogQuota(quota), "amount": topUp.Amount}), callerIp, topUp.PaymentMethod, PaymentMethodStripe)
+	RecordTopupLog(topUp.UserId, common.NewMessage("{{provider}} top-up credited: {{quota}} (order {{trade_no}})", map[string]any{"provider": "Stripe", "quota": formatTopUpLogQuota(quota), "trade_no": topUp.TradeNo}), callerIp, topUp.PaymentMethod, PaymentMethodStripe)
 	return err
 }
 
@@ -620,7 +614,7 @@ func ManualCompleteTopUp(tradeNo string, callerIp string, operator TopUpSettleme
 	if tradeNo == "" {
 		return common.NewMessage("Order number not provided")
 	}
-	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, "", "", "", "", TopUpSettlementAudit{Source: "manual", Operator: &operator})
+	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, "", "", "", TopUpSettlementAudit{Source: "manual", Operator: &operator})
 	if errors.Is(err, ErrTopUpNotFound) {
 		return common.NewMessage("Top-up order does not exist")
 	}
@@ -630,33 +624,35 @@ func ManualCompleteTopUp(tradeNo string, callerIp string, operator TopUpSettleme
 	if topUp == nil || alreadyDone {
 		return err
 	}
-	RecordTopupLog(topUp.UserId, common.NewMessage("Administrator completed the order, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"quota": formatTopUpLogQuota(quota), "amount": fmt.Sprintf("%f", topUp.Money)}), callerIp, topUp.PaymentMethod, "admin")
+	RecordTopupLog(topUp.UserId, common.NewMessage("Administrator credited {{quota}} for order {{trade_no}}", map[string]any{"quota": formatTopUpLogQuota(quota), "trade_no": topUp.TradeNo}), callerIp, topUp.PaymentMethod, "admin")
 	return err
 }
 
-func RechargeCreem(referenceId string, customerEmail string, customerName string, callerIp string) error {
-	topUp, quota, alreadyDone, err := settleWalletTopUp(referenceId, PaymentProviderCreem, "", "", customerEmail, TopUpSettlementAudit{Source: "payment"})
+// Receipt contacts are not verified account identities. Retain the existing
+// public signature without binding either contact field to the wallet owner.
+func RechargeCreem(referenceId, _, _, callerIp string) error {
+	topUp, quota, alreadyDone, err := settleWalletTopUp(referenceId, PaymentProviderCreem, "", "", TopUpSettlementAudit{Source: "payment"})
 	if topUp == nil || alreadyDone {
 		return err
 	}
-	RecordTopupLog(topUp.UserId, common.NewMessage("{{provider}} top-up succeeded, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"provider": "Creem", "quota": quota, "amount": fmt.Sprintf("%.2f", topUp.Money)}), callerIp, topUp.PaymentMethod, PaymentMethodCreem)
+	RecordTopupLog(topUp.UserId, common.NewMessage("{{provider}} top-up credited: {{quota}} (order {{trade_no}})", map[string]any{"provider": "Creem", "quota": formatTopUpLogQuota(quota), "trade_no": topUp.TradeNo}), callerIp, topUp.PaymentMethod, PaymentMethodCreem)
 	return err
 }
 
 func RechargeWaffo(tradeNo string, callerIp string) error {
-	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, PaymentProviderWaffo, "", "", "", TopUpSettlementAudit{Source: "payment"})
+	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, PaymentProviderWaffo, "", "", TopUpSettlementAudit{Source: "payment"})
 	if topUp == nil || alreadyDone {
 		return err
 	}
-	RecordTopupLog(topUp.UserId, common.NewMessage("{{provider}} top-up succeeded, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"provider": "Waffo", "quota": formatTopUpLogQuota(quota), "amount": fmt.Sprintf("%.2f", topUp.Money)}), callerIp, topUp.PaymentMethod, PaymentMethodWaffo)
+	RecordTopupLog(topUp.UserId, common.NewMessage("{{provider}} top-up credited: {{quota}} (order {{trade_no}})", map[string]any{"provider": "Waffo", "quota": formatTopUpLogQuota(quota), "trade_no": topUp.TradeNo}), callerIp, topUp.PaymentMethod, PaymentMethodWaffo)
 	return err
 }
 
 func RechargeWaffoPancake(tradeNo string) error {
-	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, PaymentProviderWaffoPancake, "", "", "", TopUpSettlementAudit{Source: "payment"})
+	topUp, quota, alreadyDone, err := settleWalletTopUp(tradeNo, PaymentProviderWaffoPancake, "", "", TopUpSettlementAudit{Source: "payment"})
 	if topUp == nil || alreadyDone {
 		return err
 	}
-	RecordLog(topUp.UserId, LogTypeTopup, common.NewMessage("{{provider}} top-up succeeded, amount added: {{quota}}, payment amount: {{amount}}", map[string]any{"provider": "Waffo Pancake", "quota": formatTopUpLogQuota(quota), "amount": fmt.Sprintf("%.2f", topUp.Money)}))
+	RecordLog(topUp.UserId, LogTypeTopup, common.NewMessage("{{provider}} top-up credited: {{quota}} (order {{trade_no}})", map[string]any{"provider": "Waffo Pancake", "quota": formatTopUpLogQuota(quota), "trade_no": topUp.TradeNo}))
 	return err
 }

@@ -368,19 +368,7 @@ func handleCheckoutCompleted(c *gin.Context, event *CreemWebhookEvent) {
 	}
 	logger.LogInfo(c.Request.Context(), common.LogText("Creem wallet payment verified trade_no=%s creem_order_id=%s amount=%d amount_field=%s currency=%s", referenceId, event.Object.Order.Id, *amount, amountField, event.Object.Order.Currency))
 
-	// 处理充值，传入客户邮箱和姓名信息
-	customerEmail := event.Object.Customer.Email
-	customerName := event.Object.Customer.Name
-
-	// 防护性检查，确保邮箱和姓名不为空字符串
-	if customerEmail == "" {
-		logger.LogWarn(c.Request.Context(), common.LogText("Creem callback customer email is empty trade_no=%s creem_order_id=%s", referenceId, event.Object.Order.Id))
-	}
-	if customerName == "" {
-		logger.LogWarn(c.Request.Context(), common.LogText("Creem callback customer name is empty trade_no=%s creem_order_id=%s", referenceId, event.Object.Order.Id))
-	}
-
-	err := model.RechargeCreem(referenceId, customerEmail, customerName, c.ClientIP())
+	err := model.RechargeCreem(referenceId, "", "", c.ClientIP())
 	if err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Creem top-up processing failed trade_no=%s creem_order_id=%s client_ip=%s error=%q", referenceId, event.Object.Order.Id, c.ClientIP(), err.Error()))
 		c.AbortWithStatus(http.StatusInternalServerError)

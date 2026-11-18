@@ -337,7 +337,7 @@ test.each([
     provider: 'stripe',
     method: 'stripe',
     amount: 10,
-    expected: '$10',
+    expected: 'Not recorded',
     quota: undefined,
   },
 ])(
@@ -364,7 +364,13 @@ test.each([
     render(<BillingHistoryDialog open onOpenChange={vi.fn()} />)
     expect(await screen.findByText(record.trade_no)).toBeVisible()
     expect(screen.getByText(expected)).toBeVisible()
-    expect(screen.getByText('90')).toBeVisible()
+    if (provider === 'stripe') {
+      expect(screen.getByText('Quantity')).toBeVisible()
+      expect(screen.getByText('10')).toBeVisible()
+      expect(screen.queryByText('90')).not.toBeInTheDocument()
+    } else {
+      expect(screen.getByText('90')).toBeVisible()
+    }
   }
 )
 

@@ -1867,7 +1867,7 @@ func TestReferralColdCacheAndWalletCreditAcrossProcesses(t *testing.T) {
 					// Use the wallet transaction boundary directly: a post-commit
 					// log's username read could refill quota 107 and mask a stale
 					// publication bug by making the hash already contain Quota.
-					_, settledQuota, duplicate, err := settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "alipay", "", "", TopUpSettlementAudit{Source: "payment"})
+					_, settledQuota, duplicate, err := settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "alipay", "", TopUpSettlementAudit{Source: "payment"})
 					require.NoError(t, err)
 					require.False(t, duplicate)
 					require.Equal(t, 100, settledQuota)

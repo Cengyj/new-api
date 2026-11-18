@@ -1284,7 +1284,7 @@ func TestReferralWalletMixedCreditsRecoverOriginalIdentitiesAcrossDatabases(t *t
 			// Both SQL transactions really commit. Only their subsequent cache
 			// finalizations see the closed client, leaving distinct pending credits.
 			DB = interrupted
-			settled, credited, duplicate, err := settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", "", TopUpSettlementAudit{Source: "payment"})
+			settled, credited, duplicate, err := settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", TopUpSettlementAudit{Source: "payment"})
 			require.ErrorIs(t, err, redis.ErrClosed)
 			require.NotNil(t, settled)
 			require.False(t, duplicate)
@@ -1348,7 +1348,7 @@ func TestReferralWalletMixedCreditsRecoverOriginalIdentitiesAcrossDatabases(t *t
 			assert.Equal(t, runID, refreshed["WalletRedisRunID"])
 
 			for range 2 {
-				settled, credited, duplicate, err = settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", "", TopUpSettlementAudit{Source: "payment"})
+				settled, credited, duplicate, err = settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", TopUpSettlementAudit{Source: "payment"})
 				require.NoError(t, err)
 				require.True(t, duplicate)
 				require.NotNil(t, settled)
@@ -2402,7 +2402,7 @@ func TestReferralWalletRecoversExpiredPendingCreditsAfterRedisRestart(t *testing
 	order := TopUp{UserId: invitee.Id, TradeNo: "restart-ttl-pending-credit", CreditedQuota: &credit, PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending}
 	require.NoError(t, order.Insert())
 	DB = interrupted
-	settled, credited, duplicate, err := settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", "", TopUpSettlementAudit{Source: "payment"})
+	settled, credited, duplicate, err := settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", TopUpSettlementAudit{Source: "payment"})
 	require.Error(t, err, "SQL commits before the cache finalization failure")
 	require.NotNil(t, settled)
 	require.False(t, duplicate)
@@ -2483,7 +2483,7 @@ func TestReferralWalletRecoversExpiredPendingCreditsAfterRedisRestart(t *testing
 		t.Logf("restored %s: pending marker=%s, quota=%s, TTL before rejection=%s, after=%s", key, beforeHash[markers[user.Id]], beforeHash["Quota"], ttl, afterTTL)
 		remaining = max(remaining, afterTTL)
 	}
-	_, _, duplicate, err = settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", "", TopUpSettlementAudit{Source: "payment"})
+	_, _, duplicate, err = settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", TopUpSettlementAudit{Source: "payment"})
 	require.True(t, duplicate)
 	require.ErrorIs(t, err, ErrWalletCacheRecoveryRequired)
 	foundTransfer, err := GetAffiliateTransfer(inviter.Id, requestID)
@@ -2503,7 +2503,7 @@ func TestReferralWalletRecoversExpiredPendingCreditsAfterRedisRestart(t *testing
 	require.NoError(t, err)
 	require.Zero(t, exists, "both restored balances and pending markers must expire naturally")
 	for range 2 {
-		_, _, duplicate, err = settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", "", TopUpSettlementAudit{Source: "payment"})
+		_, _, duplicate, err = settleWalletTopUp(order.TradeNo, PaymentProviderEpay, "", "", TopUpSettlementAudit{Source: "payment"})
 		require.NoError(t, err)
 		require.True(t, duplicate)
 		foundTransfer, err = GetAffiliateTransfer(inviter.Id, requestID)
