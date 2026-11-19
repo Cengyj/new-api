@@ -25,7 +25,7 @@ func SaveReferralRebateRule(c *gin.Context) {
 		Percentage *string `json:"percentage"`
 		ValidDays  *string `json:"valid_days"`
 	}
-	if common.DecodeJson(c.Request.Body, &request) != nil || request.Enabled == nil || request.Percentage == nil || request.ValidDays == nil {
+	if common.DecodeJsonBody(c.Request.Body, &request) != nil || request.Enabled == nil || request.Percentage == nil || request.ValidDays == nil {
 		common.ApiErrorT(c, "Invalid referral rebate rule")
 		return
 	}

@@ -267,6 +267,7 @@ func TestReferralRoutesEnforceIdentityRolesAndTokenScopes(t *testing.T) {
 		status                          int
 		quota                           string
 		failure                         bool
+		expectDefaultRule               bool
 	}{
 		{name: "anonymous", method: "GET", path: "/api/user/referral", user: -1, status: http.StatusUnauthorized},
 		{name: "own summary ignores injected identity", method: "GET", path: "/api/user/referral?user_id=2", scope: "wallet:read", user: 0, status: http.StatusOK, quota: "321"},
@@ -288,10 +289,11 @@ func TestReferralRoutesEnforceIdentityRolesAndTokenScopes(t *testing.T) {
 		{name: "transfer replay remains successful while paused", method: "POST", path: "/api/user/aff_transfer", scope: "wallet:write", user: 0, status: http.StatusOK, body: `{"quota":25,"request_id":"referral-route-transfer"}`},
 		{name: "admin cannot change root settings", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 1, status: http.StatusForbidden},
 		{name: "root needs read scope", method: "GET", path: "/api/option/referral_rebate", scope: "wallet:read", user: 2, status: http.StatusForbidden},
-		{name: "root reads rule", method: "GET", path: "/api/option/referral_rebate", scope: "option:read", user: 2, status: http.StatusOK},
+		{name: "root reads rule", method: "GET", path: "/api/option/referral_rebate", scope: "option:read", user: 2, status: http.StatusOK, expectDefaultRule: true},
 		{name: "read scope cannot save", method: "PUT", path: "/api/option/referral_rebate", scope: "option:read", user: 2, status: http.StatusForbidden},
-		{name: "root saves default disabled rule", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":false,"percentage":"5","valid_days":"7"}`},
-		{name: "root cannot erase configured default rule", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":false,"percentage":"","valid_days":""}`, failure: true},
+		{name: "root saves default disabled rule", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":false,"percentage":"5","valid_days":"7"}` + "\n", expectDefaultRule: true},
+		{name: "root rule save rejects trailing data", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":false,"percentage":"7","valid_days":"2"}{}`, failure: true, expectDefaultRule: true},
+		{name: "root cannot erase configured default rule", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":false,"percentage":"","valid_days":""}`, failure: true, expectDefaultRule: true},
 		{name: "root saves complete unconfigured rule", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":false,"percentage":"","valid_days":""}`},
 		{name: "root cannot save only one rule field", method: "PUT", path: "/api/option/referral_rebate", scope: "option:write", user: 2, status: http.StatusOK, body: `{"enabled":true}`, failure: true},
 		{name: "general option endpoint cannot bypass rule validation", method: "PUT", path: "/api/option/", scope: "option:write", user: 2, status: http.StatusOK, body: `{"key":"ReferralRebateRule","value":"{}"}`, failure: true},
@@ -338,7 +340,7 @@ func TestReferralRoutesEnforceIdentityRolesAndTokenScopes(t *testing.T) {
 					assert.Equal(t, tc.quota, result.Data.AffQuota)
 				}
 			}
-			if tc.name == "root reads rule" || tc.name == "root saves default disabled rule" || tc.name == "root cannot erase configured default rule" {
+			if tc.expectDefaultRule {
 				rule, err := model.GetReferralRebateRule()
 				require.NoError(t, err)
 				assert.Equal(t, model.ReferralRebateRule{RateBPS: 500, ValidDays: 7}, rule)
