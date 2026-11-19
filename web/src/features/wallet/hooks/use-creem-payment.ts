@@ -23,14 +23,16 @@ import { toast } from 'sonner'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { requestCreemPayment, isApiSuccess } from '../api'
-import { isPurchasableCreemProduct, isSafePaymentUrl } from '../lib/payment'
+import {
+  isPurchasableCreemProduct,
+  isSafePaymentUrl,
+  navigateToPayment,
+} from '../lib/payment'
 import type { CreemProduct } from '../types'
 import { usePaymentOperation } from './use-payment-operation'
 
-export function useCreemPayment(
-  onUnknownCheckout?: (tradeNo?: string) => void
-) {
-  const { processing, runPayment } = usePaymentOperation(onUnknownCheckout)
+export function useCreemPayment(onReviewCheckout?: (tradeNo?: string) => void) {
+  const { processing, runPayment } = usePaymentOperation(onReviewCheckout)
   const processCreemPayment = useCallback(
     async (product: CreemProduct) => {
       if (!isPurchasableCreemProduct(product)) {
@@ -38,7 +40,7 @@ export function useCreemPayment(
         return false
       }
       return runPayment(
-        (signal) =>
+        (signal, onDispatch) =>
           requestCreemPayment(
             {
               product_id: product.productId,
@@ -49,7 +51,8 @@ export function useCreemPayment(
                 quota: product.quota,
               },
             },
-            signal
+            signal,
+            onDispatch
           ),
         (response) => {
           if (!isApiSuccess(response)) {
@@ -60,11 +63,7 @@ export function useCreemPayment(
             toast.error(i18next.t('Invalid payment redirect URL'))
             return false
           }
-          window.open(
-            response.data.checkout_url,
-            '_blank',
-            'noopener,noreferrer'
-          )
+          navigateToPayment(response.data.checkout_url)
           toast.success(i18next.t('Redirecting to Creem checkout...'))
           return true
         }

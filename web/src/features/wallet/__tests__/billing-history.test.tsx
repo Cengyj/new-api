@@ -284,8 +284,12 @@ describe('billing history authentication recovery', () => {
     await act(async () => {
       expect(
         await result.current.runPayment(
-          (signal) =>
-            requestPayment({ amount: 1, payment_method: 'alipay' }, signal),
+          (signal, onDispatch) =>
+            requestPayment(
+              { amount: 1, payment_method: 'alipay' },
+              signal,
+              onDispatch
+            ),
           () => true
         )
       ).toBe(false)
@@ -302,6 +306,52 @@ describe('billing history authentication recovery', () => {
       2
     )
     expect(XMLHttpRequest.prototype.open).toHaveBeenCalledTimes(1)
+  })
+
+  test('a checkout response from before a role change leaves the new wallet view alone', async () => {
+    const notify = vi.spyOn(toast, 'error')
+    const recover = vi.fn()
+    const openCheckout = vi.fn(() => true)
+    let deliver!: () => void
+    const receipt = new Promise<void>((resolve) => {
+      deliver = resolve
+    })
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+      await receipt
+      return {
+        config,
+        data: {
+          message: 'success',
+          data: { out_trade_no: 'issued-before-demotion' },
+        },
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+      }
+    })
+    api.defaults.adapter = adapter
+    const { result } = renderHook(() => usePaymentOperation(recover))
+    let operation!: Promise<boolean>
+    await act(async () => {
+      operation = result.current.runPayment(
+        (signal, onDispatch) =>
+          requestPayment(
+            { amount: 1, payment_method: 'alipay' },
+            signal,
+            onDispatch
+          ),
+        openCheckout
+      )
+    })
+    expect(adapter).toHaveBeenCalledOnce()
+    await act(async () => {
+      useAuthStore.getState().auth.setUser({ ...original.user, role: 1 })
+      deliver()
+      expect(await operation).toBe(false)
+    })
+    expect(openCheckout).not.toHaveBeenCalled()
+    expect(recover).not.toHaveBeenCalled()
+    expect(notify).not.toHaveBeenCalled()
   })
 })
 
@@ -517,21 +567,27 @@ describe('billing history frozen quota display', () => {
   )
 })
 
-test('a failed payment is shown as failed and never offers administrator completion', async () => {
-  vi.spyOn(api, 'get').mockResolvedValue({
-    data: {
-      success: true,
-      data: { items: [{ ...record, status: 'failed' }], total: 1 },
-    },
-  })
-  render(<BillingHistoryDialog open onOpenChange={vi.fn()} />)
-  expect(await screen.findByText(record.trade_no)).toBeVisible()
-  expect(screen.getByText('Failed')).toBeVisible()
-  expect(screen.queryByText('Pending')).not.toBeInTheDocument()
-  expect(
-    screen.queryByRole('button', { name: 'Complete Order' })
-  ).not.toBeInTheDocument()
-})
+test.each([
+  ['failed', 'Failed'],
+  ['unknown-historical-status', 'Unknown'],
+])(
+  'payment status %s is shown as %s without administrator completion',
+  async (status, label) => {
+    vi.spyOn(api, 'get').mockResolvedValue({
+      data: {
+        success: true,
+        data: { items: [{ ...record, status }], total: 1 },
+      },
+    })
+    render(<BillingHistoryDialog open onOpenChange={vi.fn()} />)
+    expect(await screen.findByText(record.trade_no)).toBeVisible()
+    expect(screen.getByText(label)).toBeVisible()
+    expect(screen.queryByText('Pending')).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'Complete Order' })
+    ).not.toBeInTheDocument()
+  }
+)
 
 test.each(['business rejection', 'network failure'])(
   'a billing history %s stays unconfirmed until an explicit retry succeeds',
@@ -720,10 +776,12 @@ test.each([
       )
       expect(successNotify).not.toHaveBeenCalled()
       expect(result.current.records[0].status).toBe('pending')
-      await act(async () => {
-        await result.current.refresh()
-      })
-      expect(result.current.records[0].status).toBe('success')
+      await waitFor(() =>
+        expect(result.current.records[0].status).toBe('success')
+      )
+      expect(requests.at(-1)?.url).toBe(
+        '/api/user/topup?p=1&page_size=10&keyword=pending-order'
+      )
       const writes = requests.filter((request) => request.method === 'post')
       expect(writes).toHaveLength(1)
       expect(writes[0].url).toBe('/api/user/topup/complete')
@@ -799,11 +857,11 @@ test('a completed order closes confirmation even when refreshing the history fai
     .mockResolvedValue({ data: { success: true } })
   render(<BillingHistoryDialog open onOpenChange={vi.fn()} />)
   fireEvent.click(await screen.findByRole('button', { name: 'Complete Order' }))
-  fireEvent.click(
-    within(
-      screen.getByRole('alertdialog', { name: 'Complete Order' })
-    ).getByRole('button', { name: 'Confirm' })
+  const confirm = within(
+    screen.getByRole('alertdialog', { name: 'Complete Order' })
   )
+  expect(confirm.getByText(record.trade_no)).toBeVisible()
+  fireEvent.click(confirm.getByRole('button', { name: 'Confirm' }))
   await waitFor(() => expect(get).toHaveBeenCalledTimes(2))
   await waitFor(() =>
     expect(
@@ -824,6 +882,80 @@ test('a completed order closes confirmation even when refreshing the history fai
   expect(get).toHaveBeenCalledTimes(3)
   expect(post).toHaveBeenCalledTimes(1)
 })
+
+test.each(['lost receipt', 'cache recovery error'])(
+  'after a %s the next administrator action checks the selected order without issuing another credit',
+  async (outcome) => {
+    const selected = { ...record, id: 2, trade_no: 'verified-original-order' }
+    const get = vi
+      .spyOn(api, 'get')
+      .mockResolvedValueOnce({
+        data: { success: true, data: { items: [record, selected], total: 2 } },
+      })
+      .mockRejectedValueOnce(
+        new AxiosError('History unavailable', 'ERR_NETWORK')
+      )
+      .mockResolvedValue({
+        data: {
+          success: true,
+          data: { items: [{ ...selected, status: 'success' }], total: 1 },
+        },
+      })
+    const post = vi.spyOn(api, 'post')
+    if (outcome === 'lost receipt') {
+      post.mockRejectedValue(new AxiosError('Response lost', 'ERR_NETWORK'))
+    } else {
+      post.mockResolvedValue({
+        data: {
+          success: false,
+          message:
+            'Wallet cache recovery is required. Contact the administrator.',
+          message_key:
+            'Wallet cache recovery is required. Contact the administrator.',
+        },
+      })
+    }
+    const error = vi.spyOn(toast, 'error')
+    render(<BillingHistoryDialog open onOpenChange={vi.fn()} />)
+    const actions = await screen.findAllByRole('button', {
+      name: 'Complete Order',
+    })
+    await userEvent.click(actions[1])
+    const confirmation = screen.getByRole('alertdialog', {
+      name: 'Complete Order',
+    })
+    expect(within(confirmation).getByText(selected.trade_no)).toBeVisible()
+    await userEvent.click(
+      within(confirmation).getByRole('button', { name: 'Confirm' })
+    )
+    await waitFor(() =>
+      expect(error).toHaveBeenCalledWith(
+        outcome === 'lost receipt'
+          ? 'Order completion result is unknown. Refresh Order History before retrying this order.'
+          : 'Wallet cache recovery is required. Contact the administrator.'
+      )
+    )
+
+    // The only available recovery action after the failed history read is a GET.
+    const recovery = await screen.findByRole('button', {
+      name: /^(Retry|Confirm)$/,
+    })
+    await userEvent.click(recovery)
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(post.mock.calls[0].slice(0, 2)).toEqual([
+      '/api/user/topup/complete',
+      { trade_no: selected.trade_no },
+    ])
+    expect(get.mock.calls.slice(1).map(([url]) => url)).toEqual([
+      '/api/user/topup?p=1&page_size=10&keyword=verified-original-order',
+      '/api/user/topup?p=1&page_size=10&keyword=verified-original-order',
+    ])
+    expect(await screen.findByText('Success')).toBeVisible()
+    expect(
+      screen.queryByRole('button', { name: 'Complete Order' })
+    ).not.toBeInTheDocument()
+  }
+)
 
 test('a completion response refreshes the current search instead of restoring the old unfiltered page', async () => {
   const get = vi.spyOn(api, 'get').mockImplementation(async (url) => ({
@@ -866,6 +998,68 @@ test('a completion response refreshes the current search instead of restoring th
   await waitFor(() => expect(get).toHaveBeenCalledTimes(3))
   expect(result.current.keyword).toBe('matching')
   expect(result.current.records[0]?.trade_no).toBe('matching-order')
+})
+
+test('changing an administrator order search immediately hides the previous pending order and completion action', async () => {
+  vi.spyOn(api, 'get')
+    .mockResolvedValueOnce(history)
+    .mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          items: [
+            { ...record, trade_no: 'original-to-check', status: 'success' },
+          ],
+          total: 1,
+        },
+      },
+    })
+  render(<BillingHistoryDialog open onOpenChange={vi.fn()} />)
+  expect(
+    await screen.findByRole('button', { name: 'Complete Order' })
+  ).toBeVisible()
+
+  fireEvent.change(screen.getByPlaceholderText('Search by order number...'), {
+    target: { value: 'original-to-check' },
+  })
+
+  expect(
+    screen.queryByRole('button', { name: 'Complete Order' })
+  ).not.toBeInTheDocument()
+  expect(screen.queryByText(record.trade_no)).not.toBeInTheDocument()
+  expect(await screen.findByText('original-to-check')).toBeVisible()
+})
+
+test('a personal history page that expired from the thirty-day window returns to the last available page', async () => {
+  const inWindow = Array.from({ length: 10 }, (_, index) => ({
+    ...record,
+    user_id: 1,
+    id: 11 - index,
+    trade_no: `still-in-window-${11 - index}`,
+  }))
+  const get = vi
+    .spyOn(api, 'get')
+    .mockResolvedValueOnce({
+      data: { success: true, data: { items: inWindow, total: 11 } },
+    })
+    .mockResolvedValueOnce({
+      data: { success: true, data: { items: [], total: 10 } },
+    })
+    .mockResolvedValueOnce({
+      data: { success: true, data: { items: inWindow, total: 10 } },
+    })
+  const { result } = renderHook(() => useBillingHistory({ personalOnly: true }))
+  await waitFor(() => expect(result.current.total).toBe(11))
+  act(() => result.current.handlePageChange(2))
+
+  await waitFor(() => expect(result.current.total).toBe(10))
+  expect(result.current.records).toEqual(inWindow)
+  expect(result.current.page).toBe(1)
+  expect(get.mock.calls.map(([url]) => url)).toEqual([
+    '/api/user/topup/self?p=1&page_size=10',
+    '/api/user/topup/self?p=2&page_size=10',
+    '/api/user/topup/self?p=1&page_size=10',
+  ])
 })
 
 test('same-user session replacement clears the previous history and completion confirmation before the new read completes', async () => {
@@ -1046,8 +1240,8 @@ test('completion refreshes the current page when pagination changes while the re
   expect(result.current.records[0]?.trade_no).toBe('second-page-order')
 })
 
-test('rejected completion keeps its confirmation available and never reports success', async () => {
-  vi.spyOn(api, 'get').mockResolvedValue(history)
+test('a rejected completion allows confirmation again after the original order is verified pending', async () => {
+  const get = vi.spyOn(api, 'get').mockResolvedValue(history)
   vi.spyOn(api, 'post').mockResolvedValue({
     data: { success: false, message: 'Order cannot be completed' },
   })
@@ -1057,11 +1251,15 @@ test('rejected completion keeps its confirmation available and never reports suc
   const dialog = screen.getByRole('alertdialog', { name: 'Complete Order' })
   fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm' }))
   await waitFor(() =>
-    expect(
-      within(dialog).getByRole('button', { name: 'Confirm' })
-    ).toBeEnabled()
+    expect(get.mock.calls.at(-1)?.[0]).toBe(
+      '/api/user/topup?p=1&page_size=10&keyword=pending-order'
+    )
   )
-  expect(dialog).toBeVisible()
+  const fresh = await screen.findByRole('alertdialog', {
+    name: 'Complete Order',
+  })
+  expect(within(fresh).getByText(record.trade_no)).toBeVisible()
+  expect(within(fresh).getByRole('button', { name: 'Confirm' })).toBeEnabled()
   expect(notify).not.toHaveBeenCalled()
 })
 

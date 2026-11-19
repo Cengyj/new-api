@@ -20,6 +20,7 @@ import { Loader2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
+import { buttonVariants } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { toIntlLocale } from '@/i18n/languages'
 import { formatLocalCurrencyAmount, getCurrencyDisplay } from '@/lib/currency'
@@ -39,6 +40,8 @@ interface PaymentConfirmDialogProps {
   paymentMethod: PaymentMethod | undefined
   calculating: boolean
   processing: boolean
+  appLink?: string
+  canOpenAppLink?: () => boolean
   discountRate?: number
   usdExchangeRate?: number
 }
@@ -52,6 +55,8 @@ export function PaymentConfirmDialog({
   paymentMethod,
   calculating,
   processing,
+  appLink,
+  canOpenAppLink,
   discountRate = DEFAULT_DISCOUNT_RATE,
   usdExchangeRate = 1,
 }: PaymentConfirmDialogProps) {
@@ -75,6 +80,22 @@ export function PaymentConfirmDialog({
       className='max-sm:w-[calc(100vw-1.5rem)] sm:max-w-md'
       handleConfirm={onConfirm}
       isLoading={processing}
+      cancelBtnText={appLink ? t('Close') : undefined}
+      confirmAction={
+        appLink && (
+          <a
+            className={buttonVariants()}
+            href={appLink}
+            target='_self'
+            rel='noreferrer'
+            onClick={(event) => {
+              if (!canOpenAppLink?.()) event.preventDefault()
+            }}
+          >
+            {t('Open payment app')}
+          </a>
+        )
+      }
       disabled={
         calculating ||
         !isValidTopupAmount(topupAmount) ||

@@ -36,6 +36,7 @@ import {
   isStripePayment,
   isWaffoPayment,
   isWaffoPancakePayment,
+  navigateToPayment,
   submitPaymentForm,
 } from '../lib'
 import { isSafePaymentUrl, isValidTopupAmount } from '../lib/payment'
@@ -82,10 +83,10 @@ export async function requestPaymentAmount(
   return Number.isFinite(amount) && amount > 0 ? amount : 0
 }
 
-export function usePayment(onUnknownCheckout?: (tradeNo?: string) => void) {
+export function usePayment(onReviewCheckout?: (tradeNo?: string) => void) {
   const [amount, setAmount] = useState(0)
   const [calculating, setCalculating] = useState(false)
-  const { processing, runPayment } = usePaymentOperation(onUnknownCheckout)
+  const { processing, runPayment } = usePaymentOperation(onReviewCheckout)
   const quoteVersion = useRef(0)
   useEffect(() => {
     let auth = useAuthStore.getState().auth
@@ -134,21 +135,23 @@ export function usePayment(onUnknownCheckout?: (tradeNo?: string) => void) {
       }
       const stripe = isStripePayment(paymentType)
       return runPayment<PaymentResponse>(
-        (signal) =>
+        (signal, onDispatch) =>
           stripe
             ? requestStripePayment(
                 {
                   amount: topupAmount,
                   payment_method: 'stripe',
                 },
-                signal
+                signal,
+                onDispatch
               )
             : requestPayment(
                 {
                   amount: topupAmount,
                   payment_method: paymentType,
                 },
-                signal
+                signal,
+                onDispatch
               ),
         (response) => {
           if (!isApiSuccess(response)) {
@@ -163,7 +166,8 @@ export function usePayment(onUnknownCheckout?: (tradeNo?: string) => void) {
             return false
           }
           if (stripe) {
-            window.open(url, '_blank', 'noopener,noreferrer')
+            navigateToPayment(url)
+            toast.success(i18next.t('Redirecting to payment page...'))
           } else {
             const form = response.data
             const required = [
@@ -191,7 +195,6 @@ export function usePayment(onUnknownCheckout?: (tradeNo?: string) => void) {
             }
             submitPaymentForm(url, form)
           }
-          toast.success(i18next.t('Redirecting to payment page...'))
           return true
         }
       )

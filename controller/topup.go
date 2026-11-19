@@ -358,6 +358,14 @@ func paymentCheckoutUnknown(c *gin.Context, tradeNo string) {
 	c.JSON(http.StatusOK, body)
 }
 
+func paymentOrderCreateError(c *gin.Context, tradeNo string, err error) {
+	if errors.Is(err, model.ErrTopUpStatusInvalid) {
+		paymentError(c, common.NewMessage("Payment was not started. Check order {{trade_no}} in Order History.", map[string]any{"trade_no": tradeNo}))
+		return
+	}
+	paymentError(c, common.NewMessage("Failed to start payment"))
+}
+
 func rejectInvalidCreditedQuota(c *gin.Context, userId int, quota decimal.Decimal) bool {
 	creditedQuota, err := validateCreditedQuota(quota)
 	if err == nil {
@@ -529,7 +537,7 @@ func RequestEpay(c *gin.Context) {
 	err = topUp.Insert()
 	if err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Epay failed to create top-up order user_id=%d trade_no=%s payment_method=%s amount=%d error=%q", id, tradeNo, req.PaymentMethod, req.Amount, err.Error()))
-		paymentError(c, common.NewMessage("Failed to create order"))
+		paymentOrderCreateError(c, tradeNo, err)
 		return
 	}
 	logger.LogInfo(c.Request.Context(), common.LogText("Epay top-up order created user_id=%d trade_no=%s payment_method=%s amount=%d money=%.2f", id, tradeNo, req.PaymentMethod, req.Amount, payMoney))

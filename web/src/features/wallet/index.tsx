@@ -28,6 +28,7 @@ import { getSelf } from '@/lib/api'
 import { getCurrencyDisplay } from '@/lib/currency'
 import { requireServerSuccess } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
+import { usePaymentRecoveryStore } from '@/stores/payment-recovery-store'
 
 import { AffiliateRewardsCard } from './components/affiliate-rewards-card'
 import { BillingHistoryDialog } from './components/dialogs/billing-history-dialog'
@@ -74,6 +75,7 @@ interface PaymentConfirmation {
   paymentMethod: PaymentMethod
   waffoMethodIndex: number | null
   waffoMethod?: Pick<WaffoPayMethod, 'payMethodType' | 'payMethodName'>
+  appLink?: string
 }
 
 export function Wallet(props: WalletProps) {
@@ -95,8 +97,10 @@ export function Wallet(props: WalletProps) {
   const creemSelectionIdentity = useRef('')
   const [paymentLoading, setPaymentLoading] = useState<string | null>(null)
   const [confirmDialogOpen, setConfirmDialogOpen] = useState(false)
-  const [billingDialogOpen, setBillingDialogOpen] = useState(false)
-  const [billingTradeNo, setBillingTradeNo] = useState('')
+  const [billingHistory, setBillingHistory] = useState<{
+    personalOnly: boolean
+    tradeNo?: string
+  } | null>(null)
   const [redemptionCode, setRedemptionCode] = useState('')
   const [creemDialogOpen, setCreemDialogOpen] = useState(false)
   const [selectedCreemProduct, setSelectedCreemProduct] =
@@ -118,12 +122,11 @@ export function Wallet(props: WalletProps) {
   const { meta: currencyDisplay } = getCurrencyDisplay()
   const effectiveUsdExchangeRate =
     currencyDisplay.kind === 'tokens' ? 1 : currencyDisplay.exchangeRate
-  const handleUnknownCheckout = useCallback((tradeNo?: string) => {
+  const handleCheckoutReview = useCallback((tradeNo?: string) => {
     setConfirmDialogOpen(false)
     setCreemDialogOpen(false)
     if (!tradeNo) {
-      setBillingTradeNo('')
-      setBillingDialogOpen(true)
+      setBillingHistory({ personalOnly: true })
     }
   }, [])
   const {
@@ -132,16 +135,14 @@ export function Wallet(props: WalletProps) {
     processing,
     calculatePaymentAmount,
     processPayment,
-  } = usePayment(handleUnknownCheckout)
+  } = usePayment(handleCheckoutReview)
   const { redeeming, redeemCode } = useRedemption()
-  const { processing: creemProcessing, processCreemPayment } = useCreemPayment(
-    handleUnknownCheckout
-  )
-  const { processing: waffoProcessing, processWaffoPayment } = useWaffoPayment(
-    handleUnknownCheckout
-  )
+  const { processing: creemProcessing, processCreemPayment } =
+    useCreemPayment(handleCheckoutReview)
+  const { processing: waffoProcessing, processWaffoPayment } =
+    useWaffoPayment(handleCheckoutReview)
   const { processing: pancakeProcessing, processWaffoPancakePayment } =
-    useWaffoPancakePayment(handleUnknownCheckout)
+    useWaffoPancakePayment(handleCheckoutReview)
 
   useEffect(() => {
     let identity = referralIdentity()
@@ -161,7 +162,7 @@ export function Wallet(props: WalletProps) {
       setConfirmDialogOpen(false)
       setCreemDialogOpen(false)
       setPaymentLoading(null)
-      setBillingTradeNo('')
+      setBillingHistory(null)
     })
     return () => {
       userRequestVersion.current += 1
@@ -215,7 +216,7 @@ export function Wallet(props: WalletProps) {
 
   useEffect(() => {
     if (props.initialShowHistory) {
-      setBillingDialogOpen(true)
+      setBillingHistory({ personalOnly: true })
       window.history.replaceState({}, '', window.location.pathname)
     }
   }, [props.initialShowHistory])
@@ -307,6 +308,7 @@ export function Wallet(props: WalletProps) {
   const handlePaymentConfirm = async () => {
     if (
       !paymentConfirmation ||
+      paymentConfirmation.appLink ||
       calculating ||
       paymentConfirmation.identity !== referralIdentity() ||
       paymentConfirmation.version !== paymentSelectionVersion.current
@@ -314,6 +316,7 @@ export function Wallet(props: WalletProps) {
       return
     }
 
+    let awaitingApp = false
     const success = await dispatchSelectedPayment(
       paymentConfirmation.paymentMethod,
       paymentConfirmation.topupAmount,
@@ -321,13 +324,31 @@ export function Wallet(props: WalletProps) {
       {
         regular: processPayment,
         waffo: (amount, index) =>
-          processWaffoPayment(amount, index, paymentConfirmation.waffoMethod),
+          processWaffoPayment(
+            amount,
+            index,
+            paymentConfirmation.waffoMethod,
+            (appLink, orderId) => {
+              awaitingApp = true
+              const userId = useAuthStore.getState().auth.user?.id
+              if (userId && orderId) {
+                usePaymentRecoveryStore.getState().remember(userId, orderId)
+              }
+              if (
+                paymentConfirmation.identity === referralIdentity() &&
+                paymentConfirmation.version === paymentSelectionVersion.current
+              ) {
+                setPaymentConfirmation({ ...paymentConfirmation, appLink })
+              }
+            }
+          ),
         waffoPancake: processWaffoPancakePayment,
       }
     )
 
     if (
       success &&
+      !awaitingApp &&
       paymentConfirmation.identity === referralIdentity() &&
       paymentConfirmation.version === paymentSelectionVersion.current
     ) {
@@ -452,8 +473,7 @@ export function Wallet(props: WalletProps) {
 
             <PaymentRecoveryNotice
               onViewOrder={(tradeNo) => {
-                setBillingTradeNo(tradeNo)
-                setBillingDialogOpen(true)
+                setBillingHistory({ personalOnly: true, tradeNo })
               }}
             />
 
@@ -472,8 +492,7 @@ export function Wallet(props: WalletProps) {
                       <Button
                         variant='outline'
                         onClick={() => {
-                          setBillingTradeNo('')
-                          setBillingDialogOpen(true)
+                          setBillingHistory({ personalOnly: false })
                         }}
                       >
                         {t('Order History')}
@@ -502,8 +521,7 @@ export function Wallet(props: WalletProps) {
                     priceRatio={(status?.price as number) || 1}
                     usdExchangeRate={effectiveUsdExchangeRate}
                     onOpenBilling={() => {
-                      setBillingTradeNo('')
-                      setBillingDialogOpen(true)
+                      setBillingHistory({ personalOnly: false })
                     }}
                     creemProducts={topupInfo?.creem_products}
                     enableCreemTopup={topupInfo?.enable_creem_topup}
@@ -537,7 +555,15 @@ export function Wallet(props: WalletProps) {
 
       <PaymentConfirmDialog
         open={confirmDialogOpen}
-        onOpenChange={setConfirmDialogOpen}
+        onOpenChange={(open) => {
+          setConfirmDialogOpen(open)
+          if (!open) setPaymentConfirmation(null)
+        }}
+        appLink={paymentConfirmation?.appLink}
+        canOpenAppLink={() =>
+          paymentConfirmation?.identity === referralIdentity() &&
+          paymentConfirmation.version === paymentSelectionVersion.current
+        }
         onConfirm={handlePaymentConfirm}
         topupAmount={paymentConfirmation?.topupAmount ?? topupAmount}
         paymentAmount={paymentConfirmation?.paymentAmount ?? 0}
@@ -549,9 +575,12 @@ export function Wallet(props: WalletProps) {
       />
 
       <BillingHistoryDialog
-        initialKeyword={billingTradeNo}
-        open={billingDialogOpen}
-        onOpenChange={setBillingDialogOpen}
+        initialKeyword={billingHistory?.tradeNo}
+        personalOnly={billingHistory?.personalOnly}
+        open={billingHistory !== null}
+        onOpenChange={(open) => {
+          if (!open) setBillingHistory(null)
+        }}
       />
 
       <CreemConfirmDialog

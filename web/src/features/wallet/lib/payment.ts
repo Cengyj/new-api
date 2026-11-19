@@ -111,14 +111,13 @@ export function isSafePaymentUrl(
   }
 }
 
-/**
- * Check if browser is Safari
- */
-function isSafariBrowser(): boolean {
-  return (
-    navigator.userAgent.includes('Safari') &&
-    !navigator.userAgent.includes('Chrome')
-  )
+// The order response may arrive after the browser's popup allowance expires.
+export function navigateToPayment(url: string): void {
+  const link = document.createElement('a')
+  link.href = url
+  link.target = '_self'
+  link.rel = 'noreferrer'
+  link.click()
 }
 
 /**
@@ -133,11 +132,8 @@ export function submitPaymentForm(
   form.action = url
   form.method = 'POST'
 
-  // Don't open in new tab for Safari
-  if (!isSafariBrowser()) {
-    form.target = '_blank'
-    form.rel = 'noopener noreferrer'
-  }
+  form.target = '_parent'
+  form.rel = 'noreferrer'
 
   // Add form parameters
   Object.entries(params).forEach(([key, value]) => {
@@ -148,9 +144,26 @@ export function submitPaymentForm(
     form.appendChild(input)
   })
 
-  document.body.appendChild(form)
-  form.submit()
-  document.body.removeChild(form)
+  // A current-tab form POST can still send Referer with rel=noreferrer.
+  // Scope the policy to this submission without changing the wallet document.
+  const frame = document.createElement('iframe')
+  frame.hidden = true
+  document.body.appendChild(frame)
+  try {
+    const checkoutDocument = frame.contentDocument
+    if (!checkoutDocument) throw new Error('Payment form unavailable')
+    const policy = checkoutDocument.createElement('meta')
+    policy.name = 'referrer'
+    policy.content = 'no-referrer'
+    checkoutDocument.head.appendChild(policy)
+    checkoutDocument.body.appendChild(form)
+    form.submit()
+  } catch (error) {
+    frame.remove()
+    throw error
+  }
+  // WebKit queues the navigation and drops it if its frame is removed now.
+  setTimeout(() => frame.remove(), 0)
 }
 
 /**

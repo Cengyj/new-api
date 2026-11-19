@@ -46,7 +46,7 @@ export type AffiliateCodeResponse = ApiResponse<string>
 export type AffiliateTransferResponse = ApiResponse
 export type CreemPaymentResponse = ApiResponse<{ checkout_url: string }>
 export type WaffoPaymentResponse = ApiResponse<
-  { payment_url?: string } | string
+  { payment_url?: string; order_id?: string } | string
 >
 export type WaffoPancakePaymentResponse = ApiResponse<
   | {

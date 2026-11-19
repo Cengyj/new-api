@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -122,7 +123,45 @@ func (topUp *TopUp) Insert() error {
 		return err
 	}
 	topUp.CreditedQuota = &quota
-	return DB.Create(topUp).Error
+	if topUp.Id != 0 || topUp.Status != common.TopUpStatusPending {
+		return DB.Create(topUp).Error
+	}
+
+	// The provider is contacted only after this method succeeds. If the COMMIT
+	// reply was lost, continue only with the exact checkout this INSERT created.
+	var insertedID int
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		result := tx.Create(topUp)
+		if result.Error == nil && result.RowsAffected == 1 {
+			insertedID = topUp.Id
+		}
+		return result.Error
+	})
+	if err == nil || insertedID == 0 {
+		return err
+	}
+	var stored TopUp
+	if lookupErr := DB.First(&stored, insertedID).Error; lookupErr != nil {
+		return err
+	}
+	expected := *topUp
+	switch stored.Status {
+	case common.TopUpStatusPending:
+	case common.TopUpStatusSuccess:
+		expected.CompleteTime = stored.CompleteTime
+		expected.SettlementAudit = stored.SettlementAudit
+	case common.TopUpStatusFailed, common.TopUpStatusExpired:
+	default:
+		return err
+	}
+	expected.Status = stored.Status
+	if !reflect.DeepEqual(expected, stored) {
+		return err
+	}
+	if stored.Status != common.TopUpStatusPending {
+		return errors.Join(err, ErrTopUpStatusInvalid)
+	}
+	return nil
 }
 
 // walletCreditQuota preserves each provider's historical units. It is also the

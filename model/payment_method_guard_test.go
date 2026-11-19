@@ -149,8 +149,7 @@ func TestReferralWalletRecoversLostPostgresCommitReply(t *testing.T) {
 		require.NoError(t, populateUserCache(user))
 	}
 	credit := 100
-	order := TopUp{UserId: invitee.Id, TradeNo: "wire-loss-original-order", PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending, CreditedQuota: &credit}
-	require.NoError(t, order.Insert())
+	order := TopUp{UserId: invitee.Id, TradeNo: "wire-loss-original-order", Amount: 10, Money: 10, PaymentMethod: "alipay", PaymentProvider: PaymentProviderEpay, Status: common.TopUpStatusPending, CreditedQuota: &credit, CreateTime: time.Now().Unix()}
 	configuration, err := url.Parse(dsn)
 	require.NoError(t, err)
 	proxyAddress, armed, dropped := postgresCommitReplyLossProxy(t, configuration.Host)
@@ -164,14 +163,21 @@ func TestReferralWalletRecoversLostPostgresCommitReply(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, connection.Close()) })
 	DB = proxied
-	for _, operation := range []string{"topup", "transfer"} {
+	for _, operation := range []string{"checkout", "topup", "transfer"} {
 		if !t.Run(operation, func(t *testing.T) {
 			armed.Store(true)
-			if operation == "topup" {
+			switch operation {
+			case "checkout":
+				require.NoError(t, order.Insert())
+				require.Positive(t, order.Id)
+				var original TopUp
+				require.NoError(t, db.First(&original, order.Id).Error)
+				assert.Equal(t, order, original)
+			case "topup":
 				duplicate, err := RechargeEpay(order.TradeNo, "alipay", "127.0.0.1")
 				require.NoError(t, err)
 				assert.True(t, duplicate, "the successful original order is recovered after the lost acknowledgement")
-			} else {
+			case "transfer":
 				result, err := inviter.TransferAffQuotaToQuota(25, "wire-loss-original-transfer")
 				require.NoError(t, err)
 				assert.Equal(t, 25, result.Quota)

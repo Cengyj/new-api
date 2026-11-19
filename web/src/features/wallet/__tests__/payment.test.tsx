@@ -86,7 +86,7 @@ vi.mock('../components/dialogs/billing-history-dialog', () => ({
 
 beforeEach(() => {
   localStorage.clear()
-  usePaymentRecoveryStore.setState({ orders: {}, storageErrors: {} })
+  usePaymentRecoveryStore.setState(usePaymentRecoveryStore.getInitialState())
   useAuthStore.getState().auth.reset()
   useAuthStore.getState().auth.setUser({ id: 1, username: 'payer', role: 1 })
   useSystemConfigStore.getState().setConfig({
@@ -102,6 +102,16 @@ const signedEpayForm = {
   money: '10.00',
   notify_url: 'https://wallet.example.test/api/user/epay/notify',
   sign: 'fixture',
+}
+
+function terminalCheckoutResponse(tradeNo: string) {
+  return {
+    success: false,
+    message: 'error',
+    message_key:
+      'Payment was not started. Check order {{trade_no}} in Order History.',
+    message_params: { trade_no: tradeNo },
+  }
 }
 
 const creemProduct: CreemProduct = {
@@ -619,7 +629,7 @@ test.each(['', 'Card'])(
             : '1.00',
       },
     }))
-    vi.spyOn(window, 'open').mockReturnValue(null)
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
     const view = render(<Wallet />)
     const user = userEvent.setup()
     await user.click(
@@ -724,7 +734,9 @@ test.each([
           ? { message: 'error', data: 'Unsupported payment method' }
           : { message: 'success', data: '1.00' },
     }))
-    const open = vi.spyOn(window, 'open').mockReturnValue(null)
+    const open = vi
+      .spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(() => {})
     render(<Wallet />)
     const user = userEvent.setup()
     await user.click(
@@ -825,7 +837,7 @@ test('Stripe quantity selection omits local discounts and sends the unchanged qu
           : '10.00',
     },
   }))
-  vi.spyOn(window, 'open').mockReturnValue(null)
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
   render(<Wallet />)
   const user = userEvent.setup()
   const quantity = await screen.findByRole('spinbutton', { name: 'Quantity' })
@@ -910,8 +922,14 @@ test.each(paymentCases)(
       resolve = done
     })
     const post = vi.spyOn(api, 'post').mockReturnValue(pending)
-    vi.spyOn(window, 'open').mockReturnValue({} as Window)
-    vi.spyOn(HTMLFormElement.prototype, 'submit').mockImplementation(() => {})
+    const open = vi.spyOn(window, 'open').mockReturnValue(null)
+    const successToast = vi.spyOn(toast, 'success')
+    const navigate = vi
+      .spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(() => {})
+    const submit = vi
+      .spyOn(HTMLFormElement.prototype, 'submit')
+      .mockImplementation(() => {})
     const { result } = renderHook(hook)
     let first!: Promise<boolean>
     let second!: Promise<boolean>
@@ -929,6 +947,32 @@ test.each(paymentCases)(
       resolve({ data: body })
       await Promise.all([first, second])
     })
+    expect(await first).toBe(true)
+    expect(await second).toBe(false)
+    expect(open).not.toHaveBeenCalled()
+    if (path === '/api/user/pay') {
+      expect(submit).toHaveBeenCalledOnce()
+      const form = submit.mock.contexts[0] as HTMLFormElement
+      expect(form.target).toBe('_parent')
+      expect(form.action).toBe(body.url)
+      expect(form.method).toBe('post')
+      expect(form.rel).toBe('noreferrer')
+      expect(
+        form.ownerDocument.querySelector('meta[name="referrer"]')
+      ).toHaveAttribute('content', 'no-referrer')
+      expect(Object.fromEntries(new FormData(form))).toEqual(signedEpayForm)
+      expect(successToast).not.toHaveBeenCalled()
+      await waitFor(() => expect(document.querySelector('iframe')).toBeNull())
+    } else {
+      expect(navigate).toHaveBeenCalledOnce()
+      const link = navigate.mock.contexts[0] as HTMLAnchorElement
+      expect(link.target).toBe('_self')
+      expect(link.href).toBe('https://pay.example.test/pay')
+      expect(link.relList.contains('noreferrer')).toBe(true)
+      expect(successToast).toHaveBeenCalledWith(
+        'Redirecting to payment page...'
+      )
+    }
   }
 )
 
@@ -940,7 +984,9 @@ test.each(['stripe', 'creem', 'waffo', 'waffo_pancake'])(
       resolve = done
     })
     vi.spyOn(api, 'post').mockReturnValue(pending)
-    const open = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+    const open = vi
+      .spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(() => {})
     const { result } = renderHook(() => ({
       regular: usePayment(),
       creem: useCreemPayment(),
@@ -986,9 +1032,8 @@ test('checkout delivery never runs under a payer changed at the response microta
   })
   vi.spyOn(paymentApi, 'requestStripePayment').mockReturnValue(pending)
   const payerAtRedirect: Array<number | undefined> = []
-  vi.spyOn(window, 'open').mockImplementation(() => {
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {
     payerAtRedirect.push(useAuthStore.getState().auth.user?.id)
-    return {} as Window
   })
   const { result } = renderHook(() => usePayment())
   let operation!: Promise<boolean>
@@ -1017,7 +1062,9 @@ test('switching away and back before checkout responds still invalidates that op
       resolve = done
     })
   )
-  const open = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+  const open = vi
+    .spyOn(HTMLAnchorElement.prototype, 'click')
+    .mockImplementation(() => {})
   const { result } = renderHook(() => usePayment())
   let operation!: Promise<boolean>
   await act(async () => {
@@ -1148,7 +1195,9 @@ test.each(['creem', 'waffo', 'waffo_pancake'])(
       resolve = done
     })
     const post = vi.spyOn(api, 'post').mockReturnValue(pending)
-    const open = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+    const open = vi
+      .spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(() => {})
     const { result, unmount } = renderHook(() => ({
       creem: useCreemPayment(),
       waffo: useWaffoPayment(),
@@ -1202,6 +1251,78 @@ test('a lost order response opens recovery without a guessed reference or anothe
   expect(error).toHaveBeenCalledWith(
     'Payment request result is unknown. Check Order History before trying again.'
   )
+})
+
+test('two dispatched checkouts keep separate reminders when the page leaves before either receipt', async () => {
+  const previous = api.defaults.adapter
+  let release!: () => void
+  const pending = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let sent = 0
+  api.defaults.adapter = async (config) => {
+    const index = sent++
+    await pending
+    if (index === 0) {
+      throw new AxiosError('Network Error', 'ERR_NETWORK', config)
+    }
+    return {
+      config,
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      data: { message: 'error', data: 'Unsupported payment method' },
+    }
+  }
+  try {
+    const first = renderHook(() => usePayment())
+    const second = renderHook(() => usePayment())
+    let results!: Promise<boolean[]>
+    await act(async () => {
+      results = Promise.all([
+        first.result.current.processPayment(10, 'stripe'),
+        second.result.current.processPayment(10, 'stripe'),
+      ])
+    })
+    expect(sent).toBe(2)
+    const reminders = () =>
+      Object.keys(localStorage).filter((key) =>
+        key.startsWith('new-api:payment-recovery:v1:1:')
+      )
+    expect(reminders()).toHaveLength(2)
+    first.unmount()
+    second.unmount()
+    release()
+    await results
+    expect(reminders()).toHaveLength(1)
+    usePaymentRecoveryStore.setState(usePaymentRecoveryStore.getInitialState())
+    useAuthStore.getState().auth.setUser({ id: 2, username: 'other', role: 1 })
+    const view = vi.fn()
+    render(<PaymentRecoveryNotice onViewOrder={view} />)
+    expect(
+      screen.queryByText('Payment requests to check')
+    ).not.toBeInTheDocument()
+    act(() =>
+      useAuthStore
+        .getState()
+        .auth.setUser({ id: 1, username: 'payer', role: 1 })
+    )
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Order History' })
+    )
+    expect(view).toHaveBeenCalledWith('')
+    expect(reminders()).toHaveLength(1)
+    fireEvent.click(
+      screen.getByRole('button', { name: 'I checked Order History' })
+    )
+    expect(reminders()).toHaveLength(0)
+    expect(
+      screen.queryByText('Payment requests to check')
+    ).not.toBeInTheDocument()
+  } finally {
+    release()
+    api.defaults.adapter = previous
+  }
 })
 
 test.each([
@@ -1378,7 +1499,7 @@ test('a browser exception after receiving the checkout preserves the original or
       },
     },
   })
-  vi.spyOn(window, 'open').mockImplementation(() => {
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {
     throw new DOMException('Navigation blocked', 'SecurityError')
   })
   const onUnknown = vi.fn()
@@ -1468,27 +1589,394 @@ test('unmounting before the real request interceptor runs cancels order creation
   }
 })
 
-test('Waffo keeps supported provider deep links while rejecting active content URLs', async () => {
-  vi.spyOn(api, 'post').mockResolvedValue({
+test.each([
+  ['alipay', 'success'],
+  ['stripe', 'success'],
+  ['creem', 'success'],
+  ['waffo', 'success'],
+  ['waffo_pancake', 'success'],
+  ['stripe', 'unknown'],
+  ['stripe', 'terminal'],
+] as const)(
+  'a dispatched %s checkout returning %s after leaving the wallet remains available only to its payer',
+  async (provider, outcome) => {
+    const original = 'checkout_after_wallet_navigation'
+    const previous = api.defaults.adapter
+    let deliver!: () => void
+    const pending = new Promise<void>((resolve) => {
+      deliver = resolve
+    })
+    const adapter = vi.fn(async (config: InternalAxiosRequestConfig) => {
+      await pending
+      if (outcome === 'terminal') {
+        return {
+          config,
+          status: 200,
+          statusText: 'OK',
+          headers: {},
+          data: terminalCheckoutResponse(original),
+        }
+      }
+      if (outcome === 'unknown') {
+        throw new AxiosError(
+          'Bad Gateway',
+          'ERR_BAD_RESPONSE',
+          config,
+          undefined,
+          {
+            config,
+            status: 502,
+            statusText: 'Bad Gateway',
+            headers: {},
+            data: {
+              trade_no: original,
+              message_key:
+                'Payment request result is unknown. Check Order History before trying again.',
+            },
+          }
+        )
+      }
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: {
+          message: 'success',
+          url: 'https://pay.example.test/submit.php',
+          data:
+            provider === 'alipay'
+              ? { ...signedEpayForm, out_trade_no: original }
+              : {
+                  order_id: original,
+                  pay_link: 'https://pay.example.test/pay',
+                  checkout_url: 'https://pay.example.test/pay',
+                  payment_url: 'https://pay.example.test/pay',
+                },
+        },
+      }
+    })
+    api.defaults.adapter = adapter
+    try {
+      const open = vi.spyOn(HTMLAnchorElement.prototype, 'click')
+      const onUnknown = vi.fn()
+      const submit = vi.spyOn(HTMLFormElement.prototype, 'submit')
+      const success = vi.spyOn(toast, 'success')
+      const { result, unmount } = renderHook(() => {
+        const regular = usePayment(onUnknown)
+        const creem = useCreemPayment(onUnknown)
+        const waffo = useWaffoPayment(onUnknown)
+        const pancake = useWaffoPancakePayment(onUnknown)
+        return {
+          alipay: () => regular.processPayment(10, 'alipay'),
+          stripe: () => regular.processPayment(10, 'stripe'),
+          creem: () => creem.processCreemPayment(creemProduct),
+          waffo: () => waffo.processWaffoPayment(10, 0),
+          waffo_pancake: () => pancake.processWaffoPancakePayment(10),
+        }
+      })
+      let operation!: Promise<boolean>
+      await act(async () => {
+        operation = result.current[provider]()
+      })
+      expect(adapter).toHaveBeenCalledOnce()
+      unmount()
+      deliver()
+      expect(await operation).toBe(false)
+      expect(open).not.toHaveBeenCalled()
+      expect(submit).not.toHaveBeenCalled()
+      expect(success).not.toHaveBeenCalled()
+      expect(onUnknown).not.toHaveBeenCalled()
+
+      usePaymentRecoveryStore.setState(
+        usePaymentRecoveryStore.getInitialState()
+      )
+      useAuthStore
+        .getState()
+        .auth.setUser({ id: 2, username: 'other', role: 1 })
+      render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+      expect(screen.queryByText(original)).not.toBeInTheDocument()
+      act(() =>
+        useAuthStore
+          .getState()
+          .auth.setUser({ id: 1, username: 'payer', role: 1 })
+      )
+      expect(await screen.findByText(original)).toBeVisible()
+      if (outcome === 'terminal') {
+        expect(
+          screen.queryByText(
+            'Payment request result is unknown. Check Order History before trying again.'
+          )
+        ).not.toBeInTheDocument()
+      }
+    } finally {
+      deliver()
+      api.defaults.adapter = previous
+    }
+  }
+)
+
+test('a checkout already in a terminal state directs the payer to the original order', async () => {
+  const tradeNo = 'terminal_checkout_to_review'
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: terminalCheckoutResponse(tradeNo),
+  })
+  const error = vi.spyOn(toast, 'error')
+  const review = vi.fn()
+  const { result } = renderHook(() => usePayment(review))
+  const viewOrder = vi.fn()
+  render(<PaymentRecoveryNotice onViewOrder={viewOrder} />)
+  await act(async () => {
+    expect(await result.current.processPayment(10, 'alipay')).toBe(false)
+  })
+  expect(error).toHaveBeenCalledExactlyOnceWith(
+    `Payment was not started. Check order ${tradeNo} in Order History.`
+  )
+  expect(review).toHaveBeenCalledExactlyOnceWith(tradeNo)
+  await userEvent.click(screen.getByRole('button', { name: 'View order' }))
+  expect(viewOrder).toHaveBeenCalledExactlyOnceWith(tradeNo)
+  expect(post).toHaveBeenCalledOnce()
+})
+
+test.each([
+  'pending',
+  'checked in another tab',
+  'storage unavailable',
+] as const)(
+  'a detached checkout times out with its reminder %s',
+  async (reminder) => {
+    const previous = api.defaults.adapter
+    let signal: InternalAxiosRequestConfig['signal']
+    api.defaults.adapter = (config) => {
+      signal = config.signal
+      return new Promise((_, reject) => {
+        signal?.addEventListener?.('abort', () => reject(new Error('aborted')))
+      })
+    }
+    try {
+      const { result, unmount } = renderHook(() => usePayment())
+      let operation!: Promise<boolean>
+      vi.useFakeTimers()
+      await act(async () => {
+        operation = result.current.processPayment(10, 'stripe')
+      })
+      vi.advanceTimersByTime(5 * 60_000)
+      expect(signal?.aborted).toBe(false)
+      unmount()
+      expect(signal?.aborted).toBe(false)
+      const key =
+        Object.keys(localStorage).find((entry) =>
+          entry.startsWith('new-api:payment-recovery:v1:1:')
+        ) ?? ''
+      expect(key).not.toBe('')
+      if (reminder === 'checked in another tab') {
+        localStorage.removeItem(key)
+      } else if (reminder === 'storage unavailable') {
+        vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+          throw new Error('Storage blocked')
+        })
+        vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+          throw new Error('Storage blocked')
+        })
+      }
+      vi.advanceTimersByTime(5 * 60_000)
+      expect(signal?.aborted).toBe(true)
+      expect(await operation).toBe(false)
+      expect(usePaymentRecoveryStore.getState().orders[1] ?? []).toEqual([])
+      expect(usePaymentRecoveryStore.getState().attempts[1] ?? []).toHaveLength(
+        reminder === 'checked in another tab' ? 0 : 1
+      )
+      if (reminder === 'checked in another tab') {
+        expect(localStorage.getItem(key)).toBeNull()
+      } else if (reminder === 'storage unavailable') {
+        expect(usePaymentRecoveryStore.getState().storageErrors[1]).toBe(true)
+      }
+    } finally {
+      vi.useRealTimers()
+      api.defaults.adapter = previous
+    }
+  }
+)
+
+test.each(['slow receipt', 'timeout then late receipt'] as const)(
+  'a checkout that stays open handles a %s without another purchase',
+  async (outcome) => {
+    const { BillingHistoryDialog } = await vi.importActual<
+      typeof import('../components/dialogs/billing-history-dialog')
+    >('../components/dialogs/billing-history-dialog')
+    vi.spyOn(billingHistory, 'BillingHistoryDialog').mockImplementation(
+      BillingHistoryDialog
+    )
+    vi.spyOn(topupInfoHooks, 'useTopupInfo').mockReturnValue({
+      topupInfo: {
+        ...topupInfo,
+        enable_creem_topup: true,
+        creem_products: [creemProduct],
+      },
+      presetAmounts: [],
+      loading: false,
+      refetch: vi.fn(),
+      loadFailed: false,
+    })
+    const get = vi.spyOn(api, 'get').mockResolvedValue({
+      data: { success: true, data: { items: [], total: 0 } },
+    })
+    const open = vi
+      .spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(() => {})
+    const error = vi.spyOn(toast, 'error')
+    const original = api.defaults.adapter
+    let deliver!: () => void
+    const receipt = new Promise<void>((resolve) => {
+      deliver = resolve
+    })
+    const checkout = vi.fn(async (config: InternalAxiosRequestConfig) => {
+      await receipt
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: {
+          message: 'success',
+          data: {
+            order_id: 'slow_creem',
+            checkout_url: 'https://pay.example.test/creem',
+          },
+        },
+      }
+    })
+    api.defaults.adapter = async (config) => {
+      if (config.url === '/api/user/creem/pay') return checkout(config)
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: { success: true, data: '1.00' },
+      }
+    }
+    try {
+      render(<Wallet />)
+      await userEvent.click(screen.getByText(creemProduct.name))
+      const confirm = within(
+        screen.getByRole('dialog', { name: 'Confirm Creem Purchase' })
+      ).getByRole('button', { name: 'Confirm Payment' })
+      vi.useFakeTimers()
+      await act(async () => {
+        fireEvent.click(confirm)
+        fireEvent.click(confirm)
+      })
+      await act(async () => vi.advanceTimersByTimeAsync(6 * 60_000))
+      expect(confirm).toBeDisabled()
+      expect(checkout).toHaveBeenCalledOnce()
+      expect(checkout.mock.calls[0][0].signal?.aborted).toBe(false)
+      if (outcome === 'timeout then late receipt') {
+        await act(async () => vi.advanceTimersByTimeAsync(4 * 60_000))
+        expect(
+          screen.getByRole('dialog', { name: 'Billing History' })
+        ).toBeVisible()
+        expect(
+          get.mock.calls.some(([url]) =>
+            url.startsWith('/api/user/topup/self?')
+          )
+        ).toBe(true)
+        expect(error).toHaveBeenCalledWith(
+          'Payment request result is unknown. Check Order History before trying again.'
+        )
+        expect(usePaymentRecoveryStore.getState().attempts[1]).toHaveLength(1)
+      }
+      await act(async () => {
+        deliver()
+        await receipt
+      })
+      expect(
+        screen.queryByRole('dialog', { name: 'Confirm Creem Purchase' })
+      ).not.toBeInTheDocument()
+      if (outcome === 'slow receipt') {
+        expect(open).toHaveBeenCalledOnce()
+        expect(usePaymentRecoveryStore.getState().attempts[1] ?? []).toEqual([])
+      } else {
+        expect(open).not.toHaveBeenCalled()
+        expect(usePaymentRecoveryStore.getState().attempts[1]).toHaveLength(1)
+      }
+      expect(checkout).toHaveBeenCalledOnce()
+    } finally {
+      deliver()
+      vi.useRealTimers()
+      api.defaults.adapter = original
+    }
+  }
+)
+
+test('the issued Waffo app link can be opened again without creating another checkout', async () => {
+  const url = 'alipays://platformapi/startapp?appId=20000067'
+  vi.spyOn(api, 'get').mockImplementation(async (path) => ({
+    data: {
+      success: true,
+      data:
+        path === '/api/user/topup/info'
+          ? {
+              ...topupInfo,
+              enable_online_topup: false,
+              pay_methods: [],
+              enable_waffo_topup: true,
+              waffo_min_topup: 1,
+              waffo_pay_methods: [
+                {
+                  name: 'Wallet app',
+                  payMethodType: 'WALLET',
+                  payMethodName: 'TEST',
+                },
+              ],
+            }
+          : {},
+    },
+  }))
+  const post = vi.spyOn(api, 'post').mockImplementation(async (path) => ({
     data: {
       message: 'success',
-      data: {
-        payment_url: 'alipays://platformapi/startapp?appId=20000067',
-        order_id: 'usable_waffo_checkout',
-      },
+      data:
+        path === '/api/user/waffo/pay'
+          ? { payment_url: url, order_id: 'usable_waffo_checkout' }
+          : '1.00',
     },
-  })
-  const open = vi.spyOn(window, 'open').mockReturnValue({} as Window)
-  const { result } = renderHook(() => useWaffoPayment())
-  await act(async () => {
-    expect(await result.current.processWaffoPayment(10, 0)).toBe(true)
-  })
-  expect(open).toHaveBeenCalledWith(
-    'alipays://platformapi/startapp?appId=20000067',
-    '_blank',
-    'noopener,noreferrer'
+  }))
+  const autoOpen = vi
+    .spyOn(HTMLAnchorElement.prototype, 'click')
+    .mockImplementation(() => {})
+  render(<Wallet />)
+  const user = userEvent.setup()
+  await user.click(await screen.findByRole('button', { name: 'Wallet app' }))
+  const dialog = await screen.findByRole('alertdialog')
+  await user.click(
+    within(dialog).getByRole('button', { name: 'Confirm Payment' })
   )
-  expect(usePaymentRecoveryStore.getState().orders[1] ?? []).toEqual([])
+  const link = await within(dialog).findByRole('link', {
+    name: 'Open payment app',
+  })
+  expect(link).toHaveAttribute('href', url)
+  expect(autoOpen).not.toHaveBeenCalled()
+  expect(
+    within(dialog).queryByRole('button', { name: 'Confirm Payment' })
+  ).toBeNull()
+  // Keep jsdom on the wallet while exercising two separate user clicks.
+  link.addEventListener('click', (event) => event.preventDefault())
+  await user.click(link)
+  await user.click(link)
+  expect(
+    post.mock.calls.filter(([path]) => path === '/api/user/waffo/pay')
+  ).toHaveLength(1)
+  expect(usePaymentRecoveryStore.getState().orders[1]).toContain(
+    'usable_waffo_checkout'
+  )
+  expect(JSON.stringify(localStorage)).not.toContain(url)
+  await user.click(within(dialog).getByRole('button', { name: 'Close' }))
+  expect(screen.queryByRole('link', { name: 'Open payment app' })).toBeNull()
+})
+
+test('Waffo accepts native payment applications and rejects active content URLs', () => {
+  expect(isSafePaymentUrl('alipays://platformapi/startapp', true)).toBe(true)
   for (const url of [
     'javascript:alert(1)',
     'data:text/html,<h1>test</h1>',
@@ -1577,7 +2065,9 @@ test('a pending Creem order cannot be dismissed before checkout resolves', async
         ? pending
         : Promise.resolve({ data: { success: true, data: '1.00' } })
     )
-  const open = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+  const open = vi
+    .spyOn(HTMLAnchorElement.prototype, 'click')
+    .mockImplementation(() => {})
   render(<Wallet />)
   await userEvent.click(screen.getByText('Starter credits'))
   const dialog = screen.getByRole('dialog', { name: 'Confirm Creem Purchase' })
@@ -2232,7 +2722,9 @@ test.each(['alipay', 'stripe', 'creem', 'waffo', 'waffo_pancake'])(
               },
       },
     })
-    const open = vi.spyOn(window, 'open').mockReturnValue({} as Window)
+    const open = vi
+      .spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(() => {})
     const submit = vi
       .spyOn(HTMLFormElement.prototype, 'submit')
       .mockImplementation(() => {})
@@ -2265,7 +2757,7 @@ test.each(['alipay', 'stripe', 'creem', 'waffo', 'waffo_pancake'])(
     expect(open).not.toHaveBeenCalled()
     expect(submit).not.toHaveBeenCalled()
     notice.unmount()
-    usePaymentRecoveryStore.setState({ orders: {}, storageErrors: {} })
+    usePaymentRecoveryStore.setState(usePaymentRecoveryStore.getInitialState())
     render(<PaymentRecoveryNotice onViewOrder={viewOrder} />)
     expect(screen.getByText(original)).toBeVisible()
     await userEvent.click(screen.getByRole('button', { name: 'View order' }))
@@ -2287,7 +2779,7 @@ test('a saved checkout reference survives logout and a new session only for its 
     await hook.result.current.processCreemPayment(creemProduct)
   })
   hook.unmount()
-  usePaymentRecoveryStore.setState({ orders: {}, storageErrors: {} })
+  usePaymentRecoveryStore.setState(usePaymentRecoveryStore.getInitialState())
   useAuthStore.getState().auth.reset()
   const page = render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
   expect(
@@ -2393,6 +2885,101 @@ test('failed browser storage keeps the known order copyable and warns before lea
   ).toBeVisible()
 })
 
+test.each(['unreadable', 'damaged'])(
+  'a wallet opened with a recovery record that is %s offers personal history without an order number',
+  (condition) => {
+    const key = 'new-api:payment-recovery:v1:1:original_order'
+    localStorage.setItem(
+      key,
+      condition === 'damaged' ? 'damaged reference!' : 'original_order'
+    )
+    if (condition === 'unreadable') {
+      vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+        throw new DOMException('Storage blocked', 'SecurityError')
+      })
+    }
+    const view = vi.fn()
+    render(<PaymentRecoveryNotice onViewOrder={view} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Order History' }))
+    expect(view).toHaveBeenCalledExactlyOnceWith('')
+    expect(
+      screen.queryByText(/Copy the order number before leaving/)
+    ).not.toBeInTheDocument()
+  }
+)
+
+test.each(['known order', 'lost receipt'])(
+  'a %s survives a reload after the wallet regains storage access',
+  async (receipt) => {
+    const previous = api.defaults.adapter
+    api.defaults.adapter = async (config) => {
+      if (receipt === 'lost receipt') {
+        throw new AxiosError('Network Error', 'ERR_NETWORK', config)
+      }
+      return {
+        config,
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        data: {
+          message: 'error',
+          trade_no: 'unsaved_original_order',
+          message_key:
+            'Payment request result is unknown. Check Order History before trying again.',
+        },
+      }
+    }
+    try {
+      const save = vi
+        .spyOn(Storage.prototype, 'setItem')
+        .mockImplementation(() => {
+          throw new DOMException('Storage full', 'QuotaExceededError')
+        })
+      const notice = render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+      const payment = renderHook(() => useCreemPayment())
+      await act(async () => {
+        expect(
+          await payment.result.current.processCreemPayment(creemProduct)
+        ).toBe(false)
+      })
+      expect(
+        Object.keys(localStorage).filter((key) =>
+          key.startsWith('new-api:payment-recovery:v1:1:')
+        )
+      ).toHaveLength(0)
+      save.mockRestore()
+      act(() =>
+        window.dispatchEvent(
+          new Event(receipt === 'known order' ? 'pagehide' : 'focus')
+        )
+      )
+      notice.unmount()
+      usePaymentRecoveryStore.setState(
+        usePaymentRecoveryStore.getInitialState()
+      )
+      const view = vi.fn()
+      render(<PaymentRecoveryNotice onViewOrder={view} />)
+
+      if (receipt === 'known order') {
+        fireEvent.click(screen.getByRole('button', { name: 'View order' }))
+        expect(view).toHaveBeenCalledExactlyOnceWith('unsaved_original_order')
+        expect(
+          screen.queryByRole('button', { name: 'I checked Order History' })
+        ).not.toBeInTheDocument()
+      } else {
+        fireEvent.click(screen.getByRole('button', { name: 'Order History' }))
+        expect(view).toHaveBeenCalledExactlyOnceWith('')
+        expect(
+          screen.getByRole('button', { name: 'I checked Order History' })
+        ).toBeVisible()
+      }
+    } finally {
+      api.defaults.adapter = previous
+    }
+  }
+)
+
 test('another tab cleaning up a completed checkout during restoration cannot hide the next unresolved order', () => {
   const completedKey = 'new-api:payment-recovery:v1:1:completed_checkout'
   const unresolvedKey = 'new-api:payment-recovery:v1:1:unresolved_checkout'
@@ -2415,6 +3002,53 @@ test('another tab cleaning up a completed checkout during restoration cannot hid
   expect(screen.getByText('unresolved_checkout')).toBeVisible()
   expect(screen.queryByText('completed_checkout')).not.toBeInTheDocument()
   expect(localStorage.getItem(unresolvedKey)).toBe('unresolved_checkout')
+})
+
+test('a lost receipt keeps a repaired reminder retired after it was checked in another tab', async () => {
+  const previous = api.defaults.adapter
+  let loseReceipt!: () => void
+  const pending = new Promise<void>((resolve) => {
+    loseReceipt = resolve
+  })
+  api.defaults.adapter = async (config) => {
+    await pending
+    throw new AxiosError('Network Error', 'ERR_NETWORK', config)
+  }
+  try {
+    const save = vi
+      .spyOn(Storage.prototype, 'setItem')
+      .mockImplementation(() => {
+        throw new DOMException('Storage full', 'QuotaExceededError')
+      })
+    const notice = render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+    const payment = renderHook(() => useCreemPayment())
+    let operation!: Promise<boolean>
+    await act(async () => {
+      operation = payment.result.current.processCreemPayment(creemProduct)
+    })
+    save.mockRestore()
+    act(() => window.dispatchEvent(new Event('focus')))
+    const key =
+      Object.keys(localStorage).find((k) =>
+        k.startsWith('new-api:payment-recovery:v1:1:')
+      ) ?? ''
+    expect(key).not.toBe('')
+    notice.unmount()
+    payment.unmount()
+    // The wallet was closed when another tab checked this reminder.
+    localStorage.removeItem(key)
+    loseReceipt()
+    await operation
+
+    render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+    expect(
+      screen.queryByText('Payment requests to check')
+    ).not.toBeInTheDocument()
+    expect(localStorage.getItem(key)).toBeNull()
+  } finally {
+    loseReceipt()
+    api.defaults.adapter = previous
+  }
 })
 
 test('another tab order reference does not replace the current unknown checkout', async () => {
@@ -2520,7 +3154,7 @@ test('only a successful current-user terminal order read retires a saved checkou
     screen.queryByText('Payment requests to check')
   ).not.toBeInTheDocument()
   notice.unmount()
-  usePaymentRecoveryStore.setState({ orders: {}, storageErrors: {} })
+  usePaymentRecoveryStore.setState(usePaymentRecoveryStore.getInitialState())
   render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
   expect(screen.queryByText('query_original_checkout')).not.toBeInTheDocument()
   vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
@@ -2567,7 +3201,12 @@ test('resolving a valid checkout keeps the warning for another corrupted recover
   await waitFor(() => expect(history.result.current.records).toHaveLength(1))
 
   expect(screen.queryByText('completed_checkout')).not.toBeInTheDocument()
-  expect(screen.getByText(warning)).toBeVisible()
+  expect(
+    screen.getByText(
+      'This browser could not save a payment reminder. Check your recent top-ups before leaving.'
+    )
+  ).toBeVisible()
+  expect(screen.getByRole('button', { name: 'Order History' })).toBeVisible()
   expect(localStorage.getItem(corruptedKey)).toBe('corrupted order reference!')
 })
 
@@ -2618,6 +3257,33 @@ test('completed checkout cleanup does not expose another account recovery record
   expect(localStorage.getItem(otherUserKey)).toBe('corrupted order reference!')
 })
 
+test('a confirmed order is cleared after its earlier storage removal failed', () => {
+  usePaymentRecoveryStore.getState().remember(1, 'confirmed_order')
+  usePaymentRecoveryStore.getState().remember(1, 'unresolved_order')
+  render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
+  const remove = vi
+    .spyOn(Storage.prototype, 'removeItem')
+    .mockImplementation(() => {
+      throw new DOMException('Storage blocked', 'SecurityError')
+    })
+  act(() => {
+    usePaymentRecoveryStore.getState().resolve(1, ['confirmed_order'])
+  })
+  expect(screen.getByText('confirmed_order')).toBeVisible()
+  remove.mockRestore()
+
+  act(() => window.dispatchEvent(new Event('focus')))
+
+  expect(screen.queryByText('confirmed_order')).not.toBeInTheDocument()
+  expect(
+    localStorage.getItem('new-api:payment-recovery:v1:1:confirmed_order')
+  ).toBeNull()
+  expect(screen.getByText('unresolved_order')).toBeVisible()
+  expect(
+    localStorage.getItem('new-api:payment-recovery:v1:1:unresolved_order')
+  ).toBe('unresolved_order')
+})
+
 test.each([null, 'previous-ui-version'])(
   'frontend cache initialization preserves unresolved payment identities with cache version %s',
   async (version) => {
@@ -2647,7 +3313,7 @@ test.each([null, 'previous-ui-version'])(
 
     // A reload discards page memory, then main.tsx initializes caches before
     // mounting the components that recover unresolved money operations.
-    usePaymentRecoveryStore.setState({ orders: {}, storageErrors: {} })
+    usePaymentRecoveryStore.setState(usePaymentRecoveryStore.getInitialState())
     initializeFrontendCache()
     initializeFrontendCache()
     const request = vi

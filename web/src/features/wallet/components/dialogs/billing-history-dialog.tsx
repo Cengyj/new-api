@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { Search, Copy, Check, ChevronLeft, ChevronRight } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { ConfirmDialog } from '@/components/confirm-dialog'
@@ -56,6 +56,7 @@ import {
 interface BillingHistoryDialogProps {
   open: boolean
   initialKeyword?: string
+  personalOnly?: boolean
   onOpenChange: (open: boolean) => void
 }
 
@@ -63,7 +64,7 @@ export function BillingHistoryDialog(props: BillingHistoryDialogProps) {
   const identity = useAuthStore(billingHistoryIdentity)
   return (
     <BillingHistoryContent
-      key={`${identity}:${props.initialKeyword ?? ''}:${props.open}`}
+      key={`${identity}:${!!props.personalOnly}:${props.initialKeyword ?? ''}:${props.open}`}
       {...props}
     />
   )
@@ -73,6 +74,7 @@ function BillingHistoryContent({
   open,
   onOpenChange,
   initialKeyword,
+  personalOnly,
 }: BillingHistoryDialogProps) {
   const { t, i18n } = useTranslation()
   const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
@@ -86,21 +88,34 @@ function BillingHistoryContent({
     loading,
     loadFailed,
     completing,
-    isAdmin,
+    canManageOrders,
     handlePageChange,
     handlePageSizeChange,
     handleSearch,
     handleCompleteOrder,
     refresh,
-  } = useBillingHistory({ initialKeyword, enabled: open })
+  } = useBillingHistory({ initialKeyword, enabled: open, personalOnly })
 
   const [confirmTradeNo, setConfirmTradeNo] = useState<string | null>(null)
   const { copyToClipboard, copiedText } = useCopyToClipboard({ notify: false })
 
   const totalPages = Math.ceil(total / pageSize)
+  const canConfirm =
+    canManageOrders &&
+    !loading &&
+    !loadFailed &&
+    records.some(
+      (record) =>
+        record.trade_no === confirmTradeNo && record.status === 'pending'
+    )
+  useEffect(() => {
+    if (confirmTradeNo && !loading && !completing && !canConfirm) {
+      setConfirmTradeNo(null)
+    }
+  }, [canConfirm, completing, confirmTradeNo, loading])
 
   const handleConfirmComplete = async () => {
-    if (confirmTradeNo) {
+    if (confirmTradeNo && canConfirm) {
       const success = await handleCompleteOrder(confirmTradeNo)
       if (success) {
         setConfirmTradeNo(null)
@@ -257,7 +272,7 @@ function BillingHistoryContent({
                                 <Copy className='h-3 w-3' />
                               )}
                             </Button>
-                            {isAdmin && record.user_id != null && (
+                            {canManageOrders && record.user_id != null && (
                               <StatusBadge
                                 label={`${t('User ID')}: ${record.user_id}`}
                                 variant='neutral'
@@ -313,7 +328,7 @@ function BillingHistoryContent({
                       </div>
 
                       {/* Admin Actions */}
-                      {isAdmin && record.status === 'pending' && (
+                      {canManageOrders && record.status === 'pending' && (
                         <div className='mt-4 flex justify-end'>
                           <Button
                             size='sm'
@@ -371,12 +386,22 @@ function BillingHistoryContent({
 
       {/* Confirm Complete Order Dialog */}
       <ConfirmDialog
-        open={!!confirmTradeNo}
+        open={!!confirmTradeNo && (completing || canConfirm)}
         onOpenChange={(open) => !open && !completing && setConfirmTradeNo(null)}
         title={t('Complete Order')}
-        desc={t(
-          'Are you sure you want to manually complete this order? The user will be credited with the corresponding quota.'
-        )}
+        desc={
+          <div className='space-y-2'>
+            <p>
+              {t(
+                'Are you sure you want to manually complete this order? The user will be credited with the corresponding quota.'
+              )}
+            </p>
+            <p>
+              {t('Order number')}:{' '}
+              <code className='break-all'>{confirmTradeNo}</code>
+            </p>
+          </div>
+        }
         handleConfirm={handleConfirmComplete}
         isLoading={completing}
         confirmText={completing ? t('Processing...') : t('Confirm')}

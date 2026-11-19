@@ -56,7 +56,8 @@ export const STATUS_CONFIG: Record<TopupStatus, StatusConfig> = {
  * Get status badge configuration
  */
 export function getStatusConfig(status: TopupStatus): StatusConfig {
-  return STATUS_CONFIG[status] || STATUS_CONFIG.pending
+  if (Object.hasOwn(STATUS_CONFIG, status)) return STATUS_CONFIG[status]
+  return { variant: 'neutral', label: 'Unknown' }
 }
 
 /**

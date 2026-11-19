@@ -321,7 +321,7 @@ func RequestWaffoPay(c *gin.Context) {
 	}
 	if err := topUp.Insert(); err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Waffo failed to create top-up order user_id=%d trade_no=%s amount=%d error=%q", id, merchantOrderId, req.Amount, err.Error()))
-		paymentError(c, common.NewMessage("Failed to create order"))
+		paymentOrderCreateError(c, merchantOrderId, err)
 		return
 	}
 

@@ -46,6 +46,7 @@ interface UseBillingHistoryOptions {
   initialPageSize?: number
   initialKeyword?: string
   enabled?: boolean
+  personalOnly?: boolean
 }
 
 export function billingHistoryIdentity(): string {
@@ -61,6 +62,7 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
     enabled = true,
   } = options
   const isAdmin = useIsAdmin()
+  const canManageOrders = isAdmin && !options.personalOnly
   const identity = useAuthStore(billingHistoryIdentity)
   const abort = useRef(new AbortController())
   const pendingCompletion = useRef(false)
@@ -98,13 +100,20 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
     setLoading(true)
     setLoadFailed(false)
     try {
-      const response = isAdmin
+      const response = canManageOrders
         ? await getAllBillingHistory(page, pageSize, debouncedKeyword, signal)
         : await getUserBillingHistory(page, pageSize, debouncedKeyword, signal)
 
       if (requestId !== requestIdRef.current || signal.aborted) return
 
       if (isApiSuccess(response) && response.data) {
+        const lastPage = Math.max(1, Math.ceil(response.data.total / pageSize))
+        if (page > lastPage && response.data.items?.length === 0) {
+          // The oldest orders can leave the personal history window between pages.
+          requestIdRef.current += 1
+          setPage(lastPage)
+          return
+        }
         const userId = useAuthStore.getState().auth.user?.id
         if (userId) {
           // Only a successful authoritative read of this user's terminal order
@@ -135,7 +144,7 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
         setLoading(false)
       }
     }
-  }, [debouncedKeyword, identity, isAdmin, page, pageSize])
+  }, [canManageOrders, debouncedKeyword, identity, page, pageSize])
 
   /**
    * Complete a pending order (admin only)
@@ -150,14 +159,15 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
       ) {
         return false
       }
-      if (!isAdmin) {
+      if (!canManageOrders) {
         toast.error(i18next.t('Admin access required'))
         return false
       }
 
       pendingCompletion.current = true
       setCompleting(true)
-      let unconfirmed: unknown
+      let failure: unknown
+      let rejected = false
       try {
         const response = await completeOrder({ trade_no: tradeNo }, signal)
         if (signal.aborted) return false
@@ -168,31 +178,35 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
           setRefreshVersion((version) => version + 1)
           return true
         }
-        if (response?.success === false) {
-          handleServerError(response, i18next.t('Failed to complete order'))
-          return false
-        }
-        unconfirmed = response
+        rejected = response?.success === false
+        failure = response
       } catch (error) {
         if (signal.aborted) return false
-        if (hasPaymentDeclineResponse(error)) {
-          handleServerError(error, i18next.t('Failed to complete order'))
-          return false
-        }
-        unconfirmed = error
+        rejected = hasPaymentDeclineResponse(error)
+        failure = error
       } finally {
         pendingCompletion.current = false
         if (!signal.aborted) setCompleting(false)
       }
-      // A proxy can lose or replace the receipt even after the order was credited.
-      handleServerError(unconfirmed, undefined, {
-        title: i18next.t(
-          'Order completion result is unknown. Refresh Order History before retrying this order.'
-        ),
-      })
+      if (rejected) {
+        handleServerError(failure, i18next.t('Failed to complete order'))
+      } else {
+        handleServerError(failure, undefined, {
+          title: i18next.t(
+            'Order completion result is unknown. Refresh Order History before retrying this order.'
+          ),
+        })
+      }
+      // A lost receipt or a cache error can follow a committed credit. Recheck
+      // the exact original order before allowing another confirmation.
+      requestIdRef.current += 1
+      setLoading(true)
+      setKeyword(tradeNo)
+      setPage(1)
+      setRefreshVersion((version) => version + 1)
       return false
     },
-    [identity, isAdmin]
+    [canManageOrders, identity]
   )
 
   /**
@@ -213,11 +227,16 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
   /**
    * Search by keyword
    */
-  const handleSearch = useCallback((newKeyword: string) => {
-    requestIdRef.current += 1
-    setKeyword(newKeyword)
-    setPage(1) // Reset to first page when searching
-  }, [])
+  const handleSearch = useCallback(
+    (newKeyword: string) => {
+      if (newKeyword === keyword) return
+      requestIdRef.current += 1
+      setLoading(true)
+      setKeyword(newKeyword)
+      setPage(1)
+    },
+    [keyword]
+  )
 
   // Fetch data after the search draft has settled.
   useEffect(() => {
@@ -235,7 +254,7 @@ export function useBillingHistory(options: UseBillingHistoryOptions = {}) {
     loading,
     loadFailed,
     completing,
-    isAdmin,
+    canManageOrders,
     handlePageChange,
     handlePageSizeChange,
     handleSearch,

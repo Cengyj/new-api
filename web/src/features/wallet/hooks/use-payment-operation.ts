@@ -26,47 +26,94 @@ import { usePaymentRecoveryStore } from '@/stores/payment-recovery-store'
 
 import { hasPaymentDeclineResponse } from '../lib/payment'
 
-function isUnknownCheckout(source: Record<string | symbol, unknown>): boolean {
-  return (
-    source.message_key ===
-    'Payment request result is unknown. Check Order History before trying again.'
-  )
+// Allow slow checkout receipts without trapping the payer in confirmation.
+const CHECKOUT_RECEIPT_TIMEOUT_MS = 10 * 60_000
+const DETACHED_RECEIPT_TIMEOUT_MS = 5 * 60_000
+
+function getCheckoutReview(sources: ReturnType<typeof getServerErrorSources>) {
+  for (const source of sources) {
+    if (
+      source.message_key ===
+      'Payment request result is unknown. Check Order History before trying again.'
+    ) {
+      return { unknown: true, tradeNo: source.trade_no }
+    }
+    if (
+      source.success === false &&
+      source.message_key ===
+        'Payment was not started. Check order {{trade_no}} in Order History.'
+    ) {
+      const params = source.message_params
+      if (params && typeof params === 'object' && 'trade_no' in params) {
+        return { unknown: false, tradeNo: params.trade_no }
+      }
+    }
+  }
 }
 
 // A lost response does not cancel an order already created by the server.
 // Prevent concurrent submissions and discard delivery after payer changes.
 export function usePaymentOperation(
-  onUnknownCheckout?: (tradeNo?: string) => void
+  onReviewCheckout?: (tradeNo?: string) => void
 ) {
   const [processing, setProcessing] = useState(false)
   const pending = useRef(false)
   const mounted = useRef(true)
-  const activeController = useRef<AbortController | null>(null)
+  const onLeave = useRef<(() => void) | null>(null)
   useEffect(() => {
     mounted.current = true
     return () => {
       mounted.current = false
-      activeController.current?.abort()
+      onLeave.current?.()
     }
   }, [])
 
   const runPayment = useCallback(
     async <T>(
-      request: (signal: AbortSignal) => Promise<T>,
+      request: (signal: AbortSignal, onDispatch: () => void) => Promise<T>,
       handleResponse: (response: T) => boolean
     ): Promise<boolean> => {
       if (pending.current || !mounted.current) return false
       pending.current = true
       setProcessing(true)
       const controller = new AbortController()
-      activeController.current = controller
+      // Release the wallet even if a suspended request does not reject on abort.
+      const aborted = new Promise<never>((_, reject) => {
+        controller.signal.addEventListener(
+          'abort',
+          () => reject(controller.signal.reason),
+          { once: true }
+        )
+      })
+      let dispatched = false
+      let receiptTimer = setTimeout(
+        () =>
+          controller.abort(
+            new DOMException('Checkout receipt timed out', 'TimeoutError')
+          ),
+        CHECKOUT_RECEIPT_TIMEOUT_MS
+      )
+      onLeave.current = () => {
+        clearTimeout(receiptTimer)
+        if (dispatched) {
+          receiptTimer = setTimeout(
+            () => controller.abort(),
+            DETACHED_RECEIPT_TIMEOUT_MS
+          )
+        } else {
+          controller.abort()
+        }
+      }
       const auth = useAuthStore.getState().auth
       let changed = false
       let unresolvedOrder: unknown
       let checkHistory = false
+      let attempt: string | undefined
+      let resolved = false
       const unsubscribe = useAuthStore.subscribe((state) => {
         if (
           state.auth.user?.id !== auth.user?.id ||
+          state.auth.user?.role !== auth.user?.role ||
           state.auth.session?.sid !== auth.session?.sid
         ) {
           changed = true
@@ -76,31 +123,46 @@ export function usePaymentOperation(
         }
       })
       try {
-        const response = await request(controller.signal)
-        if (!mounted.current || changed) return false
-        // Keep delivery synchronous with the identity check: an await between
-        // checking the payer and opening checkout allows another account to win.
+        const receipt = request(controller.signal, () => {
+          dispatched = true
+          if (auth.user?.id) {
+            const nonce = Array.from(
+              crypto.getRandomValues(new Uint8Array(16)),
+              (byte) => byte.toString(16).padStart(2, '0')
+            ).join('')
+            attempt = `~${Date.now()}-${nonce}`
+            usePaymentRecoveryStore
+              .getState()
+              .remember(auth.user.id, attempt, { awaitingReceipt: true })
+          }
+        })
+        const response = await Promise.race([receipt, aborted])
+        if (changed) return false
         const sources = getServerErrorSources(response)
-        const unknownOrder = sources.find(isUnknownCheckout)
+        const review = getCheckoutReview(sources)
         // Capture the reference before browser navigation, which can throw
         // even when the server successfully created the checkout.
         const checkout = sources.find(
           (source) => source.success === true || source.message === 'success'
         )
         const data = checkout?.data
-        let tradeNo = unknownOrder?.trade_no
+        let tradeNo = review?.tradeNo
         if (!tradeNo && data && typeof data === 'object') {
           if ('order_id' in data) tradeNo = data.order_id
           else if ('out_trade_no' in data) tradeNo = data.out_trade_no
         }
         unresolvedOrder = tradeNo
+        const declined =
+          !review?.unknown &&
+          !checkout &&
+          sources.some((s) => s.success === false || s.message === 'error')
+        resolved = declined
+        // A receipt may arrive as its payer leaves the wallet. Retain the
+        // reference for that payer, but only a current session can navigate.
+        if (!mounted.current) return false
         // A proxy can return a document instead of the checkout receipt after
         // the order was created. Only a recognized decline is safe to present as one.
-        if (
-          unknownOrder ||
-          (!checkout &&
-            !sources.some((s) => s.success === false || s.message === 'error'))
-        ) {
+        if (review?.unknown || (!checkout && !declined)) {
           checkHistory = true
           handleServerError(response, undefined, {
             title: i18next.t(
@@ -110,15 +172,19 @@ export function usePaymentOperation(
           return false
         }
         const completed = handleResponse(response)
-        if (completed) unresolvedOrder = undefined
+        if (completed) {
+          unresolvedOrder = undefined
+          resolved = true
+        }
         checkHistory = !completed && !!checkout
         return completed
       } catch (error) {
-        if (!mounted.current || changed) return false
-        const unknownOrder =
-          getServerErrorSources(error).find(isUnknownCheckout)
-        if (unknownOrder) unresolvedOrder = unknownOrder.trade_no
-        if (!unknownOrder && hasPaymentDeclineResponse(error)) {
+        if (changed) return false
+        const review = getCheckoutReview(getServerErrorSources(error))
+        if (review) unresolvedOrder = review.tradeNo
+        resolved = review ? !review.unknown : hasPaymentDeclineResponse(error)
+        if (!mounted.current) return false
+        if (resolved) {
           handleServerError(error, i18next.t('Payment request failed'))
         } else {
           checkHistory = true
@@ -131,25 +197,36 @@ export function usePaymentOperation(
         return false
       } finally {
         unsubscribe()
-        activeController.current = null
+        clearTimeout(receiptTimer)
+        onLeave.current = null
         pending.current = false
         if (mounted.current) setProcessing(false)
-        if (mounted.current && !changed && auth.user?.id) {
+        if (!changed && auth.user?.id) {
           if (
             typeof unresolvedOrder === 'string' &&
             /^[a-zA-Z0-9_-]{1,128}$/.test(unresolvedOrder)
           ) {
-            usePaymentRecoveryStore
+            resolved = usePaymentRecoveryStore
               .getState()
-              .remember(auth.user.id, unresolvedOrder)
-            onUnknownCheckout?.(unresolvedOrder)
-          } else if (checkHistory) {
-            onUnknownCheckout?.()
+              .remember(auth.user.id, unresolvedOrder, {
+                replacesAttempt: attempt,
+              })
+            if (mounted.current) onReviewCheckout?.(unresolvedOrder)
+          } else if (checkHistory && mounted.current) {
+            onReviewCheckout?.()
+          }
+        }
+        if (attempt && auth.user?.id) {
+          const recovery = usePaymentRecoveryStore.getState()
+          if (resolved) {
+            recovery.resolve(auth.user.id, [attempt])
+          } else {
+            recovery.restore(auth.user.id, { dispatched: attempt })
           }
         }
       }
     },
-    [onUnknownCheckout]
+    [onReviewCheckout]
   )
 
   return { processing, runPayment }

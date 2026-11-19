@@ -28,9 +28,9 @@ import { isSafePaymentUrl, isValidTopupAmount } from '../lib/payment'
 import { usePaymentOperation } from './use-payment-operation'
 
 export function useWaffoPancakePayment(
-  onUnknownCheckout?: (tradeNo?: string) => void
+  onReviewCheckout?: (tradeNo?: string) => void
 ) {
-  const { processing, runPayment } = usePaymentOperation(onUnknownCheckout)
+  const { processing, runPayment } = usePaymentOperation(onReviewCheckout)
   const processWaffoPancakePayment = useCallback(
     async (topupAmount: number) => {
       if (!isValidTopupAmount(topupAmount)) {
@@ -38,7 +38,12 @@ export function useWaffoPancakePayment(
         return false
       }
       return runPayment(
-        (signal) => requestWaffoPancakePayment({ amount: topupAmount }, signal),
+        (signal, onDispatch) =>
+          requestWaffoPancakePayment(
+            { amount: topupAmount },
+            signal,
+            onDispatch
+          ),
         (response) => {
           if (!isApiSuccess(response)) {
             const message =

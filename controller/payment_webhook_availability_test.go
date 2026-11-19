@@ -2966,6 +2966,118 @@ func TestWalletReferralCheckoutLocalFailurePreservesCompletionPolicy(t *testing.
 	}
 }
 
+type walletCheckoutCommitPool struct {
+	gorm.ConnPool
+	commit func(*sql.Tx) error
+}
+
+func (pool walletCheckoutCommitPool) BeginTx(ctx context.Context, options *sql.TxOptions) (gorm.ConnPool, error) {
+	tx, err := pool.ConnPool.(gorm.TxBeginner).BeginTx(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &walletCheckoutCommitTx{Tx: tx, commit: pool.commit}, nil
+}
+
+type walletCheckoutCommitTx struct {
+	*sql.Tx
+	commit func(*sql.Tx) error
+}
+
+func (tx *walletCheckoutCommitTx) Commit() error {
+	return tx.commit(tx.Tx)
+}
+
+func TestWalletCheckoutContinuesOnlyItsConfirmedInsert(t *testing.T) {
+	for _, outcome := range []string{"committed", "rolled_back", "lookup_unavailable", "different_owner", "changed_quota", "terminal_failed", "terminal_expired", "terminal_success", "conflict", "explicit_id"} {
+		t.Run(outcome, func(t *testing.T) {
+			router, _ := walletCheckoutFixture(t)
+			healthy := model.DB
+			if outcome == "conflict" || outcome == "explicit_id" {
+				existing := walletWebhookOrder(t, model.PaymentProviderCreem, "existing-checkout")
+				duplicate := *existing
+				if outcome == "conflict" {
+					duplicate.Id = 0
+				}
+				require.Error(t, duplicate.Insert())
+				var total int64
+				require.NoError(t, healthy.Model(&model.TopUp{}).Count(&total).Error)
+				assert.EqualValues(t, 1, total)
+				return
+			}
+			setting.CreemProducts = `[{"productId":"fixture","name":"Wallet fixture","price":100,"currency":"USD","quota":1000}]`
+			var submitted string
+			previous := http.DefaultTransport
+			http.DefaultTransport = walletCheckoutTransport(func(request *http.Request) (*http.Response, error) {
+				assert.Empty(t, submitted, "a checkout must be submitted at most once")
+				var checkout CreemCheckoutRequest
+				require.NoError(t, common.DecodeJson(request.Body, &checkout))
+				submitted = checkout.RequestId
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"checkout_url":"https://checkout.example.invalid/original"}`))}, nil
+			})
+			t.Cleanup(func() { http.DefaultTransport = previous; model.DB = healthy })
+			var original model.TopUp
+			commits := 0
+			pool := walletCheckoutCommitPool{ConnPool: healthy.Statement.ConnPool, commit: func(tx *sql.Tx) error {
+				commits++
+				if outcome == "rolled_back" {
+					require.NoError(t, tx.Rollback())
+				} else {
+					require.NoError(t, tx.Commit())
+					require.NoError(t, healthy.First(&original).Error)
+					switch outcome {
+					case "lookup_unavailable":
+						const callbackName = "test:unavailable_checkout_lookup"
+						require.NoError(t, healthy.Callback().Query().Before("gorm:query").Register(callbackName, func(db *gorm.DB) {
+							if db.Statement.Table == "top_ups" {
+								db.AddError(errors.New("checkout lookup unavailable"))
+							}
+						}))
+						t.Cleanup(func() { _ = healthy.Callback().Query().Remove(callbackName) })
+					case "different_owner":
+						require.NoError(t, healthy.Model(&original).Updates(map[string]any{"user_id": 901, "status": common.TopUpStatusFailed}).Error)
+					case "changed_quota":
+						require.NoError(t, healthy.Model(&original).Updates(map[string]any{"credited_quota": 999, "status": common.TopUpStatusFailed}).Error)
+					case "terminal_failed":
+						require.NoError(t, healthy.Model(&original).Update("status", common.TopUpStatusFailed).Error)
+					case "terminal_expired":
+						require.NoError(t, healthy.Model(&original).Update("status", common.TopUpStatusExpired).Error)
+					case "terminal_success":
+						// Synthetic post-settlement row for checkout read-back only.
+						require.NoError(t, healthy.Model(&original).Updates(map[string]any{"status": common.TopUpStatusSuccess, "complete_time": original.CreateTime + 1, "settlement_audit": `{"source":"payment"}`}).Error)
+					}
+				}
+				return errors.New("isolated checkout commit acknowledgement unavailable")
+			}}
+			wrapped := healthy.Session(&gorm.Session{NewDB: true})
+			wrapped.Statement = &gorm.Statement{DB: wrapped, Context: t.Context(), ConnPool: pool}
+			model.DB = wrapped
+			router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestCreemPay)
+			request := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(`{"product_id":"fixture","payment_method":"creem"}`))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			require.Equal(t, 1, commits)
+			if outcome == "committed" {
+				require.NotEmpty(t, original.TradeNo)
+				assert.Equal(t, original.TradeNo, submitted)
+				assert.Contains(t, response.Body.String(), fmt.Sprintf(`"order_id":%q`, original.TradeNo))
+				assert.Contains(t, response.Body.String(), `"checkout_url":"https://checkout.example.invalid/original"`)
+			} else {
+				assert.Empty(t, submitted)
+				assert.Contains(t, response.Body.String(), `"success":false`)
+				assert.NotContains(t, response.Body.String(), "checkout_url")
+				assert.NotContains(t, response.Body.String(), "Payment request result is unknown")
+				if strings.HasPrefix(outcome, "terminal_") {
+					assert.Contains(t, response.Body.String(), fmt.Sprintf(`"trade_no":%q`, original.TradeNo))
+				} else {
+					assert.NotContains(t, response.Body.String(), `"trade_no"`)
+				}
+			}
+		})
+	}
+}
+
 func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.T) {
 	for _, scenario := range []string{"late_callback", "manual_then_callback", "callback_before_response_loss", "non_json_remote_error", "session_http500", "session_http401", "token_http500", "token_http401", "session_timeout", "token_timeout", "missing_session_id", "blank_session_id", "empty_checkout_url", "blank_checkout_url", "empty_buyer_token", "blank_buyer_token", "successful_checkout"} {
 		t.Run(scenario, func(t *testing.T) {

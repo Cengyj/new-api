@@ -207,7 +207,7 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 	err = topUp.Insert()
 	if err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Creem failed to create top-up order user_id=%d trade_no=%s product_id=%s error=%q", id, referenceId, selectedProduct.ProductId, err.Error()))
-		paymentError(c, common.NewMessage("Failed to create order"))
+		paymentOrderCreateError(c, referenceId, err)
 		return
 	}
 

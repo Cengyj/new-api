@@ -159,7 +159,7 @@ func (*StripeAdaptor) RequestPay(c *gin.Context, req *StripePayRequest) {
 	err = topUp.Insert()
 	if err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Stripe failed to create top-up order user_id=%d trade_no=%s amount=%d error=%q", id, referenceId, req.Amount, err.Error()))
-		paymentError(c, common.NewMessage("Failed to create order"))
+		paymentOrderCreateError(c, referenceId, err)
 		return
 	}
 	payLink, err := checkoutConfig.link(referenceId, user.StripeCustomer, user.Email, req.Amount, req.SuccessURL, req.CancelURL)

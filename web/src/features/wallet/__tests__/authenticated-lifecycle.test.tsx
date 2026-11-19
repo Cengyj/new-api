@@ -53,6 +53,7 @@ import { Route as RootRoute } from '@/routes/__root'
 import { Route as AuthenticatedRoute } from '@/routes/_authenticated/route'
 import { Route as WalletRoute } from '@/routes/_authenticated/wallet/index'
 import { useAuthStore, type AuthBundle } from '@/stores/auth-store'
+import { usePaymentRecoveryStore } from '@/stores/payment-recovery-store'
 import {
   DEFAULT_CURRENCY_CONFIG,
   useSystemConfigStore,
@@ -283,6 +284,7 @@ beforeEach(() => {
   vi.spyOn(window, 'scrollTo').mockImplementation(() => undefined)
   localStorage.clear()
   sessionStorage.clear()
+  usePaymentRecoveryStore.setState(usePaymentRecoveryStore.getInitialState())
   clearAuthentication(false)
   applyAuthBundle(session(1, 'original-a'), false)
   useSystemConfigStore
@@ -450,6 +452,58 @@ test('logout during checkout removes the original confirmation and a late checko
   ).toHaveLength(1)
 })
 
+test.each(['lost response', 'saved order', 'payment return'])(
+  'an administrator recovering a personal payment through %s sees only personal orders and cannot complete them',
+  async (entry) => {
+    applyAuthBundle(session(1, 'admin-paying-personally', 100), false)
+    if (entry === 'saved order') {
+      localStorage.setItem(
+        `new-api:payment-recovery:v1:1:${pendingOrder.trade_no}`,
+        pendingOrder.trade_no
+      )
+    }
+    api.defaults.adapter = async (config) => {
+      requests.push(config)
+      if (config.url === '/api/user/pay') {
+        throw new AxiosError('Response lost', 'ERR_NETWORK', config)
+      }
+      return readResponse(config)
+    }
+    await mountWallet(
+      entry === 'payment return' ? '/wallet?show_history=true' : '/wallet'
+    )
+    if (entry === 'saved order') {
+      await userEvent.click(
+        await screen.findByRole('button', { name: 'View order' })
+      )
+    } else if (entry === 'lost response') {
+      await userEvent.click(
+        await screen.findByRole('button', { name: 'Alipay' })
+      )
+      const confirm = await screen.findByRole('alertdialog', {
+        name: 'Confirm Payment',
+      })
+      await userEvent.click(
+        within(confirm).getByRole('button', { name: 'Confirm Payment' })
+      )
+    }
+    const history = await screen.findByRole('dialog', {
+      name: 'Billing History',
+    })
+    expect(
+      await within(history).findByText(pendingOrder.trade_no)
+    ).toBeVisible()
+    const paths = requests
+      .filter((request) => request.method === 'get')
+      .map((request) => request.url?.split('?')[0])
+    expect(paths).toContain('/api/user/topup/self')
+    expect(paths).not.toContain('/api/user/topup')
+    expect(
+      within(history).queryByRole('button', { name: 'Complete Order' })
+    ).not.toBeInTheDocument()
+  }
+)
+
 test('logout during manual completion removes the original order confirmation and suppresses its late success after another login', async () => {
   applyAuthBundle(session(1, 'original-admin', 100), false)
   let release!: () => void
@@ -462,7 +516,10 @@ test('logout during manual completion removes the original order confirmation an
     return response(config, null)
   }
   const successToast = vi.spyOn(toast, 'success')
-  const { router } = await mountWallet('/wallet?show_history=true')
+  const { router } = await mountWallet()
+  await userEvent.click(
+    await screen.findByRole('button', { name: 'Order History' })
+  )
   await userEvent.click(
     await screen.findByRole('button', { name: 'Complete Order' })
   )

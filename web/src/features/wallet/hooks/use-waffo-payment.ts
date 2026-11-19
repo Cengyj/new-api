@@ -24,19 +24,22 @@ import { handleServerError } from '@/lib/handle-server-error'
 
 import { requestWaffoPayment, isApiSuccess } from '../api'
 import { getPaymentErrorTranslation } from '../lib'
-import { isSafePaymentUrl, isValidTopupAmount } from '../lib/payment'
+import {
+  isSafePaymentUrl,
+  isValidTopupAmount,
+  navigateToPayment,
+} from '../lib/payment'
 import type { WaffoPayMethod } from '../types'
 import { usePaymentOperation } from './use-payment-operation'
 
-export function useWaffoPayment(
-  onUnknownCheckout?: (tradeNo?: string) => void
-) {
-  const { processing, runPayment } = usePaymentOperation(onUnknownCheckout)
+export function useWaffoPayment(onReviewCheckout?: (tradeNo?: string) => void) {
+  const { processing, runPayment } = usePaymentOperation(onReviewCheckout)
   const processWaffoPayment = useCallback(
     async (
       topupAmount: number,
       payMethodIndex?: number,
-      payMethod?: Pick<WaffoPayMethod, 'payMethodType' | 'payMethodName'>
+      payMethod?: Pick<WaffoPayMethod, 'payMethodType' | 'payMethodName'>,
+      onAppLink?: (url: string, orderId?: string) => void
     ) => {
       if (!isValidTopupAmount(topupAmount)) {
         toast.error(i18next.t('Invalid top-up amount'))
@@ -49,7 +52,7 @@ export function useWaffoPayment(
         return false
       }
       return runPayment(
-        (signal) =>
+        (signal, onDispatch) =>
           requestWaffoPayment(
             {
               amount: topupAmount,
@@ -59,7 +62,8 @@ export function useWaffoPayment(
                 pay_method_name: payMethod.payMethodName ?? '',
               }),
             },
-            signal
+            signal,
+            onDispatch
           ),
         (response) => {
           if (!isApiSuccess(response)) {
@@ -76,15 +80,19 @@ export function useWaffoPayment(
             })
             return false
           }
-          const url =
-            response.data && typeof response.data === 'object'
-              ? response.data.payment_url
-              : undefined
+          const checkout =
+            typeof response.data === 'object' ? response.data : undefined
+          const url = checkout?.payment_url
           if (!isSafePaymentUrl(url, true)) {
             toast.error(i18next.t('Invalid payment redirect URL'))
             return false
           }
-          window.open(url, '_blank', 'noopener,noreferrer')
+          if (!isSafePaymentUrl(url)) {
+            if (!onAppLink) return false
+            onAppLink(url, checkout?.order_id)
+            return true
+          }
+          navigateToPayment(url)
           toast.success(i18next.t('Redirecting to payment page...'))
           return true
         }

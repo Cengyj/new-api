@@ -16,6 +16,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import axios, { type AxiosRequestConfig } from 'axios'
+
 import { api } from '@/lib/api'
 
 import type {
@@ -111,19 +113,38 @@ export async function calculateWaffoAmount(
   return res.data
 }
 
+function checkoutConfig(
+  signal?: AbortSignal,
+  onDispatch?: () => void
+): AxiosRequestConfig {
+  return {
+    skipBusinessError: true,
+    skipAuthRefresh: true,
+    skipErrorHandler: true,
+    signal,
+    adapter:
+      onDispatch &&
+      ((config) => {
+        const send = axios.getAdapter(api.defaults.adapter)
+        onDispatch()
+        return send(config)
+      }),
+  }
+}
+
 /**
  * Request regular payment
  */
 export async function requestPayment(
   request: PaymentRequest,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onDispatch?: () => void
 ): Promise<PaymentResponse> {
-  const res = await api.post('/api/user/pay', request, {
-    signal,
-    skipBusinessError: true,
-    skipAuthRefresh: true,
-    skipErrorHandler: true,
-  } as Record<string, unknown>)
+  const res = await api.post(
+    '/api/user/pay',
+    request,
+    checkoutConfig(signal, onDispatch)
+  )
   return {
     ...res.data,
     url: res.data.url || (res as unknown as { url?: string }).url,
@@ -135,14 +156,14 @@ export async function requestPayment(
  */
 export async function requestStripePayment(
   request: PaymentRequest,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onDispatch?: () => void
 ): Promise<StripePaymentResponse> {
-  const res = await api.post('/api/user/stripe/pay', request, {
-    signal,
-    skipBusinessError: true,
-    skipAuthRefresh: true,
-    skipErrorHandler: true,
-  } as Record<string, unknown>)
+  const res = await api.post(
+    '/api/user/stripe/pay',
+    request,
+    checkoutConfig(signal, onDispatch)
+  )
   return res.data
 }
 
@@ -151,14 +172,14 @@ export async function requestStripePayment(
  */
 export async function requestCreemPayment(
   request: CreemPaymentRequest,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onDispatch?: () => void
 ): Promise<CreemPaymentResponse> {
-  const res = await api.post('/api/user/creem/pay', request, {
-    signal,
-    skipBusinessError: true,
-    skipAuthRefresh: true,
-    skipErrorHandler: true,
-  } as Record<string, unknown>)
+  const res = await api.post(
+    '/api/user/creem/pay',
+    request,
+    checkoutConfig(signal, onDispatch)
+  )
   return res.data
 }
 
@@ -167,14 +188,14 @@ export async function requestCreemPayment(
  */
 export async function requestWaffoPayment(
   request: WaffoPaymentRequest,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onDispatch?: () => void
 ): Promise<WaffoPaymentResponse> {
-  const res = await api.post('/api/user/waffo/pay', request, {
-    signal,
-    skipBusinessError: true,
-    skipAuthRefresh: true,
-    skipErrorHandler: true,
-  } as Record<string, unknown>)
+  const res = await api.post(
+    '/api/user/waffo/pay',
+    request,
+    checkoutConfig(signal, onDispatch)
+  )
   return res.data
 }
 
@@ -195,14 +216,14 @@ export async function calculateWaffoPancakeAmount(
  */
 export async function requestWaffoPancakePayment(
   request: WaffoPancakePaymentRequest,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onDispatch?: () => void
 ): Promise<WaffoPancakePaymentResponse> {
-  const res = await api.post('/api/user/waffo-pancake/pay', request, {
-    signal,
-    skipBusinessError: true,
-    skipAuthRefresh: true,
-    skipErrorHandler: true,
-  } as Record<string, unknown>)
+  const res = await api.post(
+    '/api/user/waffo-pancake/pay',
+    request,
+    checkoutConfig(signal, onDispatch)
+  )
   return res.data
 }
 
