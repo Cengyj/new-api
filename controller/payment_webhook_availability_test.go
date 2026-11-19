@@ -3476,6 +3476,38 @@ func TestWalletReferralStripeDelayedPaymentSettlesOnlyAfterSuccessEvent(t *testi
 	assert.Equal(t, facts[0].SettledAt, stored.CompleteTime)
 }
 
+func TestWalletStripeContradictoryPaymentStatusPreservesOriginalOrder(t *testing.T) {
+	router, keys := walletWebhookFixture(t)
+	for _, tc := range []struct{ name, eventType, status, paymentStatus string }{
+		{"async_success_unpaid", "checkout.session.async_payment_succeeded", "complete", "unpaid"},
+		{"async_success_open", "checkout.session.async_payment_succeeded", "open", "paid"},
+		{"async_failure_paid", "checkout.session.async_payment_failed", "complete", "paid"},
+		{"expiry_paid", "checkout.session.expired", "expired", "paid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			order := walletWebhookOrder(t, model.PaymentProviderStripe, tc.name)
+			payload := map[string]any{"id": "evt_" + tc.name, "object": "event", "type": tc.eventType, "data": map[string]any{"object": map[string]any{
+				"object": "checkout.session", "client_reference_id": order.TradeNo, "mode": "payment", "status": tc.status,
+				"payment_status": tc.paymentStatus, "amount_total": 9000, "currency": "usd",
+			}}}
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, signedWalletWebhookRequest(t, keys, model.PaymentProviderStripe, payload))
+			require.Equal(t, http.StatusOK, w.Code)
+			require.NoError(t, model.DB.First(order, order.Id).Error)
+			assert.Equal(t, common.TopUpStatusPending, order.Status)
+			assert.Zero(t, order.CompleteTime)
+		})
+	}
+	var buyer, inviter model.User
+	require.NoError(t, model.DB.First(&buyer, 902).Error)
+	require.NoError(t, model.DB.First(&inviter, 901).Error)
+	assert.Equal(t, -10, buyer.Quota)
+	assert.Equal(t, 7, inviter.AffQuota)
+	var rebates int64
+	require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebates).Error)
+	assert.Zero(t, rebates)
+}
+
 // These signed local fixtures model documented Checkout fields; they do not
 // claim an attacker can forge a Stripe signature. A public Payment Link on the
 // same account/environment accepts a payer-provided client_reference_id. A

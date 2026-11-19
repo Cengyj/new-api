@@ -476,11 +476,27 @@ func isStripeWalletCheckout(ctx context.Context, event stripe.Event) bool {
 	hasPaymentLink := event.GetObjectValue("payment_link") != ""
 	hasSubscription := event.Data.Object["subscription"] != nil
 	connectedAccount := event.Account != ""
-	if mode == string(stripe.CheckoutSessionModePayment) && !hasPaymentLink && !hasSubscription && !connectedAccount {
-		return true
+	if mode != string(stripe.CheckoutSessionModePayment) || hasPaymentLink || hasSubscription || connectedAccount {
+		logger.LogWarn(ctx, common.LogText("Stripe wallet event ignored reason=checkout_source_mismatch trade_no=%s event_type=%s mode=%q payment_link=%t subscription=%t connected_account=%t", event.GetObjectValue("client_reference_id"), string(event.Type), mode, hasPaymentLink, hasSubscription, connectedAccount))
+		return false
 	}
-	logger.LogWarn(ctx, common.LogText("Stripe wallet event ignored reason=checkout_source_mismatch trade_no=%s event_type=%s mode=%q payment_link=%t subscription=%t connected_account=%t", event.GetObjectValue("client_reference_id"), string(event.Type), mode, hasPaymentLink, hasSubscription, connectedAccount))
-	return false
+	// A delayed result follows completion. Don't let the event name override
+	// conflicting session data, or terminate a session that reports payment.
+	status, payment := event.GetObjectValue("status"), event.GetObjectValue("payment_status")
+	completeOrOmitted := status == "" || status == "complete"
+	consistent := true
+	switch event.Type {
+	case stripe.EventTypeCheckoutSessionAsyncPaymentSucceeded:
+		consistent = completeOrOmitted && (payment == "" || payment == "paid" || payment == "no_payment_required")
+	case stripe.EventTypeCheckoutSessionAsyncPaymentFailed:
+		consistent = completeOrOmitted && payment != "paid"
+	case stripe.EventTypeCheckoutSessionExpired:
+		consistent = payment != "paid"
+	}
+	if !consistent {
+		logger.LogWarn(ctx, common.LogText("Stripe wallet event ignored reason=checkout_status_mismatch trade_no=%s event_type=%s", event.GetObjectValue("client_reference_id"), string(event.Type)))
+	}
+	return consistent
 }
 
 // API-created subscription sessions need retryable completion/expiry failures
