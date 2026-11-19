@@ -6809,6 +6809,7 @@
     "This model is not available in any group, or no group pricing information is configured.": "Mô hình này không khả dụng trong bất kỳ nhóm nào, hoặc thông tin giá nhóm chưa được cấu hình.",
     "This month": "Tháng này",
     "This OAuth provider still has linked users and cannot be deleted. Unbind all users first.": "Nhà cung cấp OAuth này vẫn còn người dùng liên kết nên không thể xóa. Hãy hủy liên kết tất cả người dùng trước.",
+    "This offer has changed. Reload the wallet and review it before paying.": "Gói nạp đã thay đổi. Hãy tải lại trang ví và kiểm tra thông tin trước khi thanh toán.",
     "This OpenRouter Claude price derives cache-write usage from upstream cost and must be converted manually.": "Giá OpenRouter Claude này suy ra lượng ghi bộ nhớ đệm từ chi phí nhà cung cấp và cần chuyển đổi thủ công.",
     "This operation is only supported for vLLM channels": "Thao tác này chỉ hỗ trợ kênh vLLM",
     "This operation is only supported for vLLM or SGLang channels": "Thao tác này chỉ hỗ trợ kênh vLLM hoặc SGLang",

@@ -6809,6 +6809,7 @@
     "This model is not available in any group, or no group pricing information is configured.": "此模型在任何分組中均不可用，或未設定分組定價資訊。",
     "This month": "本月獲得",
     "This OAuth provider still has linked users and cannot be deleted. Unbind all users first.": "該 OAuth 供應商仍有使用者綁定，無法刪除。請先解除所有使用者綁定。",
+    "This offer has changed. Reload the wallet and review it before paying.": "此儲值商品已變更。請重新整理錢包頁面，確認後再付款。",
     "This OpenRouter Claude price derives cache-write usage from upstream cost and must be converted manually.": "此 OpenRouter Claude 定價根據上游費用反推快取寫入用量，需要手動轉換。",
     "This operation is only supported for vLLM channels": "此操作僅支援 vLLM 管道",
     "This operation is only supported for vLLM or SGLang channels": "此操作僅支援 vLLM 或 SGLang 渠道",

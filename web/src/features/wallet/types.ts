@@ -87,6 +87,7 @@ export interface CreemPaymentRequest {
   product_id: string
   /** Payment method identifier */
   payment_method: 'creem'
+  expected_offer: Pick<CreemProduct, 'price' | 'currency' | 'quota'>
 }
 
 /**

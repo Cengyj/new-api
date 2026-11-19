@@ -24,6 +24,7 @@ import { handleServerError } from '@/lib/handle-server-error'
 
 import { requestCreemPayment, isApiSuccess } from '../api'
 import { isSafePaymentUrl } from '../lib/payment'
+import type { CreemProduct } from '../types'
 import { usePaymentOperation } from './use-payment-operation'
 
 export function useCreemPayment(
@@ -31,8 +32,8 @@ export function useCreemPayment(
 ) {
   const { processing, runPayment } = usePaymentOperation(onUnknownCheckout)
   const processCreemPayment = useCallback(
-    async (productId: string) => {
-      if (!productId.trim()) {
+    async (product: CreemProduct) => {
+      if (!product.productId.trim() || product.currency === null) {
         toast.error(i18next.t('Payment request failed'))
         return false
       }
@@ -40,8 +41,13 @@ export function useCreemPayment(
         (signal) =>
           requestCreemPayment(
             {
-              product_id: productId,
+              product_id: product.productId,
               payment_method: 'creem',
+              expected_offer: {
+                price: product.price,
+                currency: product.currency,
+                quota: product.quota,
+              },
             },
             signal
           ),

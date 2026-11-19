@@ -474,11 +474,12 @@ func sessionExpired(ctx context.Context, event stripe.Event, _ string) error {
 func isStripeWalletCheckout(ctx context.Context, event stripe.Event) bool {
 	mode := event.GetObjectValue("mode")
 	hasPaymentLink := event.GetObjectValue("payment_link") != ""
+	hasSubscription := event.Data.Object["subscription"] != nil
 	connectedAccount := event.Account != ""
-	if mode == string(stripe.CheckoutSessionModePayment) && !hasPaymentLink && !connectedAccount {
+	if mode == string(stripe.CheckoutSessionModePayment) && !hasPaymentLink && !hasSubscription && !connectedAccount {
 		return true
 	}
-	logger.LogWarn(ctx, common.LogText("Stripe wallet event ignored reason=checkout_source_mismatch trade_no=%s event_type=%s mode=%q payment_link=%t connected_account=%t", event.GetObjectValue("client_reference_id"), string(event.Type), mode, hasPaymentLink, connectedAccount))
+	logger.LogWarn(ctx, common.LogText("Stripe wallet event ignored reason=checkout_source_mismatch trade_no=%s event_type=%s mode=%q payment_link=%t subscription=%t connected_account=%t", event.GetObjectValue("client_reference_id"), string(event.Type), mode, hasPaymentLink, hasSubscription, connectedAccount))
 	return false
 }
 
@@ -618,8 +619,10 @@ func (config stripeCheckoutConfig) link(referenceId, customerId, email string, a
 	// The SDK ignores an error alongside a session and maps an omitted livemode
 	// to false. Validate what the endpoint actually returned against this key.
 	var wire struct {
-		Error    *common.RawMessage `json:"error"`
-		Livemode *bool              `json:"livemode"`
+		Error             *common.RawMessage `json:"error"`
+		Livemode          *bool              `json:"livemode"`
+		ClientReferenceID common.RawMessage  `json:"client_reference_id"`
+		Customer          common.RawMessage  `json:"customer"`
 	}
 	if err := common.Unmarshal(result.LastResponse.RawJSON, &wire); err != nil || wire.Error != nil {
 		return "", errors.New("Stripe did not confirm checkout creation")
@@ -630,10 +633,10 @@ func (config stripeCheckoutConfig) link(referenceId, customerId, email string, a
 			return "", errors.New("Stripe checkout environment does not match the request")
 		}
 	}
-	if result.ClientReferenceID != "" && result.ClientReferenceID != referenceId {
+	if wire.ClientReferenceID != nil && result.ClientReferenceID != referenceId {
 		return "", errors.New("Stripe checkout response refers to a different order")
 	}
-	if customerId != "" && result.Customer != nil && result.Customer.ID != customerId {
+	if customerId != "" && wire.Customer != nil && (result.Customer == nil || result.Customer.ID != customerId) {
 		return "", errors.New("Stripe checkout customer does not match the request")
 	}
 	// Line items are expandable. When returned, they must describe the one
@@ -643,11 +646,12 @@ func (config stripeCheckoutConfig) link(referenceId, customerId, email string, a
 			return "", errors.New("Stripe checkout items do not match the purchase")
 		}
 		item := items.Data[0]
-		if item == nil || item.Price == nil || item.Price.ID != priceID || item.Quantity != amount {
+		if item == nil || item.Price == nil || item.Price.ID != priceID || item.Quantity != amount ||
+			item.Price.Type != "" && item.Price.Type != stripe.PriceTypeOneTime || item.Price.Recurring != nil {
 			return "", errors.New("Stripe checkout item does not match the purchase")
 		}
 	}
-	if result.Object != "" && result.Object != "checkout.session" || result.Mode != "" && result.Mode != stripe.CheckoutSessionModePayment || result.PaymentLink != nil ||
+	if result.Object != "" && result.Object != "checkout.session" || result.Mode != "" && result.Mode != stripe.CheckoutSessionModePayment || result.PaymentLink != nil || result.Subscription != nil ||
 		result.Status != "" && result.Status != stripe.CheckoutSessionStatusOpen {
 		return "", errors.New("Stripe did not return an open wallet checkout")
 	}

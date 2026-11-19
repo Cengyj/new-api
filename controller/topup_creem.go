@@ -53,6 +53,12 @@ func verifyCreemSignature(payload string, signature string, secret string) bool 
 type CreemPayRequest struct {
 	ProductId     string `json:"product_id"`
 	PaymentMethod string `json:"payment_method"`
+	// Older clients select only by ID. Confirmation terms are a precondition, never a source of credit.
+	ExpectedOffer *struct {
+		Price    float64 `json:"price"`
+		Currency string  `json:"currency"`
+		Quota    int64   `json:"quota"`
+	} `json:"expected_offer"`
 }
 
 type CreemProduct struct {
@@ -136,6 +142,10 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 
 	if selectedProduct == nil {
 		paymentError(c, common.NewMessage("Product does not exist"))
+		return
+	}
+	if offer := req.ExpectedOffer; offer != nil && (offer.Price != selectedProduct.Price || offer.Currency != selectedProduct.Currency || offer.Quota != selectedProduct.Quota) {
+		paymentError(c, common.NewMessage("This offer has changed. Reload the wallet and review it before paying."))
 		return
 	}
 	id := c.GetInt("id")
@@ -277,8 +287,9 @@ type CreemWebhookEvent struct {
 			UpdatedAt         string  `json:"updated_at"`
 			Mode              string  `json:"mode"`
 		}] `json:"product"`
-		Units    int `json:"units"`
-		Customer creemResource[struct {
+		Units        int              `json:"units"`
+		Subscription *json.RawMessage `json:"subscription,omitempty"`
+		Customer     creemResource[struct {
 			Id        string `json:"id"`
 			Object    string `json:"object"`
 			Email     string `json:"email"`
@@ -332,12 +343,24 @@ func CreemWebhook(c *gin.Context) {
 
 	logger.LogInfo(c.Request.Context(), common.LogText("Creem webhook signature verified path=%q client_ip=%s", c.Request.URL.Path, c.ClientIP()))
 
-	// 重新设置body供后续的ShouldBindJSON使用
-	c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-
-	// 解析新格式的webhook数据
-	var webhookEvent CreemWebhookEvent
-	if err := c.ShouldBindJSON(&webhookEvent); err != nil {
+	// Other signed events have different object schemas (for example an order ID, not an order object).
+	var envelope struct {
+		EventType string          `json:"eventType"`
+		ID        string          `json:"id"`
+		CreatedAt int64           `json:"created_at"`
+		Object    json.RawMessage `json:"object"`
+	}
+	if err := common.Unmarshal(bodyBytes, &envelope); err != nil || envelope.EventType == "" {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	if envelope.EventType != "checkout.completed" {
+		logger.LogInfo(c.Request.Context(), common.LogText("Creem webhook ignored event event_type=%s event_id=%s", envelope.EventType, envelope.ID))
+		c.Status(http.StatusOK)
+		return
+	}
+	webhookEvent := CreemWebhookEvent{Id: envelope.ID, EventType: envelope.EventType, CreatedAt: envelope.CreatedAt}
+	if err := common.Unmarshal(envelope.Object, &webhookEvent.Object); err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Creem webhook failed to parse path=%q client_ip=%s error_type=%T", c.Request.URL.Path, c.ClientIP(), err))
 		c.AbortWithStatus(http.StatusBadRequest)
 		return
@@ -345,17 +368,10 @@ func CreemWebhook(c *gin.Context) {
 
 	logger.LogInfo(c.Request.Context(), common.LogText("Creem webhook parsed event_type=%s event_id=%s request_id=%s order_id=%s order_status=%s", webhookEvent.EventType, webhookEvent.Id, webhookEvent.Object.RequestId, webhookEvent.Object.Order.Id, webhookEvent.Object.Order.Status))
 
-	// 根据事件类型处理不同的webhook
-	switch webhookEvent.EventType {
-	case "checkout.completed":
-		if walletOnly && !requireIssuedWalletOrder(c, webhookEvent.Object.RequestId, model.PaymentProviderCreem) {
-			return
-		}
-		handleCheckoutCompleted(c, &webhookEvent)
-	default:
-		logger.LogInfo(c.Request.Context(), common.LogText("Creem webhook ignored event event_type=%s event_id=%s", webhookEvent.EventType, webhookEvent.Id))
-		c.Status(http.StatusOK)
+	if walletOnly && !requireIssuedWalletOrder(c, webhookEvent.Object.RequestId, model.PaymentProviderCreem) {
+		return
 	}
+	handleCheckoutCompleted(c, &webhookEvent)
 }
 
 // 处理支付完成事件
@@ -378,6 +394,9 @@ func handleCheckoutCompleted(c *gin.Context, event *CreemWebhookEvent) {
 	// Try complete subscription order first
 	LockOrder(referenceId)
 	defer UnlockOrder(referenceId)
+	// Only the presence of a subscription is relevant to wallet proof. Keep expanded subscription data out of the shared receipt.
+	hasSubscription := event.Object.Subscription != nil
+	event.Object.Subscription = nil
 	if err := model.CompleteSubscriptionOrder(referenceId, common.GetJsonString(event), model.PaymentProviderCreem, ""); err == nil {
 		logger.LogInfo(c.Request.Context(), common.LogText("Creem subscription order processed trade_no=%s creem_order_id=%s", referenceId, event.Object.Order.Id))
 		c.Status(http.StatusOK)
@@ -392,6 +411,17 @@ func handleCheckoutCompleted(c *gin.Context, event *CreemWebhookEvent) {
 	if event.Object.Order.Type != "onetime" {
 		logger.LogInfo(c.Request.Context(), common.LogText("Creem order type not supported, ignored request_id=%s creem_order_id=%s order_type=%s", referenceId, event.Object.Order.Id, event.Object.Order.Type))
 		c.Status(http.StatusOK)
+		return
+	}
+	product := event.Object.Product
+	productID := product.expanded.Id
+	if product.id != nil {
+		productID = *product.id
+	}
+	if event.Object.Status != "" && event.Object.Status != "completed" || hasSubscription ||
+		product.expanded.BillingType != "" && product.expanded.BillingType != "onetime" ||
+		productID != "" && event.Object.Order.Product != "" && productID != event.Object.Order.Product {
+		c.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 
@@ -430,15 +460,21 @@ type CreemCheckoutRequest struct {
 }
 
 type CreemCheckoutResponse struct {
-	CheckoutUrl string           `json:"checkout_url"`
-	Id          string           `json:"id"`
-	RequestID   string           `json:"request_id"`
-	Status      string           `json:"status"`
-	Error       string           `json:"error"`
-	Mode        string           `json:"mode"`
-	Units       *int64           `json:"units"`
-	CustomPrice *json.RawMessage `json:"custom_price"`
-	Product     *creemResource[struct {
+	CheckoutUrl  string           `json:"checkout_url"`
+	Id           string           `json:"id"`
+	RequestID    json.RawMessage  `json:"request_id"`
+	Status       string           `json:"status"`
+	Error        string           `json:"error"`
+	Mode         string           `json:"mode"`
+	Units        *int64           `json:"units"`
+	CustomPrice  *json.RawMessage `json:"custom_price"`
+	Subscription *json.RawMessage `json:"subscription"`
+	Order        *struct {
+		Product string `json:"product"`
+		Type    string `json:"type"`
+		Status  string `json:"status"`
+	} `json:"order"`
+	Product *creemResource[struct {
 		ID          string          `json:"id"`
 		BillingType string          `json:"billing_type"`
 		Price       json.RawMessage `json:"price"`
@@ -545,7 +581,8 @@ func (config creemCheckoutConfig) link(ctx context.Context, referenceId string, 
 	if err := common.Unmarshal(body, &checkoutResp); err != nil {
 		return "", fmt.Errorf("failed to parse response: %v", err)
 	}
-	if checkoutResp.RequestID != "" && checkoutResp.RequestID != referenceId {
+	var returnedID string
+	if checkoutResp.RequestID != nil && (common.Unmarshal(checkoutResp.RequestID, &returnedID) != nil || returnedID != referenceId) {
 		return "", errors.New("Creem checkout response refers to a different order")
 	}
 	if checkoutResp.Error != "" || checkoutResp.Status != "" && checkoutResp.Status != "pending" {
@@ -570,6 +607,10 @@ func (config creemCheckoutConfig) link(ctx context.Context, referenceId string, 
 		catalogPrice, catalogCurrency = p.expanded.Price, p.expanded.Currency
 	}
 	if oneTimeOnly {
+		if o := checkoutResp.Order; checkoutResp.Subscription != nil || o != nil && (o.Product != "" && o.Product != product.ProductId ||
+			o.Type != "" && o.Type != "onetime" || o.Status != "" && o.Status != "pending") {
+			return "", errors.New("Creem did not return a pending one-time order for this wallet product")
+		}
 		// USD/EUR product and custom prices are cents per unit, not the tax- or discount-adjusted order total.
 		expected := decimal.NewFromFloat(product.Price).Shift(2)
 		if catalogPrice != nil && !creemPriceEquals(catalogPrice, expected) ||
@@ -601,7 +642,7 @@ func creemCheckoutRejected(status int, body []byte) bool {
 		Status  *int            `json:"status"`
 		Message json.RawMessage `json:"message"`
 	}
-	if common.Unmarshal(body, &refusal) != nil || refusal.Id != "" || refusal.CheckoutUrl != "" || refusal.RequestID != "" || refusal.Product != nil ||
+	if common.Unmarshal(body, &refusal) != nil || refusal.Id != "" || refusal.CheckoutUrl != "" || refusal.RequestID != nil || refusal.Product != nil || refusal.Order != nil || refusal.Subscription != nil ||
 		refusal.Units != nil || refusal.CustomPrice != nil || refusal.Status != nil && *refusal.Status != status {
 		return false
 	}

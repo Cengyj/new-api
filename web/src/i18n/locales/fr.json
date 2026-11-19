@@ -6809,6 +6809,7 @@
     "This model is not available in any group, or no group pricing information is configured.": "Ce modèle n'est disponible dans aucun groupe, ou aucune information de tarification de groupe n'est configurée.",
     "This month": "Ce mois-ci",
     "This OAuth provider still has linked users and cannot be deleted. Unbind all users first.": "Ce fournisseur OAuth a encore des utilisateurs liés et ne peut pas être supprimé. Dissociez d’abord tous les utilisateurs.",
+    "This offer has changed. Reload the wallet and review it before paying.": "Cette offre a changé. Rechargez la page du portefeuille et vérifiez l’offre avant de payer.",
     "This OpenRouter Claude price derives cache-write usage from upstream cost and must be converted manually.": "Ce tarif OpenRouter Claude déduit les écritures en cache du coût amont et doit être converti manuellement.",
     "This operation is only supported for vLLM channels": "Cette opération est réservée aux canaux vLLM",
     "This operation is only supported for vLLM or SGLang channels": "Cette opération est réservée aux canaux vLLM ou SGLang",

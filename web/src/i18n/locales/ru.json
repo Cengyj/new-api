@@ -6809,6 +6809,7 @@
     "This model is not available in any group, or no group pricing information is configured.": "Эта модель недоступна ни в одной группе, или информация о ценах для групп не настроена.",
     "This month": "В этом месяце",
     "This OAuth provider still has linked users and cannot be deleted. Unbind all users first.": "У этого поставщика OAuth есть привязанные пользователи, поэтому его нельзя удалить. Сначала отвяжите всех пользователей.",
+    "This offer has changed. Reload the wallet and review it before paying.": "Условия покупки изменились. Обновите страницу кошелька и проверьте их перед оплатой.",
     "This OpenRouter Claude price derives cache-write usage from upstream cost and must be converted manually.": "Этот тариф OpenRouter Claude определяет объём записи в кэш по стоимости провайдера и требует ручного преобразования.",
     "This operation is only supported for vLLM channels": "Операция доступна только для каналов vLLM",
     "This operation is only supported for vLLM or SGLang channels": "Эта операция доступна только для каналов vLLM или SGLang",

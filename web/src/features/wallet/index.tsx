@@ -359,7 +359,7 @@ export function Wallet(props: WalletProps) {
     const identity = creemSelectionIdentity.current
     if (!selectedCreemProduct || identity !== referralIdentity()) return
 
-    const success = await processCreemPayment(selectedCreemProduct.productId)
+    const success = await processCreemPayment(selectedCreemProduct)
     if (success && identity === referralIdentity()) {
       setCreemDialogOpen(false)
       setSelectedCreemProduct(null)

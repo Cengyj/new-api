@@ -63,7 +63,7 @@ import { useWaffoPancakePayment } from '../hooks/use-waffo-pancake-payment'
 import { useWaffoPayment } from '../hooks/use-waffo-payment'
 import { Wallet } from '../index'
 import { isSafePaymentUrl } from '../lib/payment'
-import type { StripePaymentResponse, TopupInfo } from '../types'
+import type { CreemProduct, StripePaymentResponse, TopupInfo } from '../types'
 
 vi.mock('@/hooks/use-status', () => ({
   useStatus: () => ({ status: { price: 1 } }),
@@ -102,6 +102,14 @@ const signedEpayForm = {
   money: '10.00',
   notify_url: 'https://wallet.example.test/api/user/epay/notify',
   sign: 'fixture',
+}
+
+const creemProduct: CreemProduct = {
+  productId: 'prod_reference',
+  name: 'Starter credits',
+  price: 10,
+  currency: 'USD',
+  quota: 5000000,
 }
 
 const topupInfo: TopupInfo = {
@@ -840,7 +848,7 @@ test.each(['stripe', 'creem', 'waffo', 'waffo_pancake'])(
     let operation!: Promise<boolean>
     await act(async () => {
       if (provider === 'creem') {
-        operation = result.current.creem.processCreemPayment('product-test')
+        operation = result.current.creem.processCreemPayment(creemProduct)
       } else if (provider === 'waffo') {
         operation = result.current.waffo.processWaffoPayment(10, 0)
       } else if (provider === 'waffo_pancake') {
@@ -1046,7 +1054,7 @@ test.each(['creem', 'waffo', 'waffo_pancake'])(
     }))
     const submit = () => {
       if (provider === 'creem') {
-        return result.current.creem.processCreemPayment('product-test')
+        return result.current.creem.processCreemPayment(creemProduct)
       }
       if (provider === 'waffo') {
         return result.current.waffo.processWaffoPayment(10, 0)
@@ -1275,7 +1283,7 @@ test('a browser exception after receiving the checkout preserves the original or
   const { result } = renderHook(() => useCreemPayment(onUnknown))
   render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
   await act(async () => {
-    expect(await result.current.processCreemPayment('fixture')).toBe(false)
+    expect(await result.current.processCreemPayment(creemProduct)).toBe(false)
   })
   expect(screen.getByText('issued_creem')).toBeVisible()
   expect(post).toHaveBeenCalledOnce()
@@ -1313,7 +1321,7 @@ test.each(['alipay', 'stripe', 'creem', 'waffo', 'waffo_pancake'])(
       await act(async () => {
         let operation: Promise<boolean>
         if (provider === 'creem') {
-          operation = result.current.creem.processCreemPayment('product-test')
+          operation = result.current.creem.processCreemPayment(creemProduct)
         } else if (provider === 'waffo') {
           operation = result.current.waffo.processWaffoPayment(10, 0)
         } else if (provider === 'waffo_pancake') {
@@ -1460,17 +1468,28 @@ test('a pending Creem order cannot be dismissed before checkout resolves', async
   const pending = new Promise<{ data: unknown }>((done) => {
     resolve = done
   })
-  vi.spyOn(api, 'post').mockImplementation((path) =>
-    path === '/api/user/creem/pay'
-      ? pending
-      : Promise.resolve({ data: { success: true, data: '1.00' } })
-  )
+  const post = vi
+    .spyOn(api, 'post')
+    .mockImplementation((path) =>
+      path === '/api/user/creem/pay'
+        ? pending
+        : Promise.resolve({ data: { success: true, data: '1.00' } })
+    )
   const open = vi.spyOn(window, 'open').mockReturnValue({} as Window)
   render(<Wallet />)
   await userEvent.click(screen.getByText('Starter credits'))
   const dialog = screen.getByRole('dialog', { name: 'Confirm Creem Purchase' })
   await userEvent.click(
     within(dialog).getByRole('button', { name: 'Confirm Payment' })
+  )
+  expect(post).toHaveBeenCalledWith(
+    '/api/user/creem/pay',
+    {
+      product_id: 'starter',
+      payment_method: 'creem',
+      expected_offer: { price: 10, quota: 5000000, currency: 'USD' },
+    },
+    expect.anything()
   )
   expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeDisabled()
   await userEvent.keyboard('{Escape}')
@@ -2075,7 +2094,7 @@ test.each(['alipay', 'stripe', 'creem', 'waffo', 'waffo_pancake'])(
       render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
       await act(async () => {
         if (provider === 'creem') {
-          await result.current.creem.processCreemPayment('prod_reference')
+          await result.current.creem.processCreemPayment(creemProduct)
         } else if (provider === 'waffo') {
           await result.current.waffo.processWaffoPayment(10, 0)
         } else if (provider === 'waffo_pancake') {
@@ -2127,7 +2146,7 @@ test.each(['alipay', 'stripe', 'creem', 'waffo', 'waffo_pancake'])(
     await act(async () => {
       let succeeded: boolean
       if (provider === 'creem') {
-        succeeded = await result.current.creem.processCreemPayment('prod_test')
+        succeeded = await result.current.creem.processCreemPayment(creemProduct)
       } else if (provider === 'waffo') {
         succeeded = await result.current.waffo.processWaffoPayment(10, 0)
       } else if (provider === 'waffo_pancake') {
@@ -2163,7 +2182,7 @@ test('a saved checkout reference survives logout and a new session only for its 
   })
   const hook = renderHook(() => useCreemPayment())
   await act(async () => {
-    await hook.result.current.processCreemPayment('prod_reference')
+    await hook.result.current.processCreemPayment(creemProduct)
   })
   hook.unmount()
   usePaymentRecoveryStore.setState({ orders: {}, storageErrors: {} })
@@ -2207,7 +2226,7 @@ test.each(['unknown', 'unusable redirect'])(
     render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
     let operation!: Promise<boolean>
     act(() => {
-      operation = result.current.processCreemPayment('prod_reference')
+      operation = result.current.processCreemPayment(creemProduct)
     })
     act(() =>
       useAuthStore
@@ -2259,7 +2278,7 @@ test('failed browser storage keeps the known order copyable and warns before lea
   const { result } = renderHook(() => useCreemPayment())
   render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
   await act(async () => {
-    await result.current.processCreemPayment('prod_reference')
+    await result.current.processCreemPayment(creemProduct)
   })
   expect(screen.getByText('unsaved_checkout')).toBeVisible()
   expect(
@@ -2308,7 +2327,7 @@ test('another tab order reference does not replace the current unknown checkout'
   const { result } = renderHook(() => useCreemPayment())
   render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
   await act(async () => {
-    await result.current.processCreemPayment('prod_reference')
+    await result.current.processCreemPayment(creemProduct)
   })
   const key = 'new-api:payment-recovery:v1:1:other_tab_checkout'
   localStorage.setItem(key, 'other_tab_checkout')
@@ -2340,7 +2359,7 @@ test('only a successful current-user terminal order read retires a saved checkou
   const payment = renderHook(() => useCreemPayment())
   const notice = render(<PaymentRecoveryNotice onViewOrder={vi.fn()} />)
   await act(async () => {
-    await payment.result.current.processCreemPayment('prod_reference')
+    await payment.result.current.processCreemPayment(creemProduct)
   })
   storage.mockRestore()
   const get = vi

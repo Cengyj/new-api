@@ -2242,6 +2242,46 @@ func TestWalletCreemCheckoutRequiresUnambiguousSelectedOffer(t *testing.T) {
 	}
 }
 
+func TestWalletCreemCheckoutBindsConfirmedOffer(t *testing.T) {
+	router, _ := walletCheckoutFixture(t)
+	router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestCreemPay)
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	visits := 0
+	http.DefaultTransport = walletCheckoutTransport(func(*http.Request) (*http.Response, error) {
+		visits++
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"checkout_url":"https://checkout.example.invalid/current"}`))}, nil
+	})
+	// The buyer confirmed $10 for 100 credits. The merchant can edit that same product ID before the POST.
+	for _, tc := range []struct {
+		name, price, currency string
+		quota                 int
+		allowed               bool
+	}{
+		{"changed_credit", "10", "USD", 90, false}, {"changed_price", "11", "USD", 100, false},
+		{"changed_currency", "10", "EUR", 100, false}, {"unchanged", "10.00", "USD", 100, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setting.CreemProducts = fmt.Sprintf(`[{"productId":"fixture","name":"Credits","price":%s,"currency":%q,"quota":%d}]`, tc.price, tc.currency, tc.quota)
+			before := visits
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(`{"product_id":"fixture","payment_method":"creem","expected_offer":{"price":10,"currency":"USD","quota":100}}`)))
+			if tc.allowed {
+				assert.Contains(t, w.Body.String(), `"message":"success"`)
+				assert.Equal(t, before+1, visits)
+			} else {
+				assert.Contains(t, w.Body.String(), "This offer has changed. Reload the wallet and review it before paying.")
+				assert.Equal(t, before, visits)
+			}
+		})
+	}
+	var orders []model.TopUp
+	require.NoError(t, model.DB.Find(&orders).Error)
+	require.Len(t, orders, 1)
+	require.NotNil(t, orders[0].CreditedQuota)
+	assert.Equal(t, 100, *orders[0].CreditedQuota)
+}
+
 // Only the network endpoint is replaced. Production JSON generation, HTTP
 // transmission, response parsing and raw-body webhook verification all run.
 func TestWalletCreemCheckoutHTTPPreservesFrozenOrderAndRecovery(t *testing.T) {
@@ -2254,6 +2294,7 @@ func TestWalletCreemCheckoutHTTPPreservesFrozenOrderAndRecovery(t *testing.T) {
 		"documented_refusal", "validation_refusal", "conflicting_refusal_status", "duplicate_resource", "unclassified_bad_request",
 		"other_product", "recurring_product", "completed_checkout", "success_with_error", "other_environment", "other_quantity",
 		"other_catalog_price", "other_catalog_currency", "unexpected_custom_price", "refusal_with_custom_price",
+		"null_request_id", "empty_request_id", "nested_recurring_order", "nested_other_product", "nested_paid_order", "checkout_with_subscription", "refusal_with_order",
 	} {
 		t.Run(scenario, func(t *testing.T) {
 			router, keys := walletCheckoutFixture(t)
@@ -2387,6 +2428,23 @@ func TestWalletCreemCheckoutHTTPPreservesFrozenOrderAndRecovery(t *testing.T) {
 					_, _ = io.WriteString(w, `{"id":"ch_fixture","checkout_url":"   "}`)
 				case "mismatched_request_id":
 					_, _ = io.WriteString(w, `{"id":"ch_fixture","request_id":"another-purchase","checkout_url":"`+checkoutURL+`"}`)
+				case "null_request_id", "empty_request_id":
+					ref := `null`
+					if scenario == "empty_request_id" {
+						ref = `""`
+					}
+					_, _ = fmt.Fprintf(w, `{"request_id":%s,"checkout_url":%q}`, ref, checkoutURL)
+				case "nested_recurring_order":
+					_, _ = fmt.Fprintf(w, `{"request_id":%q,"product":"fixture","order":{"type":"recurring"},"checkout_url":%q}`, checkout.RequestId, checkoutURL)
+				case "nested_other_product":
+					_, _ = fmt.Fprintf(w, `{"request_id":%q,"product":"fixture","order":{"product":"prod_other"},"checkout_url":%q}`, checkout.RequestId, checkoutURL)
+				case "nested_paid_order":
+					_, _ = fmt.Fprintf(w, `{"request_id":%q,"order":{"status":"paid"},"checkout_url":%q}`, checkout.RequestId, checkoutURL)
+				case "checkout_with_subscription":
+					_, _ = fmt.Fprintf(w, `{"request_id":%q,"product":"fixture","subscription":"sub_fixture","checkout_url":%q}`, checkout.RequestId, checkoutURL)
+				case "refusal_with_order":
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = io.WriteString(w, `{"status":400,"message":"Product not found","order":{"id":"ord_fixture","status":"paid"}}`)
 				case "other_product":
 					_, _ = fmt.Fprintf(w, `{"request_id":%q,"product":"other_product","checkout_url":%q}`, checkout.RequestId, checkoutURL)
 				case "recurring_product":
@@ -2665,10 +2723,15 @@ func TestWalletReferralStripeCheckoutRejectionPreservesCompletionPolicy(t *testi
 		{"empty_checkout_url", http.StatusOK, `{"url":""}`, common.TopUpStatusPending},
 		{"blank_checkout_url", http.StatusOK, `{"url":"   "}`, common.TopUpStatusPending},
 		{"mismatched_reference", http.StatusOK, `{"id":"cs_other","client_reference_id":"another-purchase","url":"https://checkout.example.invalid/other"}`, common.TopUpStatusPending},
+		{"null_reference", http.StatusOK, `{"client_reference_id":null,"url":"https://checkout.example.invalid/unbound"}`, common.TopUpStatusPending},
+		{"empty_reference", http.StatusOK, `{"client_reference_id":"","url":"https://checkout.example.invalid/unbound"}`, common.TopUpStatusPending},
 		{"different_price", http.StatusOK, `{"line_items":{"data":[{"price":{"id":"price_other"},"quantity":100}]},"url":"https://checkout.example.invalid/other"}`, common.TopUpStatusPending},
 		{"different_quantity", http.StatusOK, `{"line_items":{"data":[{"price":{"id":"price_fixture"},"quantity":1}]},"url":"https://checkout.example.invalid/other"}`, common.TopUpStatusPending},
 		{"additional_item", http.StatusOK, `{"line_items":{"has_more":true,"data":[{"price":{"id":"price_fixture"},"quantity":100}]},"url":"https://checkout.example.invalid/other"}`, common.TopUpStatusPending},
 		{"different_customer", http.StatusOK, `{"customer":"cus_other","url":"https://checkout.example.invalid/other"}`, common.TopUpStatusPending},
+		{"null_existing_customer", http.StatusOK, `{"customer":null,"url":"https://checkout.example.invalid/unbound"}`, common.TopUpStatusPending},
+		{"subscription_reference", http.StatusOK, `{"subscription":"sub_fixture","url":"https://checkout.example.invalid/plan"}`, common.TopUpStatusPending},
+		{"recurring_price", http.StatusOK, `{"mode":"payment","line_items":{"data":[{"price":{"id":"price_fixture","type":"recurring"},"quantity":100}]},"url":"https://checkout.example.invalid/plan"}`, common.TopUpStatusPending},
 		{"subscription_checkout", http.StatusOK, `{"mode":"subscription","url":"https://checkout.example.invalid/subscription"}`, common.TopUpStatusPending},
 		{"success_with_error", http.StatusOK, `{"url":"https://checkout.example.invalid/existing","error":{"type":"invalid_request_error"}}`, common.TopUpStatusPending},
 		{"other_environment", http.StatusOK, `{"livemode":true,"url":"https://checkout.example.invalid/live"}`, common.TopUpStatusPending},
@@ -2684,7 +2747,8 @@ func TestWalletReferralStripeCheckoutRejectionPreservesCompletionPolicy(t *testi
 				stripe.Key = originalKey
 			})
 			observed := make(chan model.TopUp, 1)
-			if tc.name == "different_customer" {
+			existingCustomer := tc.name == "different_customer" || tc.name == "null_existing_customer"
+			if existingCustomer {
 				require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 902).Update("stripe_customer", "cus_original").Error)
 			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -2698,7 +2762,7 @@ func TestWalletReferralStripeCheckoutRejectionPreservesCompletionPolicy(t *testi
 					return
 				}
 				observed <- order
-				if tc.name == "different_customer" {
+				if existingCustomer {
 					assert.Equal(t, "cus_original", request.Form.Get("customer"))
 				}
 				if tc.wantStatus == common.TopUpStatusSuccess {
@@ -3419,17 +3483,19 @@ func TestWalletReferralStripeDelayedPaymentSettlesOnlyAfterSuccessEvent(t *testi
 // account; this application's wallet checkout never uses Stripe-Account.
 func TestWalletStripeCheckoutSourceCannotSettleOrTerminateAnotherOrder(t *testing.T) {
 	for _, source := range []struct {
-		name        string
-		mode        string
-		paymentLink any
-		account     string
-		wallet      bool
+		name         string
+		mode         string
+		paymentLink  any
+		account      string
+		subscription string
+		wallet       bool
 	}{
 		{name: "api_payment", mode: "payment", wallet: true},
 		{name: "connected_account_payment", mode: "payment", account: "acct_other_merchant"},
 		{name: "public_payment_link", mode: "payment", paymentLink: "plink_public_low_price"},
 		{name: "expanded_payment_link", mode: "payment", paymentLink: map[string]any{"id": "plink_public_low_price"}},
 		{name: "subscription", mode: "subscription"},
+		{name: "payment_with_subscription", mode: "payment", subscription: "sub_fixture"},
 		{name: "setup", mode: "setup"},
 		{name: "missing_mode"},
 	} {
@@ -3438,6 +3504,11 @@ func TestWalletStripeCheckoutSourceCannotSettleOrTerminateAnotherOrder(t *testin
 				router, keys := walletWebhookFixture(t)
 				order := walletWebhookOrder(t, model.PaymentProviderStripe, "stripe-source-order")
 				object := map[string]any{"id": "cs_fixture", "object": "checkout.session", "mode": source.mode, "payment_link": source.paymentLink, "status": "complete", "payment_status": "paid", "client_reference_id": order.TradeNo, "amount_total": 100, "customer": "cus_fixture", "currency": "usd"}
+				if source.wallet {
+					object["subscription"] = nil
+				} else if source.subscription != "" {
+					object["subscription"] = source.subscription
+				}
 				wantStatus := common.TopUpStatusPending
 				if source.wallet {
 					wantStatus = common.TopUpStatusSuccess
@@ -6183,7 +6254,12 @@ func TestWalletCreemOptionalPaidAmountPreservesDocumentedCheckout(t *testing.T) 
 		{name: "product_reference", amounts: map[string]any{"amount": 9000}, checkoutFields: map[string]any{"product": "prod_documented"}, wantSuccess: true},
 		{name: "customer_reference", amounts: map[string]any{"amount_paid": 9000}, checkoutFields: map[string]any{"customer": "cust_documented"}, wantSuccess: true},
 		{name: "numeric_metadata", amounts: map[string]any{"amount_paid": 0}, checkoutFields: map[string]any{"metadata": map[string]any{"visitCount": 42}}, wantSuccess: true},
-		{name: "unrelated_subscription_event", eventType: "subscription.active", checkoutFields: map[string]any{"product": "prod_documented", "metadata": map[string]any{"visitCount": 42}}},
+		{name: "unrelated_subscription_event", eventType: "subscription.active", checkoutFields: map[string]any{"object": "subscription", "product": "prod_documented", "metadata": map[string]any{"visitCount": 42}}},
+		{name: "unrelated_event_with_order_reference", eventType: "refund.created", checkoutFields: map[string]any{"object": "refund", "order": "ord_documented"}},
+		{name: "conflicting_product_reference", amounts: map[string]any{"amount_paid": 9000}, checkoutFields: map[string]any{"product": "prod_different"}},
+		{name: "conflicting_expanded_product", amounts: map[string]any{"amount_paid": 9000}, checkoutFields: map[string]any{"product": map[string]any{"id": "prod_documented", "billing_type": "recurring"}}},
+		{name: "one_time_order_with_subscription", amounts: map[string]any{"amount_paid": 9000}, checkoutFields: map[string]any{"subscription": "sub_fixture"}},
+		{name: "checkout_still_processing", amounts: map[string]any{"amount_paid": 9000}, checkoutFields: map[string]any{"status": "processing"}},
 		{name: "existing_paid_amount", amounts: map[string]any{"amount_paid": 9000}, wantSuccess: true},
 		{name: "explicit_free_paid_order", amounts: map[string]any{"amount": 0}, wantSuccess: true},
 		{name: "paid_amount_zero_with_discount", amounts: map[string]any{"amount": 9000, "amount_paid": 0}, wantSuccess: true},
@@ -6226,11 +6302,11 @@ func TestWalletCreemOptionalPaidAmountPreservesDocumentedCheckout(t *testing.T) 
 					},
 				},
 			}
-			for k, v := range tc.checkoutFields {
-				payload["object"].(map[string]any)[k] = v
-			}
 			if tc.eventType != "" {
 				payload["eventType"] = tc.eventType
+				payload["object"] = tc.checkoutFields
+			} else {
+				maps.Copy(payload["object"].(map[string]any), tc.checkoutFields)
 			}
 			request := signedWalletWebhookRequest(t, keys, model.PaymentProviderCreem, payload)
 			if tc.invalidSignature {
@@ -6314,7 +6390,8 @@ func TestWalletCreemOptionalPaidAmountPreservesDocumentedCheckout(t *testing.T) 
 		payload := map[string]any{"id": "evt_subscription", "eventType": "checkout.completed", "object": map[string]any{
 			"request_id": order.TradeNo, "order": map[string]any{"id": "ord_subscription", "amount": 9000, "status": "paid", "type": "recurring", "currency": "USD"},
 			"product": "prod_subscription", "customer": map[string]any{"id": "cust_receipt", "external_id": "not-part-of-stored-receipt"},
-			"metadata": map[string]any{"sequence": json.Number("9007199254740993")},
+			"subscription": map[string]any{"id": "sub_receipt", "metadata": map[string]any{"internal": "not-part-of-stored-receipt"}},
+			"metadata":     map[string]any{"sequence": json.Number("9007199254740993")},
 		}}
 		for range 2 {
 			recorder := httptest.NewRecorder()
@@ -6325,15 +6402,17 @@ func TestWalletCreemOptionalPaidAmountPreservesDocumentedCheckout(t *testing.T) 
 		assert.Equal(t, common.TopUpStatusSuccess, order.Status)
 		var receipt struct {
 			Object struct {
-				Product  json.RawMessage            `json:"product"`
-				Customer map[string]json.RawMessage `json:"customer"`
-				Metadata map[string]json.RawMessage `json:"metadata"`
+				Product      json.RawMessage            `json:"product"`
+				Customer     map[string]json.RawMessage `json:"customer"`
+				Metadata     map[string]json.RawMessage `json:"metadata"`
+				Subscription json.RawMessage            `json:"subscription"`
 			} `json:"object"`
 		}
 		require.NoError(t, common.UnmarshalJsonStr(order.ProviderPayload, &receipt))
 		assert.JSONEq(t, `"prod_subscription"`, string(receipt.Object.Product))
 		assert.JSONEq(t, `"cust_receipt"`, string(receipt.Object.Customer["id"]))
 		assert.NotContains(t, receipt.Object.Customer, "external_id")
+		assert.Nil(t, receipt.Object.Subscription)
 		assert.Equal(t, "9007199254740993", string(receipt.Object.Metadata["sequence"]))
 		var subscriptions, rebates int64
 		require.NoError(t, model.DB.Model(&model.UserSubscription{}).Count(&subscriptions).Error)
