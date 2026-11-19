@@ -50,23 +50,53 @@ func verifyCreemSignature(payload string, signature string, secret string) bool 
 	return hmac.Equal([]byte(signature), []byte(expectedSignature))
 }
 
+// Creem uses JSON numbers for counts and minor currency units. Preserve whole
+// values exactly, including decimal and exponent forms, in stored receipts.
+type creemInteger int64
+
+func (n *creemInteger) UnmarshalJSON(raw []byte) error {
+	if bytes.Equal(raw, []byte("null")) {
+		return nil // Match Go integer fields; optional pointers retain nil.
+	}
+	value, err := decimal.NewFromString(string(raw))
+	if err != nil {
+		return errors.New("invalid Creem integer")
+	}
+	if value.IsZero() {
+		*n = 0
+		return nil
+	}
+	// Reject impossible scales before rescaling: int64 has at most 19 digits,
+	// and the coefficient cannot have more trailing zeros than the input length.
+	exp := int64(value.Exponent())
+	if exp > 18 || exp < -int64(len(raw)) {
+		return errors.New("Creem number is not an int64")
+	}
+	integer := value.BigInt()
+	if !integer.IsInt64() || !decimal.NewFromBigInt(integer, 0).Equal(value) {
+		return errors.New("Creem number is not an int64")
+	}
+	*n = creemInteger(integer.Int64())
+	return nil
+}
+
 type CreemPayRequest struct {
 	ProductId     string `json:"product_id"`
 	PaymentMethod string `json:"payment_method"`
 	// Older clients select only by ID. Confirmation terms are a precondition, never a source of credit.
 	ExpectedOffer *struct {
-		Price    float64 `json:"price"`
-		Currency string  `json:"currency"`
-		Quota    int64   `json:"quota"`
+		Price    float64      `json:"price"`
+		Currency string       `json:"currency"`
+		Quota    creemInteger `json:"quota"`
 	} `json:"expected_offer"`
 }
 
 type CreemProduct struct {
-	ProductId string  `json:"productId"`
-	Name      string  `json:"name"`
-	Price     float64 `json:"price"`
-	Currency  string  `json:"currency"`
-	Quota     int64   `json:"quota"`
+	ProductId string       `json:"productId"`
+	Name      string       `json:"name"`
+	Price     float64      `json:"price"`
+	Currency  string       `json:"currency"`
+	Quota     creemInteger `json:"quota"`
 }
 
 type CreemAdaptor struct {
@@ -149,7 +179,7 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 		return
 	}
 	id := c.GetInt("id")
-	if rejectInvalidCreditedQuota(c, id, decimal.NewFromInt(selectedProduct.Quota)) {
+	if rejectInvalidCreditedQuota(c, id, decimal.NewFromInt(int64(selectedProduct.Quota))) {
 		return
 	}
 
@@ -166,8 +196,8 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 	// 先创建订单记录，使用产品配置的金额和充值额度
 	topUp := &model.TopUp{
 		UserId:          id,
-		Amount:          selectedProduct.Quota, // 充值额度
-		Money:           selectedProduct.Price, // 支付金额
+		Amount:          int64(selectedProduct.Quota), // 充值额度
+		Money:           selectedProduct.Price,        // 支付金额
 		TradeNo:         referenceId,
 		PaymentMethod:   model.PaymentMethodCreem,
 		PaymentProvider: model.PaymentProviderCreem,
@@ -245,49 +275,49 @@ func (r creemResource[T]) MarshalJSON() ([]byte, error) {
 }
 
 type CreemWebhookEvent struct {
-	Id        string `json:"id"`
-	EventType string `json:"eventType"`
-	CreatedAt int64  `json:"created_at"`
+	Id        string       `json:"id"`
+	EventType string       `json:"eventType"`
+	CreatedAt creemInteger `json:"created_at"`
 	Object    struct {
 		Id        string `json:"id"`
 		Object    string `json:"object"`
 		RequestId string `json:"request_id"`
 		Order     struct {
-			Object      string `json:"object"`
-			Id          string `json:"id"`
-			Customer    string `json:"customer"`
-			Product     string `json:"product"`
-			Amount      *int64 `json:"amount"`
-			Currency    string `json:"currency"`
-			SubTotal    int    `json:"sub_total"`
-			TaxAmount   int    `json:"tax_amount"`
-			AmountDue   int    `json:"amount_due"`
-			AmountPaid  *int64 `json:"amount_paid"`
-			Status      string `json:"status"`
-			Type        string `json:"type"`
-			Transaction string `json:"transaction"`
-			CreatedAt   string `json:"created_at"`
-			UpdatedAt   string `json:"updated_at"`
-			Mode        string `json:"mode"`
+			Object      string        `json:"object"`
+			Id          string        `json:"id"`
+			Customer    string        `json:"customer"`
+			Product     string        `json:"product"`
+			Amount      *creemInteger `json:"amount"`
+			Currency    string        `json:"currency"`
+			SubTotal    creemInteger  `json:"sub_total"`
+			TaxAmount   creemInteger  `json:"tax_amount"`
+			AmountDue   creemInteger  `json:"amount_due"`
+			AmountPaid  *creemInteger `json:"amount_paid"`
+			Status      string        `json:"status"`
+			Type        string        `json:"type"`
+			Transaction string        `json:"transaction"`
+			CreatedAt   string        `json:"created_at"`
+			UpdatedAt   string        `json:"updated_at"`
+			Mode        string        `json:"mode"`
 		} `json:"order"`
 		Product creemResource[struct {
-			Id                string  `json:"id"`
-			Object            string  `json:"object"`
-			Name              string  `json:"name"`
-			Description       string  `json:"description"`
-			Price             int     `json:"price"`
-			Currency          string  `json:"currency"`
-			BillingType       string  `json:"billing_type"`
-			BillingPeriod     string  `json:"billing_period"`
-			Status            string  `json:"status"`
-			TaxMode           string  `json:"tax_mode"`
-			TaxCategory       string  `json:"tax_category"`
-			DefaultSuccessUrl *string `json:"default_success_url"`
-			CreatedAt         string  `json:"created_at"`
-			UpdatedAt         string  `json:"updated_at"`
-			Mode              string  `json:"mode"`
+			Id                string       `json:"id"`
+			Object            string       `json:"object"`
+			Name              string       `json:"name"`
+			Description       string       `json:"description"`
+			Price             creemInteger `json:"price"`
+			Currency          string       `json:"currency"`
+			BillingType       string       `json:"billing_type"`
+			BillingPeriod     string       `json:"billing_period"`
+			Status            string       `json:"status"`
+			TaxMode           string       `json:"tax_mode"`
+			TaxCategory       string       `json:"tax_category"`
+			DefaultSuccessUrl *string      `json:"default_success_url"`
+			CreatedAt         string       `json:"created_at"`
+			UpdatedAt         string       `json:"updated_at"`
+			Mode              string       `json:"mode"`
 		}] `json:"product"`
-		Units        *int             `json:"units"`
+		Units        *creemInteger    `json:"units"`
 		Subscription *json.RawMessage `json:"subscription,omitempty"`
 		Customer     creemResource[struct {
 			Id        string `json:"id"`
@@ -347,7 +377,7 @@ func CreemWebhook(c *gin.Context) {
 	var envelope struct {
 		EventType string          `json:"eventType"`
 		ID        string          `json:"id"`
-		CreatedAt int64           `json:"created_at"`
+		CreatedAt creemInteger    `json:"created_at"`
 		Object    json.RawMessage `json:"object"`
 	}
 	if err := common.Unmarshal(bodyBytes, &envelope); err != nil || envelope.EventType == "" {
@@ -400,7 +430,7 @@ func handleCheckoutCompleted(c *gin.Context, event *CreemWebhookEvent) {
 	// Historical subscription receipts serialized an omitted quantity as zero.
 	units := event.Object.Units
 	if units == nil {
-		event.Object.Units = new(int)
+		event.Object.Units = new(creemInteger)
 	}
 	if err := model.CompleteSubscriptionOrder(referenceId, common.GetJsonString(event), model.PaymentProviderCreem, ""); err == nil {
 		logger.LogInfo(c.Request.Context(), common.LogText("Creem subscription order processed trade_no=%s creem_order_id=%s", referenceId, event.Object.Order.Id))
@@ -480,7 +510,7 @@ type CreemCheckoutResponse struct {
 	Status       string           `json:"status"`
 	Error        string           `json:"error"`
 	Mode         string           `json:"mode"`
-	Units        *int64           `json:"units"`
+	Units        *creemInteger    `json:"units"`
 	CustomPrice  *json.RawMessage `json:"custom_price"`
 	Subscription *json.RawMessage `json:"subscription"`
 	Order        *struct {

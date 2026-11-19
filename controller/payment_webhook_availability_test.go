@@ -2206,6 +2206,7 @@ func TestWalletCreemCheckoutRequiresUnambiguousSelectedOffer(t *testing.T) {
 		{"different_currency", `{"productId":"fixture","price":10,"quota":100,"currency":"EUR"}`, false},
 		{"different_price", `{"productId":"fixture","price":11,"quota":100}`, false},
 		{"equivalent_legacy_USD", `{"productId":"fixture","price":10,"quota":100,"currency":"USD"}`, true},
+		{"equivalent_integer_quota", `{"productId":"fixture","price":10,"quota":1e2}`, true},
 		{"other_invalid_quota", `{"productId":"other","price":10,"quota":1.5}`, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2472,7 +2473,7 @@ func TestWalletCreemCheckoutHTTPPreservesFrozenOrderAndRecovery(t *testing.T) {
 				case "unexpected_custom_price":
 					_, _ = fmt.Fprintf(w, `{"request_id":%q,"product":"fixture","custom_price":15000,"checkout_url":%q}`, checkout.RequestId, checkoutURL)
 				case "success":
-					_, _ = fmt.Fprintf(w, `{"id":"ch_fixture","request_id":%q,"product":{"id":"fixture","billing_type":"onetime","price":10000.0,"currency":"USD"},"discount":{"type":"percentage","amount":10},"status":"pending","mode":"prod","units":1,"checkout_url":%q}`, checkout.RequestId, checkoutURL)
+					_, _ = fmt.Fprintf(w, `{"id":"ch_fixture","request_id":%q,"product":{"id":"fixture","billing_type":"onetime","price":10000.0,"currency":"USD"},"discount":{"type":"percentage","amount":10},"status":"pending","mode":"prod","units":1.0,"checkout_url":%q}`, checkout.RequestId, checkoutURL)
 				case "http_401_with_checkout_url", "http_500_with_checkout_url":
 					status := http.StatusUnauthorized
 					if scenario == "http_500_with_checkout_url" {
@@ -6356,6 +6357,10 @@ func TestWalletCreemOptionalPaidAmountPreservesDocumentedCheckout(t *testing.T) 
 		{name: "one_time_order_with_subscription", amounts: map[string]any{"amount_paid": 9000}, checkoutFields: map[string]any{"subscription": "sub_fixture"}},
 		{name: "checkout_still_processing", amounts: map[string]any{"amount_paid": 9000}, checkoutFields: map[string]any{"status": "processing"}},
 		{name: "existing_paid_amount", amounts: map[string]any{"amount_paid": 9000}, wantSuccess: true},
+		{name: "whole_cents_in_exponent_notation", amounts: map[string]any{"amount_paid": json.Number("9e3")}, wantSuccess: true},
+		{name: "whole_units_and_expanded_product_price", amounts: map[string]any{"amount": json.Number("9000.00"), "tax_amount": json.Number("2.5e1")}, checkoutFields: map[string]any{"units": json.Number("1.0"), "product": map[string]any{"id": "prod_documented", "price": json.Number("9000.0")}}, wantSuccess: true},
+		{name: "fraction_below_float_precision", amounts: map[string]any{"amount_paid": json.Number("9000.000000000000001")}},
+		{name: "numeric_string_is_not_an_amount", amounts: map[string]any{"amount_paid": "9000"}},
 		{name: "explicit_free_paid_order", amounts: map[string]any{"amount": 0}, wantSuccess: true},
 		{name: "paid_amount_zero_with_discount", amounts: map[string]any{"amount": 9000, "amount_paid": 0}, wantSuccess: true},
 		{name: "missing_both_amounts"},
