@@ -2665,6 +2665,10 @@ func TestWalletReferralStripeCheckoutRejectionPreservesCompletionPolicy(t *testi
 		{"empty_checkout_url", http.StatusOK, `{"url":""}`, common.TopUpStatusPending},
 		{"blank_checkout_url", http.StatusOK, `{"url":"   "}`, common.TopUpStatusPending},
 		{"mismatched_reference", http.StatusOK, `{"id":"cs_other","client_reference_id":"another-purchase","url":"https://checkout.example.invalid/other"}`, common.TopUpStatusPending},
+		{"different_price", http.StatusOK, `{"line_items":{"data":[{"price":{"id":"price_other"},"quantity":100}]},"url":"https://checkout.example.invalid/other"}`, common.TopUpStatusPending},
+		{"different_quantity", http.StatusOK, `{"line_items":{"data":[{"price":{"id":"price_fixture"},"quantity":1}]},"url":"https://checkout.example.invalid/other"}`, common.TopUpStatusPending},
+		{"additional_item", http.StatusOK, `{"line_items":{"has_more":true,"data":[{"price":{"id":"price_fixture"},"quantity":100}]},"url":"https://checkout.example.invalid/other"}`, common.TopUpStatusPending},
+		{"different_customer", http.StatusOK, `{"customer":"cus_other","url":"https://checkout.example.invalid/other"}`, common.TopUpStatusPending},
 		{"subscription_checkout", http.StatusOK, `{"mode":"subscription","url":"https://checkout.example.invalid/subscription"}`, common.TopUpStatusPending},
 		{"success_with_error", http.StatusOK, `{"url":"https://checkout.example.invalid/existing","error":{"type":"invalid_request_error"}}`, common.TopUpStatusPending},
 		{"other_environment", http.StatusOK, `{"livemode":true,"url":"https://checkout.example.invalid/live"}`, common.TopUpStatusPending},
@@ -2680,6 +2684,9 @@ func TestWalletReferralStripeCheckoutRejectionPreservesCompletionPolicy(t *testi
 				stripe.Key = originalKey
 			})
 			observed := make(chan model.TopUp, 1)
+			if tc.name == "different_customer" {
+				require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 902).Update("stripe_customer", "cus_original").Error)
+			}
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 				if !assert.NoError(t, request.ParseForm()) {
 					w.WriteHeader(http.StatusBadRequest)
@@ -2691,6 +2698,9 @@ func TestWalletReferralStripeCheckoutRejectionPreservesCompletionPolicy(t *testi
 					return
 				}
 				observed <- order
+				if tc.name == "different_customer" {
+					assert.Equal(t, "cus_original", request.Form.Get("customer"))
+				}
 				if tc.wantStatus == common.TopUpStatusSuccess {
 					callback := httptest.NewRecorder()
 					router.ServeHTTP(callback, walletWebhookRequest(t, keys, model.PaymentProviderStripe, order.TradeNo, "90", true))
@@ -5677,9 +5687,10 @@ func TestWalletStripeProductQuantityQuoteAndFrozenCredit(t *testing.T) {
 				}
 				assert.Equal(t, "1", request.Form.Get("line_items[0][quantity]"))
 				assert.Equal(t, "price_fixture", request.Form.Get("line_items[0][price]"))
+				assert.Equal(t, "line_items", request.Form.Get("expand[0]"))
 				assert.Equal(t, "true", request.Form.Get("allow_promotion_codes"))
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = fmt.Fprintf(w, `{"id":"cs_quantity_fixture","object":"checkout.session","mode":"payment","status":"open","livemode":false,"client_reference_id":%q,"url":"https://checkout.example.invalid/quantity"}`, request.Form.Get("client_reference_id"))
+				_, _ = fmt.Fprintf(w, `{"id":"cs_quantity_fixture","object":"checkout.session","mode":"payment","status":"open","livemode":false,"client_reference_id":%q,"line_items":{"data":[{"price":{"id":"price_fixture"},"quantity":1,"amount_total":0}]},"url":"https://checkout.example.invalid/quantity"}`, request.Form.Get("client_reference_id"))
 			}))
 			defer server.Close()
 			stripe.SetBackend(stripe.APIBackend, stripe.GetBackendWithConfig(stripe.APIBackend, &stripe.BackendConfig{URL: stripe.String(server.URL), HTTPClient: server.Client(), MaxNetworkRetries: stripe.Int64(0), EnableTelemetry: stripe.Bool(false)}))

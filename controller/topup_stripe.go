@@ -591,6 +591,7 @@ func (config stripeCheckoutConfig) link(referenceId, customerId, email string, a
 		Mode:                stripe.String(string(stripe.CheckoutSessionModePayment)),
 		AllowPromotionCodes: stripe.Bool(allowPromotionCodes),
 	}
+	params.AddExpand("line_items")
 
 	if "" == customerId {
 		if "" != email {
@@ -631,6 +632,20 @@ func (config stripeCheckoutConfig) link(referenceId, customerId, email string, a
 	}
 	if result.ClientReferenceID != "" && result.ClientReferenceID != referenceId {
 		return "", errors.New("Stripe checkout response refers to a different order")
+	}
+	if customerId != "" && result.Customer != nil && result.Customer.ID != customerId {
+		return "", errors.New("Stripe checkout customer does not match the request")
+	}
+	// Line items are expandable. When returned, they must describe the one
+	// Price and quantity we sent; discounts and tax do not change either.
+	if items := result.LineItems; items != nil {
+		if items.HasMore || len(items.Data) != 1 {
+			return "", errors.New("Stripe checkout items do not match the purchase")
+		}
+		item := items.Data[0]
+		if item == nil || item.Price == nil || item.Price.ID != priceID || item.Quantity != amount {
+			return "", errors.New("Stripe checkout item does not match the purchase")
+		}
 	}
 	if result.Object != "" && result.Object != "checkout.session" || result.Mode != "" && result.Mode != stripe.CheckoutSessionModePayment || result.PaymentLink != nil ||
 		result.Status != "" && result.Status != stripe.CheckoutSessionStatusOpen {
