@@ -76,6 +76,7 @@ export function isPurchasableCreemProduct(
 ): product is CreemProduct & { currency: 'USD' | 'EUR' } {
   return (
     !!product.productId.trim() &&
+    !product.conflictingTerms &&
     (product.currency === 'USD' || product.currency === 'EUR') &&
     Number.isFinite(product.price) &&
     product.price >= 0.01 &&

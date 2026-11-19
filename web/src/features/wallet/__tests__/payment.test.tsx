@@ -273,6 +273,38 @@ test('Creem offer selection supports keyboard confirmation', async () => {
   expect(select).toHaveBeenCalledExactlyOnceWith(creemProduct)
 })
 
+test('Creem lists equivalent product IDs once and disables conflicting terms for the affected ID only', async () => {
+  const catalog = [
+    { ...creemProduct, currency: undefined },
+    { ...creemProduct, name: 'Same offer' },
+    { ...creemProduct, productId: 'conflict', name: 'Conflicting offer' },
+    { ...creemProduct, productId: 'conflict', name: '', quota: 2 },
+  ]
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...topupInfo, creem_products: JSON.stringify(catalog) },
+    },
+  })
+  const { result } = renderHook(() => topupInfoHooks.useTopupInfo())
+  await waitFor(() => expect(result.current.loading).toBe(false))
+  const select = vi.fn()
+  render(
+    <CreemProductsSection
+      products={result.current.topupInfo?.creem_products ?? []}
+      onProductSelect={select}
+    />
+  )
+  expect(screen.queryByText('Same offer')).not.toBeInTheDocument()
+  expect(screen.getAllByRole('button')).toHaveLength(2)
+  expect(
+    screen.getByRole('button', { name: /Conflicting offer/ })
+  ).toBeDisabled()
+  expect(screen.getByText('Product configuration error')).toBeVisible()
+  await userEvent.click(screen.getByRole('button', { name: /Starter credits/ }))
+  expect(select).toHaveBeenCalledExactlyOnceWith(creemProduct)
+})
+
 test.each([
   { mode: 'USD', quantity: 10, preset: '10', confirmed: '$10', updated: '$10' },
   {

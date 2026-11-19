@@ -2294,6 +2294,7 @@ func TestWalletCreemCheckoutHTTPPreservesFrozenOrderAndRecovery(t *testing.T) {
 		"documented_refusal", "validation_refusal", "conflicting_refusal_status", "duplicate_resource", "unclassified_bad_request",
 		"other_product", "recurring_product", "completed_checkout", "success_with_error", "other_environment", "other_quantity",
 		"other_catalog_price", "other_catalog_currency", "unexpected_custom_price", "refusal_with_custom_price",
+		"non_checkout_resource", "non_order_resource", "refusal_with_checkout_resource",
 		"null_request_id", "empty_request_id", "nested_recurring_order", "nested_other_product", "nested_paid_order", "checkout_with_subscription", "refusal_with_order",
 	} {
 		t.Run(scenario, func(t *testing.T) {
@@ -2436,6 +2437,13 @@ func TestWalletCreemCheckoutHTTPPreservesFrozenOrderAndRecovery(t *testing.T) {
 					_, _ = fmt.Fprintf(w, `{"request_id":%s,"checkout_url":%q}`, ref, checkoutURL)
 				case "nested_recurring_order":
 					_, _ = fmt.Fprintf(w, `{"request_id":%q,"product":"fixture","order":{"type":"recurring"},"checkout_url":%q}`, checkout.RequestId, checkoutURL)
+				case "non_checkout_resource":
+					_, _ = fmt.Fprintf(w, `{"request_id":%q,"object":"subscription","checkout_url":%q}`, checkout.RequestId, checkoutURL)
+				case "non_order_resource":
+					_, _ = fmt.Fprintf(w, `{"request_id":%q,"order":{"object":"refund"},"checkout_url":%q}`, checkout.RequestId, checkoutURL)
+				case "refusal_with_checkout_resource":
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = io.WriteString(w, `{"status":400,"message":"Product not found","object":"checkout"}`)
 				case "nested_other_product":
 					_, _ = fmt.Fprintf(w, `{"request_id":%q,"product":"fixture","order":{"product":"prod_other"},"checkout_url":%q}`, checkout.RequestId, checkoutURL)
 				case "nested_paid_order":
@@ -6283,6 +6291,11 @@ func TestWalletCreemOptionalPaidAmountPreservesDocumentedCheckout(t *testing.T) 
 		wantSuccess      bool
 	}{
 		{name: "documented_order_amount", amounts: map[string]any{"amount": 9000}, wantSuccess: true},
+		{name: "one_wallet_unit", amounts: map[string]any{"amount": 9000}, checkoutFields: map[string]any{"units": 1}, wantSuccess: true},
+		{name: "multiple_wallet_units", amounts: map[string]any{"amount": 9000}, checkoutFields: map[string]any{"units": 2}},
+		{name: "zero_wallet_units", amounts: map[string]any{"amount": 9000}, checkoutFields: map[string]any{"units": 0}},
+		{name: "non_checkout_resource", amounts: map[string]any{"amount": 9000}, checkoutFields: map[string]any{"object": "subscription"}},
+		{name: "non_order_resource", amounts: map[string]any{"amount": 9000, "object": "refund"}},
 		{name: "product_reference", amounts: map[string]any{"amount": 9000}, checkoutFields: map[string]any{"product": "prod_documented"}, wantSuccess: true},
 		{name: "customer_reference", amounts: map[string]any{"amount_paid": 9000}, checkoutFields: map[string]any{"customer": "cust_documented"}, wantSuccess: true},
 		{name: "numeric_metadata", amounts: map[string]any{"amount_paid": 0}, checkoutFields: map[string]any{"metadata": map[string]any{"visitCount": 42}}, wantSuccess: true},
@@ -6438,6 +6451,7 @@ func TestWalletCreemOptionalPaidAmountPreservesDocumentedCheckout(t *testing.T) 
 				Customer     map[string]json.RawMessage `json:"customer"`
 				Metadata     map[string]json.RawMessage `json:"metadata"`
 				Subscription json.RawMessage            `json:"subscription"`
+				Units        json.RawMessage            `json:"units"`
 			} `json:"object"`
 		}
 		require.NoError(t, common.UnmarshalJsonStr(order.ProviderPayload, &receipt))
@@ -6445,6 +6459,7 @@ func TestWalletCreemOptionalPaidAmountPreservesDocumentedCheckout(t *testing.T) 
 		assert.JSONEq(t, `"cust_receipt"`, string(receipt.Object.Customer["id"]))
 		assert.NotContains(t, receipt.Object.Customer, "external_id")
 		assert.Nil(t, receipt.Object.Subscription)
+		assert.JSONEq(t, "0", string(receipt.Object.Units), "keep the legacy subscription receipt when units are omitted")
 		assert.Equal(t, "9007199254740993", string(receipt.Object.Metadata["sequence"]))
 		var subscriptions, rebates int64
 		require.NoError(t, model.DB.Model(&model.UserSubscription{}).Count(&subscriptions).Error)

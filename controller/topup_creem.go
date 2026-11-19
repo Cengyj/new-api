@@ -287,7 +287,7 @@ type CreemWebhookEvent struct {
 			UpdatedAt         string  `json:"updated_at"`
 			Mode              string  `json:"mode"`
 		}] `json:"product"`
-		Units        int              `json:"units"`
+		Units        *int             `json:"units"`
 		Subscription *json.RawMessage `json:"subscription,omitempty"`
 		Customer     creemResource[struct {
 			Id        string `json:"id"`
@@ -397,6 +397,11 @@ func handleCheckoutCompleted(c *gin.Context, event *CreemWebhookEvent) {
 	// Only the presence of a subscription is relevant to wallet proof. Keep expanded subscription data out of the shared receipt.
 	hasSubscription := event.Object.Subscription != nil
 	event.Object.Subscription = nil
+	// Historical subscription receipts serialized an omitted quantity as zero.
+	units := event.Object.Units
+	if units == nil {
+		event.Object.Units = new(int)
+	}
 	if err := model.CompleteSubscriptionOrder(referenceId, common.GetJsonString(event), model.PaymentProviderCreem, ""); err == nil {
 		logger.LogInfo(c.Request.Context(), common.LogText("Creem subscription order processed trade_no=%s creem_order_id=%s", referenceId, event.Object.Order.Id))
 		c.Status(http.StatusOK)
@@ -411,6 +416,14 @@ func handleCheckoutCompleted(c *gin.Context, event *CreemWebhookEvent) {
 	if event.Object.Order.Type != "onetime" {
 		logger.LogInfo(c.Request.Context(), common.LogText("Creem order type not supported, ignored request_id=%s creem_order_id=%s order_type=%s", referenceId, event.Object.Order.Id, event.Object.Order.Type))
 		c.Status(http.StatusOK)
+		return
+	}
+	// Wallet checkout requests buy one unit. Older signed notifications can
+	// omit these fields, but explicit values must describe the same purchase.
+	if units != nil && *units != 1 ||
+		event.Object.Object != "" && event.Object.Object != "checkout" ||
+		event.Object.Order.Object != "" && event.Object.Order.Object != "order" {
+		c.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 	product := event.Object.Product
@@ -460,6 +473,7 @@ type CreemCheckoutRequest struct {
 }
 
 type CreemCheckoutResponse struct {
+	Object       string           `json:"object"`
 	CheckoutUrl  string           `json:"checkout_url"`
 	Id           string           `json:"id"`
 	RequestID    json.RawMessage  `json:"request_id"`
@@ -470,6 +484,7 @@ type CreemCheckoutResponse struct {
 	CustomPrice  *json.RawMessage `json:"custom_price"`
 	Subscription *json.RawMessage `json:"subscription"`
 	Order        *struct {
+		Object  string `json:"object"`
 		Product string `json:"product"`
 		Type    string `json:"type"`
 		Status  string `json:"status"`
@@ -607,8 +622,9 @@ func (config creemCheckoutConfig) link(ctx context.Context, referenceId string, 
 		catalogPrice, catalogCurrency = p.expanded.Price, p.expanded.Currency
 	}
 	if oneTimeOnly {
-		if o := checkoutResp.Order; checkoutResp.Subscription != nil || o != nil && (o.Product != "" && o.Product != product.ProductId ||
-			o.Type != "" && o.Type != "onetime" || o.Status != "" && o.Status != "pending") {
+		if o := checkoutResp.Order; checkoutResp.Object != "" && checkoutResp.Object != "checkout" || checkoutResp.Subscription != nil ||
+			o != nil && (o.Object != "" && o.Object != "order" || o.Product != "" && o.Product != product.ProductId ||
+				o.Type != "" && o.Type != "onetime" || o.Status != "" && o.Status != "pending") {
 			return "", errors.New("Creem did not return a pending one-time order for this wallet product")
 		}
 		// USD/EUR product and custom prices are cents per unit, not the tax- or discount-adjusted order total.
@@ -642,7 +658,7 @@ func creemCheckoutRejected(status int, body []byte) bool {
 		Status  *int            `json:"status"`
 		Message json.RawMessage `json:"message"`
 	}
-	if common.Unmarshal(body, &refusal) != nil || refusal.Id != "" || refusal.CheckoutUrl != "" || refusal.RequestID != nil || refusal.Product != nil || refusal.Order != nil || refusal.Subscription != nil ||
+	if common.Unmarshal(body, &refusal) != nil || refusal.Object == "checkout" || refusal.Id != "" || refusal.CheckoutUrl != "" || refusal.RequestID != nil || refusal.Product != nil || refusal.Order != nil || refusal.Subscription != nil ||
 		refusal.Units != nil || refusal.CustomPrice != nil || refusal.Status != nil && *refusal.Status != status {
 		return false
 	}

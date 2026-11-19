@@ -110,30 +110,45 @@ function parseWaffoPayMethods(data: unknown): WaffoPayMethod[] {
 }
 
 function parseCreemProducts(data: unknown): CreemProduct[] {
-  return parseJsonArray(data)
-    .filter(
-      (item): item is Record<string, unknown> =>
-        !!item && typeof item === 'object'
-    )
-    .map((item) => {
-      // Old configurations omitted the currency and displayed USD. An explicit
-      // unsupported value must not be presented as a different currency.
-      let currency: CreemProduct['currency'] = null
-      if (item.currency === undefined || item.currency === 'USD') {
-        currency = 'USD'
-      } else if (item.currency === 'EUR') {
-        currency = 'EUR'
-      }
+  const products = new Map<string, CreemProduct>()
+  for (const raw of parseJsonArray(data)) {
+    if (!raw || typeof raw !== 'object') continue
+    const item = raw as Record<string, unknown>
+    if (typeof item.productId !== 'string' || !item.productId) continue
+    // Old configurations omitted the currency and displayed USD. An explicit
+    // unsupported value must not be presented as a different currency.
+    let currency: CreemProduct['currency'] = null
+    if (item.currency === undefined || item.currency === 'USD') {
+      currency = 'USD'
+    } else if (item.currency === 'EUR') {
+      currency = 'EUR'
+    }
 
-      return {
-        name: typeof item.name === 'string' ? item.name : '',
-        productId: typeof item.productId === 'string' ? item.productId : '',
-        price: typeof item.price === 'number' ? item.price : Number.NaN,
-        quota: typeof item.quota === 'number' ? item.quota : Number.NaN,
+    const name = typeof item.name === 'string' ? item.name : ''
+    const price = typeof item.price === 'number' ? item.price : Number.NaN
+    const quota = typeof item.quota === 'number' ? item.quota : Number.NaN
+    const previous = products.get(item.productId)
+    if (!previous) {
+      products.set(item.productId, {
+        name,
+        productId: item.productId,
+        price,
+        quota,
         currency,
-      }
-    })
-    .filter((item) => item.name && item.productId)
+      })
+      continue
+    }
+    // Checkout selects by ID, including rows without a display name.
+    if (
+      previous.price !== price ||
+      previous.quota !== quota ||
+      previous.currency !== currency
+    ) {
+      previous.conflictingTerms = true
+    }
+    if (!previous.name) previous.name = name
+  }
+  return [...products.values()].filter((product) => product.name)
 }
 
 function parseAmountOptions(data: unknown): number[] {

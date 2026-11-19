@@ -67,6 +67,8 @@ export type WaffoPancakePaymentResponse = ApiResponse<
  * Creem product configuration
  */
 export interface CreemProduct {
+  /** The catalog contains different purchase terms for this ID. */
+  conflictingTerms?: boolean
   /** Product display name */
   name: string
   /** Creem product ID */
