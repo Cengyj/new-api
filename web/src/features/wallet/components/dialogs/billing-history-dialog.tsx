@@ -215,17 +215,19 @@ function BillingHistoryContent({
                   // the provider's historical Amount units (Creem uses quota).
                   const creditedQuota = record.credited_quota
                   const isStripe = record.payment_provider === 'stripe'
+                  const quota =
+                    creditedQuota ??
+                    (record.payment_provider === 'creem' ? record.amount : null)
                   const formatAmount =
-                    creditedQuota != null || record.payment_provider === 'creem'
+                    quota != null
                       ? formatQuotaWithCurrency
                       : formatCurrencyFromUSD
                   // Token display must not lose integer quota units in a
                   // quota -> USD -> quota floating-point round trip.
                   const displayAmount =
-                    creditedQuota != null &&
-                    currency.quotaDisplayType === 'TOKENS'
-                      ? formatNumber(creditedQuota, locale)
-                      : formatAmount(creditedQuota ?? record.amount, {
+                    quota != null && currency.quotaDisplayType === 'TOKENS'
+                      ? formatNumber(quota, locale)
+                      : formatAmount(quota ?? record.amount, {
                           digitsLarge: 2,
                           digitsSmall: 2,
                           abbreviate: false,

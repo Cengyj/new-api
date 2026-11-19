@@ -56,6 +56,7 @@ import { getUserBillingHistory, requestPayment } from '../api'
 import { BillingHistoryDialog } from '../components/dialogs/billing-history-dialog'
 import { useBillingHistory } from '../hooks/use-billing-history'
 import { usePaymentOperation } from '../hooks/use-payment-operation'
+import type { TopupRecord } from '../types'
 
 const original: AuthBundle = {
   access_token: 'test-admin-access',
@@ -376,13 +377,8 @@ test.each([
 
 describe('billing history frozen quota display', () => {
   const originalAdapter = api.defaults.adapter
-  let responseRecord = {
-    ...record,
-    amount: 1,
-    money: 1.5,
-    credited_quota: 749999,
-    payment_provider: 'epay',
-  }
+  let responseRecord: typeof record &
+    Pick<TopupRecord, 'credited_quota' | 'payment_provider'>
   let requests: string[]
 
   beforeEach(() => {
@@ -450,54 +446,75 @@ describe('billing history frozen quota display', () => {
     }
   )
 
-  test('frozen token quota remains exact at the safe integer limit when switching all interface languages', async () => {
-    responseRecord.credited_quota = 9007199254740991
-    useSystemConfigStore.getState().setConfig({
-      currency: {
-        ...DEFAULT_CURRENCY_CONFIG,
-        quotaDisplayType: 'TOKENS',
-        quotaPerUnit: 3,
-      },
-    })
-    const i18n = createInstance()
-    await i18n.use(initReactI18next).init({
-      lng: 'en',
-      fallbackLng: false,
-      resources: {
-        en,
-        zhCN: zh,
-        zhTW,
-        fr,
-        ja,
-        ru,
-        vi: viLocale,
-        invalid_locale: en,
-      },
-      interpolation: { escapeValue: false },
-    })
-    render(
-      <I18nextProvider i18n={i18n}>
-        <BillingHistoryDialog open onOpenChange={vi.fn()} />
-      </I18nextProvider>
-    )
-    expect(await screen.findByText(record.trade_no)).toBeVisible()
-    for (const [language, expected] of [
-      ['en', '9,007,199,254,740,991'],
-      ['zhCN', '9,007,199,254,740,991'],
-      ['zhTW', '9,007,199,254,740,991'],
-      ['fr', '9\u202f007\u202f199\u202f254\u202f740\u202f991'],
-      ['ru', '9\u00a0007\u00a0199\u00a0254\u00a0740\u00a0991'],
-      ['ja', '9,007,199,254,740,991'],
-      ['vi', '9.007.199.254.740.991'],
-      ['invalid_locale', '9,007,199,254,740,991'],
-    ]) {
-      await act(() => i18n.changeLanguage(language))
-      expect(
-        screen.getByText(expected, { normalizer: (value) => value })
-      ).toBeVisible()
+  test.each([
+    { provider: 'epay', role: 100, amount: 1, credit: Number.MAX_SAFE_INTEGER },
+    {
+      provider: 'creem',
+      role: 1,
+      amount: Number.MAX_SAFE_INTEGER,
+      credit: null,
+    },
+    {
+      provider: 'creem',
+      role: 100,
+      amount: Number.MAX_SAFE_INTEGER,
+      credit: null,
+    },
+  ])(
+    'role $role sees exact $provider token quota across interface languages',
+    async ({ provider, role, amount, credit }) => {
+      applyAuthBundle({ ...original, user: { ...original.user, role } }, false)
+      responseRecord.payment_provider = provider
+      responseRecord.payment_method = provider
+      responseRecord.amount = amount
+      responseRecord.credited_quota = credit
+      useSystemConfigStore.getState().setConfig({
+        currency: {
+          ...DEFAULT_CURRENCY_CONFIG,
+          quotaDisplayType: 'TOKENS',
+          quotaPerUnit: 3,
+        },
+      })
+      const i18n = createInstance()
+      await i18n.use(initReactI18next).init({
+        lng: 'en',
+        fallbackLng: false,
+        resources: {
+          en,
+          zhCN: zh,
+          zhTW,
+          fr,
+          ja,
+          ru,
+          vi: viLocale,
+          invalid_locale: en,
+        },
+        interpolation: { escapeValue: false },
+      })
+      render(
+        <I18nextProvider i18n={i18n}>
+          <BillingHistoryDialog open onOpenChange={vi.fn()} />
+        </I18nextProvider>
+      )
+      expect(await screen.findByText(record.trade_no)).toBeVisible()
+      for (const [language, expected] of [
+        ['en', '9,007,199,254,740,991'],
+        ['zhCN', '9,007,199,254,740,991'],
+        ['zhTW', '9,007,199,254,740,991'],
+        ['fr', '9\u202f007\u202f199\u202f254\u202f740\u202f991'],
+        ['ru', '9\u00a0007\u00a0199\u00a0254\u00a0740\u00a0991'],
+        ['ja', '9,007,199,254,740,991'],
+        ['vi', '9.007.199.254.740.991'],
+        ['invalid_locale', '9,007,199,254,740,991'],
+      ]) {
+        await act(() => i18n.changeLanguage(language))
+        expect(
+          screen.getByText(expected, { normalizer: (value) => value })
+        ).toBeVisible()
+      }
+      expect(requests).toHaveLength(1)
     }
-    expect(requests).toHaveLength(1)
-  })
+  )
 })
 
 test('a failed payment is shown as failed and never offers administrator completion', async () => {
