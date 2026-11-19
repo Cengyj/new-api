@@ -446,18 +446,9 @@ func RequestWaffoPancakePay(c *gin.Context) {
 		OrderMerchantExternalID: tradeNo,
 	})
 	if err != nil {
-		if errors.Is(err, service.ErrWaffoPancakeCheckoutNotStarted) {
-			// A local configuration failure cannot later become a paid checkout.
-			// Preserve the original failed-order/manual-completion policy.
-			if updateErr := model.UpdatePendingTopUpStatus(tradeNo, model.PaymentProviderWaffoPancake, common.TopUpStatusFailed); updateErr != nil && !errors.Is(updateErr, model.ErrTopUpStatusInvalid) {
-				err = errors.Join(err, updateErr)
-			}
-		}
 		logger.LogError(c.Request.Context(), common.LogText("Waffo Pancake failed to create checkout session user_id=%d trade_no=%s error_type=%T", id, tradeNo, err))
-		// Only uncertain remote outcomes retain the frozen pending order for a
-		// later verified notification; local rejections were marked failed above.
 		if errors.Is(err, service.ErrWaffoPancakeCheckoutNotStarted) {
-			paymentError(c, common.NewMessage("Failed to start payment"))
+			rejectUnstartedTopUp(c, topUp, common.NewMessage("Failed to start payment"))
 		} else {
 			paymentCheckoutUnknown(c, tradeNo)
 		}

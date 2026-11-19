@@ -98,6 +98,7 @@
   "Error pinging DB: %v": "数据库 ping 失败: %v",
   "Error: Failed to decode base64 string": "base64 字符串解码失败",
   "FRONTEND_BASE_URL is ignored on master node": "当前是主节点，FRONTEND_BASE_URL 设置已忽略",
+  "Failed to close unstarted top-up provider=%s trade_no=%s error=%q": "关闭尚未发起付款的充值订单失败 provider=%s trade_no=%s error=%q",
   "Failed to get binding count for provider %s: %s": "查询 OAuth 提供商 %s 的绑定用户数失败: %s",
   "Failed to load custom OAuth providers: %s": "加载自定义 OAuth 提供商失败: %s",
   "Failed to load rate limit script: %v": "加载限流脚本失败: %v",

@@ -360,10 +360,24 @@ func paymentCheckoutUnknown(c *gin.Context, tradeNo string) {
 
 func paymentOrderCreateError(c *gin.Context, tradeNo string, err error) {
 	if errors.Is(err, model.ErrTopUpStatusInvalid) {
-		paymentError(c, common.NewMessage("Payment was not started. Check order {{trade_no}} in Order History.", map[string]any{"trade_no": tradeNo}))
+		paymentError(c, unstartedPaymentReview(tradeNo))
 		return
 	}
 	paymentError(c, common.NewMessage("Failed to start payment"))
+}
+
+func unstartedPaymentReview(tradeNo string) *common.Message {
+	return common.NewMessage("Payment was not started. Check order {{trade_no}} in Order History.", map[string]any{"trade_no": tradeNo})
+}
+
+// No request reached the provider. If the local order cannot be closed, its
+// owner still needs the original reference to check its persisted outcome.
+func rejectUnstartedTopUp(c *gin.Context, topUp *model.TopUp, reason *common.Message) {
+	if err := model.UpdatePendingTopUpStatus(topUp.TradeNo, topUp.PaymentProvider, common.TopUpStatusFailed); err != nil {
+		logger.LogError(c.Request.Context(), common.LogText("Failed to close unstarted top-up provider=%s trade_no=%s error=%q", topUp.PaymentProvider, topUp.TradeNo, err.Error()))
+		reason = unstartedPaymentReview(topUp.TradeNo)
+	}
+	paymentError(c, reason)
 }
 
 func rejectInvalidCreditedQuota(c *gin.Context, userId int, quota decimal.Decimal) bool {

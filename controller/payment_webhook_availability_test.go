@@ -2899,7 +2899,7 @@ func walletCheckoutFixture(t *testing.T) (*gin.Engine, *waffoutils.KeyPair) {
 }
 
 func TestWalletReferralCheckoutLocalFailurePreservesCompletionPolicy(t *testing.T) {
-	for _, scenario := range []string{"epay_signing", "stripe_api_key", "pancake_store", "pancake_merchant", "pancake_private_key", "pancake_product"} {
+	for _, scenario := range []string{"epay_signing", "stripe_api_key", "waffo_sdk", "pancake_store", "pancake_merchant", "pancake_private_key", "pancake_product"} {
 		t.Run(scenario, func(t *testing.T) {
 			router, _ := walletCheckoutFixture(t)
 			oldClient := http.DefaultClient
@@ -2917,6 +2917,9 @@ func TestWalletReferralCheckoutLocalFailurePreservesCompletionPolicy(t *testing.
 			case "stripe_api_key":
 				setting.StripeApiSecret = "configured-but-invalid"
 				handler, method = RequestStripePay, model.PaymentMethodStripe
+			case "waffo_sdk":
+				setting.WaffoApiKey = ""
+				handler, method = RequestWaffoPay, model.PaymentMethodWaffo
 			case "pancake_store":
 				setting.WaffoPancakeStoreID = ""
 			case "pancake_merchant":
@@ -2938,7 +2941,7 @@ func TestWalletReferralCheckoutLocalFailurePreservesCompletionPolicy(t *testing.
 			var orders []model.TopUp
 			require.NoError(t, model.DB.Find(&orders).Error)
 			tradeNo := "no-checkout-created"
-			if strings.HasPrefix(scenario, "pancake_") {
+			if scenario == "waffo_sdk" || strings.HasPrefix(scenario, "pancake_") {
 				require.Len(t, orders, 1)
 				assert.Equal(t, common.TopUpStatusFailed, orders[0].Status)
 				require.NotNil(t, orders[0].CreditedQuota)
@@ -2963,6 +2966,64 @@ func TestWalletReferralCheckoutLocalFailurePreservesCompletionPolicy(t *testing.
 			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
 			assert.Zero(t, facts)
 		})
+	}
+}
+
+func TestWalletLocalCheckoutFailureKeepsOriginalReference(t *testing.T) {
+	for _, provider := range []string{model.PaymentProviderWaffo, model.PaymentProviderWaffoPancake} {
+		for _, status := range []string{common.TopUpStatusPending, common.TopUpStatusExpired} {
+			t.Run(provider+"/"+status, func(t *testing.T) {
+				router, _ := walletCheckoutFixture(t)
+				handler := RequestWaffoPay
+				if provider == model.PaymentProviderWaffo {
+					setting.WaffoApiKey = ""
+					service.WaffoHTTPTransport = walletWaffoSDKTransport(func(context.Context, *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+						t.Error("unexpected provider request before SDK initialization")
+						return nil, errors.New("unexpected checkout")
+					})
+				} else {
+					handler = RequestWaffoPancakePay
+					setting.WaffoPancakeStoreID = ""
+					http.DefaultClient = &http.Client{Transport: walletCheckoutTransport(func(*http.Request) (*http.Response, error) {
+						t.Error("unexpected provider request without a configured store")
+						return nil, errors.New("unexpected checkout")
+					})}
+				}
+				if status == common.TopUpStatusPending {
+					require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("test:unavailable_checkout_status", func(tx *gorm.DB) {
+						if tx.Statement.Table == "top_ups" {
+							tx.AddError(errors.New("checkout status write unavailable"))
+						}
+					}))
+				} else {
+					// The original already reached a terminal state before checkout failed locally.
+					require.NoError(t, model.DB.Callback().Create().After("gorm:create").Register("test:expired_checkout", func(tx *gorm.DB) {
+						if order, ok := tx.Statement.Dest.(*model.TopUp); ok {
+							tx.AddError(tx.Session(&gorm.Session{NewDB: true}).Model(&model.TopUp{}).Where("id = ?", order.Id).UpdateColumn("status", status).Error)
+						}
+					}))
+				}
+				router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, handler)
+				request := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(`{"amount":100}`))
+				request.Header.Set("Content-Type", "application/json")
+				response := httptest.NewRecorder()
+				router.ServeHTTP(response, request)
+				var orders []model.TopUp
+				require.NoError(t, model.DB.Find(&orders).Error)
+				require.Len(t, orders, 1)
+				assert.Equal(t, status, orders[0].Status)
+				assert.Zero(t, orders[0].CompleteTime)
+				var reply struct {
+					Success bool              `json:"success"`
+					Key     string            `json:"message_key"`
+					Params  map[string]string `json:"message_params"`
+				}
+				require.NoError(t, common.Unmarshal(response.Body.Bytes(), &reply))
+				assert.False(t, reply.Success)
+				assert.Equal(t, "Payment was not started. Check order {{trade_no}} in Order History.", reply.Key)
+				assert.Equal(t, orders[0].TradeNo, reply.Params["trade_no"])
+			})
+		}
 	}
 }
 

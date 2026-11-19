@@ -329,9 +329,7 @@ func RequestWaffoPay(c *gin.Context) {
 	sdk, err := sdkConfig.newSDK(&checkoutResponse)
 	if err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Waffo SDK initialization failed user_id=%d trade_no=%s error=%q", id, merchantOrderId, err.Error()))
-		topUp.Status = common.TopUpStatusFailed
-		_ = topUp.Update()
-		paymentError(c, common.NewMessage("Payment configuration error"))
+		rejectUnstartedTopUp(c, topUp, common.NewMessage("Payment configuration error"))
 		return
 	}
 
