@@ -28,6 +28,7 @@ import (
 	"github.com/waffo-com/waffo-go/core"
 	waffonet "github.com/waffo-com/waffo-go/net"
 	"github.com/waffo-com/waffo-go/types/order"
+	"github.com/waffo-com/waffo-go/types/subscription"
 	"gorm.io/gorm"
 )
 
@@ -488,20 +489,15 @@ func resolveWaffoCheckoutResponse(topUp *model.TopUp, resp *core.ApiResponse[ord
 	return paymentURL, nil
 }
 
-// webhookPayloadWithSubInfo 扩展 PAYMENT_NOTIFICATION，包含 SDK 未定义的 subscriptionInfo 字段
-type webhookPayloadWithSubInfo struct {
-	EventType string `json:"eventType"`
-	Result    struct {
-		core.PaymentNotificationResult
-		SubscriptionInfo *webhookSubscriptionInfo `json:"subscriptionInfo,omitempty"`
-	} `json:"result"`
+type waffoPaymentNotification struct {
+	core.PaymentNotificationResult
+	Subscription waffoSubscriptionInfo `json:"subscriptionInfo"`
 }
 
-type webhookSubscriptionInfo struct {
-	Period              string `json:"period,omitempty"`
-	MerchantRequest     string `json:"merchantRequest,omitempty"`
-	SubscriptionID      string `json:"subscriptionId,omitempty"`
-	SubscriptionRequest string `json:"subscriptionRequest,omitempty"`
+// v1.3.2 omits subscriptionEvent from its subscription info type.
+type waffoSubscriptionInfo struct {
+	subscription.SubscriptionInfo
+	Event string `json:"subscriptionEvent"`
 }
 
 // WaffoWebhook 处理 Waffo 回调通知（支付/退款/订阅）
@@ -551,14 +547,16 @@ func WaffoWebhook(c *gin.Context) {
 	switch event.EventType {
 	case core.EventPayment:
 		// 解析为扩展类型，区分普通支付和订阅支付
-		var payload webhookPayloadWithSubInfo
+		var payload struct {
+			Result waffoPaymentNotification `json:"result"`
+		}
 		if err := common.Unmarshal(bodyBytes, &payload); err != nil {
 			logger.LogError(c.Request.Context(), common.LogText("Waffo failed to parse payment callback payload event_type=%s client_ip=%s error_type=%T", event.EventType, c.ClientIP(), err))
 			sendWaffoWebhookResponse(c, wh, false, "invalid payment payload")
 			return
 		}
 		logger.LogInfo(c.Request.Context(), common.LogText("Waffo webhook verified and parsed event_type=%s merchant_order_id=%s order_status=%s client_ip=%s", event.EventType, payload.Result.MerchantOrderID, payload.Result.OrderStatus, c.ClientIP()))
-		handleWaffoPayment(c, sdk, wh, &payload.Result.PaymentNotificationResult)
+		handleWaffoPayment(c, sdk, wh, &payload.Result)
 	default:
 		logger.LogInfo(c.Request.Context(), common.LogText("Waffo webhook ignored event event_type=%s client_ip=%s", event.EventType, c.ClientIP()))
 		sendWaffoWebhookResponse(c, wh, true, "")
@@ -595,7 +593,7 @@ func (transport waffoResponseTransport) Send(ctx context.Context, request *waffo
 }
 
 // handleWaffoPayment 处理支付完成通知
-func handleWaffoPayment(c *gin.Context, sdk *waffo.Waffo, wh *core.WebhookHandler, result *core.PaymentNotificationResult) {
+func handleWaffoPayment(c *gin.Context, sdk *waffo.Waffo, wh *core.WebhookHandler, result *waffoPaymentNotification) {
 	if result.OrderStatus == core.OrderStatusPaySuccess || result.OrderStatus == core.OrderStatusOrderClose {
 		topUp, err := model.GetTopUpByTradeNoWithError(result.MerchantOrderID)
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -619,6 +617,10 @@ func handleWaffoPayment(c *gin.Context, sdk *waffo.Waffo, wh *core.WebhookHandle
 			// A committed order only needs the existing idempotent settlement /
 			// cache recovery path. Provider availability cannot revoke that fact.
 			if topUp.Status == common.TopUpStatusPending {
+				if result.Subscription != (waffoSubscriptionInfo{}) {
+					sendWaffoWebhookResponse(c, wh, false, "payment identity mismatch")
+					return
+				}
 				response, err := sdk.Order().Inquiry(c.Request.Context(), &order.InquiryOrderParams{PaymentRequestID: topUp.TradeNo}, nil)
 				// SDK v1.3.2 represents transport/verification failures as E0001
 				// with nil error; a non-nil response is not proof of success.
@@ -629,7 +631,7 @@ func handleWaffoPayment(c *gin.Context, sdk *waffo.Waffo, wh *core.WebhookHandle
 				verified := response.Data
 				if verified.PaymentRequestID != topUp.TradeNo || verified.MerchantOrderID != topUp.TradeNo ||
 					verified.OrderStatus != result.OrderStatus ||
-					(verified.SubscriptionInfo != nil && (verified.SubscriptionInfo.SubscriptionID != "" || verified.SubscriptionInfo.SubscriptionRequest != "" || verified.SubscriptionInfo.MerchantRequest != "")) ||
+					(verified.SubscriptionInfo != nil && *verified.SubscriptionInfo != (subscription.SubscriptionInfo{})) ||
 					(result.OrderStatus == core.OrderStatusPaySuccess && (verified.AcquiringOrderID == "" || verified.OrderCurrency == "")) ||
 					(result.AcquiringOrderID != "" && result.AcquiringOrderID != verified.AcquiringOrderID) ||
 					(result.OrderCurrency != "" && !strings.EqualFold(result.OrderCurrency, verified.OrderCurrency)) ||
@@ -639,11 +641,12 @@ func handleWaffoPayment(c *gin.Context, sdk *waffo.Waffo, wh *core.WebhookHandle
 					return
 				}
 				if result.OrderStatus == core.OrderStatusPaySuccess {
-					paid, paymentErr := decimal.NewFromString(result.OrderAmount)
-					verifiedPaid, verifiedErr := decimal.NewFromString(verified.OrderAmount)
-					// Compare final provider amounts, not the undiscounted checkout
-					// quote: Waffo coupons legitimately permit a zero final amount.
-					if paymentErr != nil || verifiedErr != nil || paid.IsNegative() || !paid.Equal(verifiedPaid) {
+					// Merchant order and buyer payment may use different currencies
+					// and include different fees. Compare each field with its peer.
+					if result.OrderAmount == "" || verified.OrderAmount == "" ||
+						!waffoAmountsAgree(result.OrderAmount, verified.OrderAmount) ||
+						!waffoAmountsAgree(result.FinalDealAmount, verified.FinalDealAmount) ||
+						(result.UserCurrency != "" && verified.UserCurrency != "" && !strings.EqualFold(result.UserCurrency, verified.UserCurrency)) {
 						sendWaffoWebhookResponse(c, wh, false, "payment amount mismatch")
 						return
 					}
@@ -689,6 +692,29 @@ func handleWaffoPayment(c *gin.Context, sdk *waffo.Waffo, wh *core.WebhookHandle
 
 	logger.LogInfo(c.Request.Context(), common.LogText("Waffo top-up succeeded trade_no=%s client_ip=%s", merchantOrderId, c.ClientIP()))
 	sendWaffoWebhookResponse(c, wh, true, "")
+}
+
+// Older receipts can omit the final payment amount. Validate every supplied
+// amount and compare their exact values when both sources report one.
+func waffoAmountsAgree(notice, inquiry string) bool {
+	left, leftErr := decimal.NewFromString(notice)
+	right, rightErr := decimal.NewFromString(inquiry)
+	if notice != "" && (leftErr != nil || left.IsNegative()) || inquiry != "" && (rightErr != nil || right.IsNegative()) {
+		return false
+	}
+	if notice == "" || inquiry == "" {
+		return true
+	}
+	if left.IsZero() || right.IsZero() {
+		return left.IsZero() && right.IsZero()
+	}
+	// Equal nonzero numbers can only differ in scale by trailing coefficient
+	// digits. Avoid expanding unrelated exponents just to discover a mismatch.
+	gap := int64(left.Exponent()) - int64(right.Exponent())
+	if gap > int64(len(inquiry)) || -gap > int64(len(notice)) {
+		return false
+	}
+	return left.Equal(right)
 }
 
 // sendWaffoWebhookResponse 发送签名响应

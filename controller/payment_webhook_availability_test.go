@@ -7613,8 +7613,18 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 		raw         string
 		closed      bool
 		accepted    bool
+		fx          bool
+		subNotice   map[string]string
 	}{
 		{name: "discounted_amount", accepted: true},
+		{name: "exchange_and_fee", fx: true, accepted: true},
+		{name: "different_final_amount", fx: true, field: "finalDealAmount", value: "88.09"},
+		{name: "different_payment_currency", fx: true, field: "userCurrency", value: "GBP"},
+		{name: "invalid_query_final_amount", field: "finalDealAmount", value: "not-a-price"},
+		{name: "legacy_notice_with_query_final_amount", field: "finalDealAmount", value: "93.70", accepted: true},
+		{name: "subscription_payment_notice", subNotice: map[string]string{"subscriptionEvent": "PERIOD_CHARGE"}},
+		{name: "subscription_close_notice", subNotice: map[string]string{"subscriptionId": "sub_fixture"}, closed: true},
+		{name: "subscription_period_in_inquiry", field: "subscriptionInfo", value: map[string]string{"period": "2"}},
 		{name: "zero_paid", field: "orderAmount", value: "0.00", accepted: true},
 		{name: "merchant_order_mismatch", field: "merchantOrderId", value: "other_order"},
 		{name: "payment_request_mismatch", field: "paymentRequestId", value: "other_request"},
@@ -7663,6 +7673,12 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 				amount = "0.00"
 			}
 			result := map[string]any{"merchantOrderId": topUp.TradeNo, "paymentRequestId": topUp.TradeNo, "orderStatus": status, "orderAmount": amount, "orderCurrency": "USD"}
+			if scenario.fx {
+				result["userCurrency"], result["finalDealAmount"] = "EUR", "88.10"
+			}
+			if scenario.subNotice != nil {
+				result["subscriptionInfo"] = scenario.subNotice
+			}
 			if scenario.name == "closed_without_payment_fields" {
 				delete(result, "orderAmount")
 				delete(result, "orderCurrency")
@@ -7673,6 +7689,9 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 			request.Body = io.NopCloser(bytes.NewReader(callbackBody))
 			transport := service.WaffoHTTPTransport.(*walletWaffoInquiryTransport)
 			query := map[string]any{"merchantOrderId": topUp.TradeNo, "paymentRequestId": topUp.TradeNo, "acquiringOrderId": "acquiring_" + topUp.TradeNo, "orderStatus": status, "orderAmount": amount, "orderCurrency": "USD", "merchantInfo": map[string]any{"merchantId": "merchant_checkout"}, "userInfo": map[string]any{"userId": "902"}}
+			if scenario.fx {
+				query["userCurrency"], query["finalDealAmount"] = "EUR", "88.100"
+			}
 			if scenario.field != "" {
 				query[scenario.field] = scenario.value
 			}
@@ -7746,7 +7765,16 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 			var facts int64
 			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&facts).Error)
 			assert.Equal(t, expectedFacts, facts)
-			assert.EqualValues(t, 1, transport.requests.Load(), "terminal notification must query the merchant-authenticated original order")
+			if scenario.subNotice != nil {
+				// A subscription notification isn't wallet proof. Only a separate
+				// matching one-time notification can recover the original order.
+				delete(result, "subscriptionInfo")
+				request = signedWalletWebhookRequest(t, keys, model.PaymentProviderWaffo, map[string]any{"eventType": "PAYMENT_NOTIFICATION", "result": result})
+				callbackBody, err = io.ReadAll(request.Body)
+				require.NoError(t, err)
+			} else {
+				assert.EqualValues(t, 1, transport.requests.Load(), "terminal notification must query the merchant-authenticated original order")
+			}
 			// Restore the provider's original fact and replay the exact signed
 			// notification. A retry does not need a replacement local order.
 			transport.setResult(result)
