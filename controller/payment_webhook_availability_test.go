@@ -3441,6 +3441,56 @@ func TestWalletReferralManualCompletionRejectsSubscriptionDisplayOrder(t *testin
 	assert.Zero(t, facts)
 }
 
+func TestWalletStripePaymentPreservesCustomerForNextCheckout(t *testing.T) {
+	for _, tc := range []struct {
+		name, event, want string
+		customer          any
+	}{
+		{"customer_id", "checkout.session.completed", "cus_paid", "cus_paid"},
+		{"customer_null", "checkout.session.completed", "cus_existing", nil},
+		{"customer_omitted", "checkout.session.async_payment_succeeded", "cus_existing", nil},
+		{"expanded_customer", "checkout.session.async_payment_succeeded", "cus_paid", map[string]any{"id": "cus_paid", "object": "customer"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, keys := walletCheckoutFixture(t)
+			require.NoError(t, model.DB.Model(&model.User{}).Where("id = ?", 902).Update("stripe_customer", "cus_existing").Error)
+			order := walletWebhookOrder(t, model.PaymentProviderStripe, "stripe-customer")
+			object := map[string]any{"client_reference_id": order.TradeNo, "mode": "payment", "status": "complete", "payment_status": "paid", "amount_total": 9000, "currency": "usd"}
+			if tc.name != "customer_omitted" {
+				object["customer"] = tc.customer
+			}
+			event := map[string]any{"type": tc.event, "data": map[string]any{"object": object}}
+			for range 2 {
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, signedWalletWebhookRequest(t, keys, model.PaymentProviderStripe, event))
+				require.Equal(t, http.StatusOK, w.Code)
+			}
+			var buyer model.User
+			require.NoError(t, model.DB.First(&buyer, 902).Error)
+			assert.Equal(t, tc.want, buyer.StripeCustomer)
+			assert.Equal(t, 990, buyer.Quota)
+			var rebates []model.ReferralRebate
+			require.NoError(t, model.DB.Where("top_up_id = ?", order.Id).Find(&rebates).Error)
+			require.Len(t, rebates, 1)
+			assert.EqualValues(t, 100, rebates[0].RewardQuota)
+
+			previous := stripe.GetBackend(stripe.APIBackend)
+			t.Cleanup(func() { stripe.SetBackend(stripe.APIBackend, previous) })
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, tc.want, r.FormValue("customer"))
+				assert.Empty(t, r.FormValue("customer_creation"))
+				_, _ = io.WriteString(w, `{"url":"https://checkout.example.invalid/next"}`)
+			}))
+			defer server.Close()
+			stripe.SetBackend(stripe.APIBackend, stripe.GetBackendWithConfig(stripe.APIBackend, &stripe.BackendConfig{URL: stripe.String(server.URL), HTTPClient: server.Client(), MaxNetworkRetries: stripe.Int64(0)}))
+			router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestStripePay)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(`{"amount":1,"payment_method":"stripe"}`)))
+			assert.Contains(t, w.Body.String(), `"message":"success"`)
+		})
+	}
+}
+
 func TestWalletReferralStripeDelayedPaymentSettlesOnlyAfterSuccessEvent(t *testing.T) {
 	router, keys := walletWebhookFixture(t)
 	order := walletWebhookOrder(t, model.PaymentProviderStripe, "stripe-delayed-payment")

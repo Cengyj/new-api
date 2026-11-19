@@ -342,7 +342,7 @@ func settleWalletTopUp(tradeNo, expectedProvider, actualMethod, customerID strin
 			return err
 		}
 		updates := map[string]any{}
-		if expectedProvider == PaymentProviderStripe {
+		if expectedProvider == PaymentProviderStripe && customerID != "" {
 			updates["stripe_customer"] = customerID
 		}
 		if err := creditTopUpQuota(tx, topUp.UserId, quota, updates); err != nil {

@@ -281,7 +281,6 @@ func StripeWebhook(c *gin.Context) {
 }
 
 func sessionCompleted(ctx context.Context, event stripe.Event, callerIp string) error {
-	customerId := event.GetObjectValue("customer")
 	referenceId := event.GetObjectValue("client_reference_id")
 	status := event.GetObjectValue("status")
 	if "complete" != status {
@@ -294,16 +293,15 @@ func sessionCompleted(ctx context.Context, event stripe.Event, callerIp string) 
 		logger.LogInfo(ctx, common.LogText("Stripe Checkout payment not completed, waiting for async result trade_no=%s payment_status=%s client_ip=%s", referenceId, paymentStatus, callerIp))
 		return nil
 	}
-	return fulfillOrder(ctx, event, referenceId, customerId, callerIp)
+	return fulfillOrder(ctx, event, referenceId, callerIp)
 }
 
 // sessionAsyncPaymentSucceeded handles delayed payment methods that confirm
 // payment after checkout completes. The signed event remains the payment proof.
 func sessionAsyncPaymentSucceeded(ctx context.Context, event stripe.Event, callerIp string) error {
-	customerId := event.GetObjectValue("customer")
 	referenceId := event.GetObjectValue("client_reference_id")
 	logger.LogInfo(ctx, common.LogText("Stripe async payment succeeded trade_no=%s client_ip=%s", referenceId, callerIp))
-	return fulfillOrder(ctx, event, referenceId, customerId, callerIp)
+	return fulfillOrder(ctx, event, referenceId, callerIp)
 }
 
 // sessionAsyncPaymentFailed marks orders as failed when delayed payment methods
@@ -356,7 +354,7 @@ func sessionAsyncPaymentFailed(ctx context.Context, event stripe.Event, callerIp
 }
 
 // fulfillOrder is the shared logic for crediting quota after payment is confirmed.
-func fulfillOrder(ctx context.Context, event stripe.Event, referenceId string, customerId string, callerIp string) error {
+func fulfillOrder(ctx context.Context, event stripe.Event, referenceId, callerIp string) error {
 	if len(referenceId) == 0 {
 		logger.LogWarn(ctx, common.LogText("Stripe order completion missing order number client_ip=%s", callerIp))
 		return errors.New("missing payment order number")
@@ -364,6 +362,12 @@ func fulfillOrder(ctx context.Context, event stripe.Event, referenceId string, c
 
 	LockOrder(referenceId)
 	defer UnlockOrder(referenceId)
+	// Checkout normally sends a nullable ID. Keep an expanded customer's
+	// properties out of both the shared receipt and the next Checkout request.
+	customerId, _ := event.Data.Object["customer"].(string)
+	if expanded, ok := event.Data.Object["customer"].(map[string]any); ok {
+		customerId, _ = expanded["id"].(string)
+	}
 	payload := map[string]any{
 		"customer":     customerId,
 		"amount_total": event.GetObjectValue("amount_total"),
