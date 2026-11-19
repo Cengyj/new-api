@@ -50,10 +50,10 @@ func getWaffoSDK() (*waffo.Waffo, error) {
 	common.OptionMapRWMutex.RLock()
 	snapshot := waffoConfigLocked()
 	common.OptionMapRWMutex.RUnlock()
-	return snapshot.newSDK()
+	return snapshot.newSDK(nil)
 }
 
-func (snapshot waffoConfigSnapshot) newSDK() (*waffo.Waffo, error) {
+func (snapshot waffoConfigSnapshot) newSDK(checkoutResponse *waffonet.HttpResponse) (*waffo.Waffo, error) {
 	builder := config.NewConfigBuilder().APIKey(snapshot.apiKey).PrivateKey(snapshot.privateKey).
 		WaffoPublicKey(snapshot.publicKey).Environment(snapshot.environment)
 	if snapshot.merchantID != "" {
@@ -67,7 +67,7 @@ func (snapshot waffoConfigSnapshot) newSDK() (*waffo.Waffo, error) {
 	if cfg.CustomTransport == nil {
 		cfg.CustomTransport = service.NewWaffoHTTPTransport(cfg.ConnectTimeout, cfg.ReadTimeout)
 	}
-	cfg.CustomTransport = waffoResponseTransport{transport: cfg.CustomTransport}
+	cfg.CustomTransport = waffoResponseTransport{transport: cfg.CustomTransport, checkoutResponse: checkoutResponse}
 	return waffo.New(cfg), nil
 }
 
@@ -324,7 +324,8 @@ func RequestWaffoPay(c *gin.Context) {
 		return
 	}
 
-	sdk, err := sdkConfig.newSDK()
+	var checkoutResponse waffonet.HttpResponse
+	sdk, err := sdkConfig.newSDK(&checkoutResponse)
 	if err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Waffo SDK initialization failed user_id=%d trade_no=%s error=%q", id, merchantOrderId, err.Error()))
 		topUp.Status = common.TopUpStatusFailed
@@ -382,7 +383,7 @@ func RequestWaffoPay(c *gin.Context) {
 		paymentCheckoutUnknown(c, merchantOrderId)
 		return
 	}
-	paymentUrl, err := resolveWaffoCheckoutResponse(topUp, resp)
+	paymentUrl, err := resolveWaffoCheckoutResponse(topUp, resp, &checkoutResponse)
 	if err != nil {
 		if errors.Is(err, errWaffoCheckoutRejected) {
 			logger.LogWarn(c.Request.Context(), common.LogText("Waffo order creation rejected user_id=%d trade_no=%s code=%s", id, merchantOrderId, resp.Code))
@@ -406,28 +407,55 @@ func RequestWaffoPay(c *gin.Context) {
 
 var errWaffoCheckoutRejected = errors.New("Waffo rejected order creation")
 
+// Documented create-time refusals (v1.3.2). An idempotency conflict (A0011)
+// or concurrent creation (A0040) does not establish the order was rejected.
+func waffoCheckoutRefusalStatus(code string) int {
+	switch code {
+	case "A0001", "A0002", "A0004":
+		return http.StatusUnauthorized
+	case "A0003", "A0005", "A0006", "A0007", "A0008", "A0010", "A0012", "A0018", "A0020",
+		"A0021", "A0022", "A0023", "A0024", "A0026", "A0029", "A0030", "A0031", "A0032", "A0033", "A0034", "A0037", "A0038", "A0045":
+		return http.StatusBadRequest
+	case "D0001":
+		return http.StatusNotAcceptable
+	default:
+		return 0
+	}
+}
+
 // resolveWaffoCheckoutResponse only fails the stored order when the provider
 // supplies an explicit rejection. Missing results must remain recoverable by
 // a later verified notification, including JSON null decoded by the SDK.
-func resolveWaffoCheckoutResponse(topUp *model.TopUp, resp *core.ApiResponse[order.CreateOrderData]) (string, error) {
-	if resp == nil || strings.TrimSpace(resp.Code) == "" {
+func resolveWaffoCheckoutResponse(topUp *model.TopUp, resp *core.ApiResponse[order.CreateOrderData], wire *waffonet.HttpResponse) (string, error) {
+	if resp == nil || wire == nil {
 		return "", common.NewMessage("Failed to start payment")
 	}
-	// v1.3.2 also returns a nonzero code for an idempotency conflict
-	// (A0011) or a concurrent create (A0040). Neither rules out a paid order.
-	// Only documented create-time input, credential or policy rejections
-	// are terminal; leave other outcomes open for the authenticated inquiry.
-	switch resp.Code {
-	case "0":
-	case "A0001", "A0002", "A0003", "A0004", "A0005", "A0006", "A0007", "A0008",
-		"A0010", "A0012", "A0018", "A0020", "A0021", "A0022", "A0023", "A0024", "A0026",
-		"A0029", "A0030", "A0031", "A0032", "A0033", "A0034", "A0037", "A0038", "A0045", "D0001":
+	if !resp.IsSuccess() {
+		status := waffoCheckoutRefusalStatus(resp.Code)
+		if status == 0 || !wire.IsSuccess() && wire.StatusCode != status {
+			return "", common.NewMessage("Failed to start payment")
+		}
+		// v1.3.2 discards data on nonzero codes. Inspect the same signed body
+		// before closing an order; a checkout action or a different ID conflicts
+		// with a definitive refusal. Matching echoes alone are not a checkout.
+		var envelope struct {
+			Data order.CreateOrderData `json:"data"`
+		}
+		if err := common.Unmarshal(wire.Body, &envelope); err != nil {
+			return "", err
+		}
+		d := envelope.Data
+		if d.OrderAction != "" || d.OrderStatus != "" || d.AcquiringOrderID != "" ||
+			d.PaymentRequestID != "" && d.PaymentRequestID != topUp.TradeNo || d.MerchantOrderID != "" && d.MerchantOrderID != topUp.TradeNo {
+			return "", common.NewMessage("Failed to start payment")
+		}
 		topUp.Status = common.TopUpStatusFailed
 		if err := topUp.Update(); err != nil {
 			return "", err
 		}
 		return "", errWaffoCheckoutRejected
-	default:
+	}
+	if !wire.IsSuccess() {
 		return "", common.NewMessage("Failed to start payment")
 	}
 
@@ -436,6 +464,13 @@ func resolveWaffoCheckoutResponse(topUp *model.TopUp, resp *core.ApiResponse[ord
 	// checkout. Both required provider identifiers must match the frozen order
 	// before exposing a payment link. A mismatch leaves its outcome unknown.
 	if orderData == nil || orderData.PaymentRequestID != topUp.TradeNo || orderData.MerchantOrderID != topUp.TradeNo {
+		return "", common.NewMessage("Failed to start payment")
+	}
+	// Paid, closed or already authorized orders must not send the buyer back
+	// to an old payment action. Only the notification / inquiry can settle it.
+	switch orderData.OrderStatus {
+	case "", core.OrderStatusAuthorizationRequired, core.OrderStatusPayInProgress:
+	default:
 		return "", common.NewMessage("Failed to start payment")
 	}
 	paymentURL := orderData.FetchRedirectURL()
@@ -533,7 +568,8 @@ func WaffoWebhook(c *gin.Context) {
 // The SDK decodes JSON even on HTTP authentication/server failures. Such a
 // reply cannot prove that a merchant-authenticated payment request succeeded.
 type waffoResponseTransport struct {
-	transport waffonet.HttpTransport
+	transport        waffonet.HttpTransport
+	checkoutResponse *waffonet.HttpResponse // local to a single Order.Create; nil for inquiries and shared callers
 }
 
 func (transport waffoResponseTransport) Send(ctx context.Context, request *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
@@ -544,12 +580,16 @@ func (transport waffoResponseTransport) Send(ctx context.Context, request *waffo
 	if response == nil {
 		return nil, errors.New("Waffo returned no HTTP response")
 	}
-	if !response.IsSuccess() {
+	// The SDK verifies response signatures only when present; require one.
+	if strings.TrimSpace(response.GetHeader(core.HeaderSignature)) == "" {
+		return nil, errors.New("Waffo response signature is missing")
+	}
+	if !response.IsSuccess() && (transport.checkoutResponse == nil ||
+		(response.StatusCode != http.StatusBadRequest && response.StatusCode != http.StatusUnauthorized && response.StatusCode != http.StatusNotAcceptable)) {
 		return nil, fmt.Errorf("Waffo returned HTTP %d", response.StatusCode)
 	}
-	// The SDK verifies response signatures only when present; require one.
-	if response.GetHeader(core.HeaderSignature) == "" {
-		return nil, errors.New("Waffo response signature is missing")
+	if transport.checkoutResponse != nil {
+		*transport.checkoutResponse = *response
 	}
 	return response, nil
 }

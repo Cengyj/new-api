@@ -165,16 +165,13 @@ func (*StripeAdaptor) RequestPay(c *gin.Context, req *StripePayRequest) {
 	payLink, err := checkoutConfig.link(referenceId, user.StripeCustomer, user.Email, req.Amount, req.SuccessURL, req.CancelURL)
 	if err != nil {
 		knownRejection := false
-		var stripeErr *stripe.Error
-		if errors.As(err, &stripeErr) && stripeErr.Type == stripe.ErrorTypeInvalidRequest &&
-			(stripeErr.HTTPStatusCode == http.StatusBadRequest || stripeErr.HTTPStatusCode == http.StatusUnauthorized ||
-				stripeErr.HTTPStatusCode == http.StatusForbidden) {
-			knownRejection = true
-			// A structured parameter/authentication rejection did not create a
-			// checkout. Preserve the original manual-completion boundary. Network
-			// failures, conflicts and server errors remain indeterminate.
-			if updateErr := model.UpdatePendingTopUpStatus(referenceId, model.PaymentProviderStripe, common.TopUpStatusFailed); updateErr != nil && !errors.Is(updateErr, model.ErrTopUpStatusInvalid) {
-				err = errors.Join(err, updateErr)
+		if stripeCheckoutRejected(err) {
+			// Only report a definite refusal if this order actually transitioned.
+			// A committed callback or a lost SQL reply needs the original ID.
+			updateErr := model.UpdatePendingTopUpStatus(referenceId, model.PaymentProviderStripe, common.TopUpStatusFailed)
+			knownRejection = updateErr == nil
+			if updateErr != nil && !errors.Is(updateErr, model.ErrTopUpStatusInvalid) {
+				logger.LogError(c.Request.Context(), common.LogText("Stripe failed to mark top-up order as failed trade_no=%s client_ip=%s error=%q", referenceId, c.ClientIP(), updateErr.Error()))
 			}
 		}
 		logger.LogError(c.Request.Context(), common.LogText("Stripe failed to create Checkout Session user_id=%d trade_no=%s amount=%d %s", id, referenceId, req.Amount, stripeCheckoutErrorSummary(err)))
@@ -523,6 +520,25 @@ func stripeCheckoutErrorSummary(err error) string {
 	return fmt.Sprintf("error_type=%T", err)
 }
 
+func stripeCheckoutRejected(err error) bool {
+	var e *stripe.Error
+	if !errors.As(err, &e) || e.Type != stripe.ErrorTypeInvalidRequest || e.LastResponse == nil {
+		return false
+	}
+	switch e.HTTPStatusCode {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
+	default:
+		return false
+	}
+	if e.Code == stripe.ErrorCodeIdempotencyKeyInUse || e.Code == stripe.ErrorCodeResourceAlreadyExists || e.LastResponse.Header.Get("Stripe-Should-Retry") == "true" {
+		return false
+	}
+	// v81 decodes only the error member on HTTP failures. A mixed session and
+	// error body isn't the provider's error envelope and cannot close the order.
+	var envelope map[string]common.RawMessage
+	return common.Unmarshal(e.LastResponse.RawJSON, &envelope) == nil && len(envelope) == 1 && envelope["error"] != nil
+}
+
 type stripeCheckoutConfig struct {
 	priceID, apiSecret, serverAddress string
 	allowPromotionCodes               bool
@@ -593,6 +609,32 @@ func (config stripeCheckoutConfig) link(referenceId, customerId, email string, a
 	}
 	if result == nil || strings.TrimSpace(result.URL) == "" {
 		return "", errors.New("Stripe checkout response is missing a payment URL")
+	}
+	// With redirects disabled v81 can still decode a 3xx body as a session.
+	if result.LastResponse == nil || result.LastResponse.StatusCode/100 != 2 {
+		return "", errors.New("Stripe did not confirm checkout creation")
+	}
+	// The SDK ignores an error alongside a session and maps an omitted livemode
+	// to false. Validate what the endpoint actually returned against this key.
+	var wire struct {
+		Error    *common.RawMessage `json:"error"`
+		Livemode *bool              `json:"livemode"`
+	}
+	if err := common.Unmarshal(result.LastResponse.RawJSON, &wire); err != nil || wire.Error != nil {
+		return "", errors.New("Stripe did not confirm checkout creation")
+	}
+	if wire.Livemode != nil {
+		_, mode, _ := strings.Cut(apiSecret, "_")
+		if strings.HasPrefix(mode, "test_") && *wire.Livemode || strings.HasPrefix(mode, "live_") && !*wire.Livemode {
+			return "", errors.New("Stripe checkout environment does not match the request")
+		}
+	}
+	if result.ClientReferenceID != "" && result.ClientReferenceID != referenceId {
+		return "", errors.New("Stripe checkout response refers to a different order")
+	}
+	if result.Object != "" && result.Object != "checkout.session" || result.Mode != "" && result.Mode != stripe.CheckoutSessionModePayment || result.PaymentLink != nil ||
+		result.Status != "" && result.Status != stripe.CheckoutSessionStatusOpen {
+		return "", errors.New("Stripe did not return an open wallet checkout")
 	}
 
 	return result.URL, nil

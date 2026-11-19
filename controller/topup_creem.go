@@ -14,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting"
 	"io"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -85,32 +86,51 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 		return
 	}
 
-	// 解析产品列表
-	var products []struct {
-		CreemProduct
-		CurrencyJSON json.RawMessage `json:"currency"`
-	}
-	err := common.Unmarshal([]byte(productConfig), &products)
+	var products []json.RawMessage
+	err := common.UnmarshalJsonStr(productConfig, &products)
 	if err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Creem failed to parse product config user_id=%d error=%q", c.GetInt("id"), err.Error()))
 		paymentError(c, common.NewMessage("Product configuration error"))
 		return
 	}
 
-	// 查找对应的产品
+	// The buyer selects by product ID alone. An unrelated malformed offer must
+	// not block it, but two different prices or credits for this ID are ambiguous.
 	var selectedProduct *CreemProduct
-	for _, product := range products {
-		if product.ProductId == req.ProductId {
-			// Only a missing currency has the historical USD default. A bad
-			// product must not prevent purchasing another valid catalog item.
-			if product.CurrencyJSON == nil {
-				product.Currency = "USD"
-			} else if err := common.Unmarshal(product.CurrencyJSON, &product.Currency); err != nil || (product.Currency != "USD" && product.Currency != "EUR") {
-				paymentError(c, common.NewMessage("Product configuration error"))
-				return
-			}
+	for _, raw := range products {
+		var id struct {
+			ProductID string `json:"productId"`
+		}
+		if common.Unmarshal(raw, &id) != nil || id.ProductID != req.ProductId {
+			continue
+		}
+		var product struct {
+			CreemProduct
+			PriceJSON    json.RawMessage `json:"price"`
+			CurrencyJSON json.RawMessage `json:"currency"`
+		}
+		if err := common.Unmarshal(raw, &product); err != nil {
+			paymentError(c, common.NewMessage("Product configuration error"))
+			return
+		}
+		// The wallet displays cents but TopUp.Money stores a float. Check the original number
+		// against the representable two-decimal price; never round a different offer into it.
+		if common.Unmarshal(product.PriceJSON, &product.Price) != nil || validateTopUpPaymentAmount(product.Price) != nil ||
+			!creemPriceEquals(product.PriceJSON, decimal.NewFromFloat(product.Price).Round(2)) {
+			paymentError(c, common.NewMessage("Product configuration error"))
+			return
+		}
+		if product.CurrencyJSON == nil {
+			product.Currency = "USD"
+		} else if err := common.Unmarshal(product.CurrencyJSON, &product.Currency); err != nil || (product.Currency != "USD" && product.Currency != "EUR") {
+			paymentError(c, common.NewMessage("Product configuration error"))
+			return
+		}
+		if selectedProduct == nil {
 			selectedProduct = &product.CreemProduct
-			break
+		} else if selectedProduct.Price != product.Price || selectedProduct.Quota != product.Quota || selectedProduct.Currency != product.Currency {
+			paymentError(c, common.NewMessage("Product configuration error"))
+			return
 		}
 	}
 
@@ -118,11 +138,6 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 		paymentError(c, common.NewMessage("Product does not exist"))
 		return
 	}
-	if err := validateTopUpPaymentAmount(selectedProduct.Price); err != nil {
-		paymentError(c, common.NewMessage("Product configuration error"))
-		return
-	}
-
 	id := c.GetInt("id")
 	if rejectInvalidCreditedQuota(c, id, decimal.NewFromInt(selectedProduct.Quota)) {
 		return
@@ -157,14 +172,19 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 	}
 
 	// 创建支付链接，传入用户邮箱
-	checkoutUrl, err := checkoutConfig.link(c.Request.Context(), referenceId, selectedProduct, user.Email, user.Username)
+	checkoutUrl, err := checkoutConfig.link(c.Request.Context(), referenceId, selectedProduct, user.Email, user.Username, true)
 	if err != nil {
 		logger.LogError(c.Request.Context(), common.LogText("Creem failed to create payment link user_id=%d trade_no=%s product_id=%s error_type=%T", id, referenceId, selectedProduct.ProductId, err))
 		if errors.Is(err, errCreemCheckoutNotCreated) {
-			paymentError(c, common.NewMessage("Failed to start payment"))
-		} else {
-			paymentCheckoutUnknown(c, referenceId)
+			// Creem preserves pending orders on a definite rejection. A callback
+			// can already have settled this one before the create response arrived.
+			stored, lookupErr := model.GetTopUpByTradeNoWithError(referenceId)
+			if lookupErr == nil && stored.Status == common.TopUpStatusPending {
+				paymentError(c, common.NewMessage("Failed to start payment"))
+				return
+			}
 		}
+		paymentCheckoutUnknown(c, referenceId)
 		return
 	}
 
@@ -192,7 +212,28 @@ func RequestCreemPay(c *gin.Context) {
 	creemAdaptor.RequestPay(c, &req)
 }
 
-// 新的Creem Webhook结构体，匹配实际的webhook数据格式
+// Creem can send just the ID or an expanded object. In shared order receipts,
+// keep that distinction and only retain the expanded fields declared below.
+type creemResource[T any] struct {
+	id       *string
+	expanded T
+}
+
+func (r *creemResource[T]) UnmarshalJSON(data []byte) error {
+	if common.GetJsonType(data) == "string" {
+		return common.Unmarshal(data, &r.id)
+	}
+	r.id = nil
+	return common.Unmarshal(data, &r.expanded)
+}
+
+func (r creemResource[T]) MarshalJSON() ([]byte, error) {
+	if r.id != nil {
+		return common.Marshal(*r.id)
+	}
+	return common.Marshal(r.expanded)
+}
+
 type CreemWebhookEvent struct {
 	Id        string `json:"id"`
 	EventType string `json:"eventType"`
@@ -219,7 +260,7 @@ type CreemWebhookEvent struct {
 			UpdatedAt   string `json:"updated_at"`
 			Mode        string `json:"mode"`
 		} `json:"order"`
-		Product struct {
+		Product creemResource[struct {
 			Id                string  `json:"id"`
 			Object            string  `json:"object"`
 			Name              string  `json:"name"`
@@ -235,9 +276,9 @@ type CreemWebhookEvent struct {
 			CreatedAt         string  `json:"created_at"`
 			UpdatedAt         string  `json:"updated_at"`
 			Mode              string  `json:"mode"`
-		} `json:"product"`
+		}] `json:"product"`
 		Units    int `json:"units"`
-		Customer struct {
+		Customer creemResource[struct {
 			Id        string `json:"id"`
 			Object    string `json:"object"`
 			Email     string `json:"email"`
@@ -246,10 +287,10 @@ type CreemWebhookEvent struct {
 			CreatedAt string `json:"created_at"`
 			UpdatedAt string `json:"updated_at"`
 			Mode      string `json:"mode"`
-		} `json:"customer"`
-		Status   string            `json:"status"`
-		Metadata map[string]string `json:"metadata"`
-		Mode     string            `json:"mode"`
+		}] `json:"customer"`
+		Status   string                     `json:"status"`
+		Metadata map[string]json.RawMessage `json:"metadata"`
+		Mode     string                     `json:"mode"`
 	} `json:"object"`
 }
 
@@ -389,8 +430,26 @@ type CreemCheckoutRequest struct {
 }
 
 type CreemCheckoutResponse struct {
-	CheckoutUrl string `json:"checkout_url"`
-	Id          string `json:"id"`
+	CheckoutUrl string           `json:"checkout_url"`
+	Id          string           `json:"id"`
+	RequestID   string           `json:"request_id"`
+	Status      string           `json:"status"`
+	Error       string           `json:"error"`
+	Mode        string           `json:"mode"`
+	Units       *int64           `json:"units"`
+	CustomPrice *json.RawMessage `json:"custom_price"`
+	Product     *creemResource[struct {
+		ID          string          `json:"id"`
+		BillingType string          `json:"billing_type"`
+		Price       json.RawMessage `json:"price"`
+		Currency    json.RawMessage `json:"currency"`
+	}] `json:"product"`
+}
+
+// Compare a JSON number exactly, including decimal or exponent notation.
+func creemPriceEquals(raw json.RawMessage, expected decimal.Decimal) bool {
+	price, ok := new(big.Rat).SetString(string(raw))
+	return ok && price.Cmp(expected.Rat()) == 0
 }
 
 type creemCheckoutConfig struct {
@@ -402,10 +461,10 @@ func genCreemLink(ctx context.Context, referenceId string, product *CreemProduct
 	common.OptionMapRWMutex.RLock()
 	config := creemCheckoutConfig{apiKey: setting.CreemApiKey, testMode: setting.CreemTestMode}
 	common.OptionMapRWMutex.RUnlock()
-	return config.link(ctx, referenceId, product, email, username)
+	return config.link(ctx, referenceId, product, email, username, false)
 }
 
-func (config creemCheckoutConfig) link(ctx context.Context, referenceId string, product *CreemProduct, email, username string) (string, error) {
+func (config creemCheckoutConfig) link(ctx context.Context, referenceId string, product *CreemProduct, email, username string, oneTimeOnly bool) (string, error) {
 	apiKey, testMode := config.apiKey, config.testMode
 	if apiKey == "" {
 		return "", fmt.Errorf("%w: API key is not configured", errCreemCheckoutNotCreated)
@@ -476,20 +535,51 @@ func (config creemCheckoutConfig) link(ctx context.Context, referenceId string, 
 
 	logger.LogInfo(ctx, common.LogText("Creem API response received trade_no=%s status_code=%d body_bytes=%d", referenceId, resp.StatusCode, len(body)))
 
-	var checkoutResp CreemCheckoutResponse
-	err = common.Unmarshal(body, &checkoutResp)
 	if resp.StatusCode/100 != 2 {
-		// Create Checkout documents 400/401/404 as input/auth/resource
-		// rejections. A contradictory checkout payload or unreadable body
-		// remains unknown; this does not change the local pending policy.
-		if (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusNotFound) &&
-			err == nil && checkoutResp.Id == "" && strings.TrimSpace(checkoutResp.CheckoutUrl) == "" {
+		if creemCheckoutRejected(resp.StatusCode, body) {
 			return "", fmt.Errorf("%w: HTTP %d", errCreemCheckoutNotCreated, resp.StatusCode)
 		}
 		return "", fmt.Errorf("Creem API http status %d", resp.StatusCode)
 	}
-	if err != nil {
+	var checkoutResp CreemCheckoutResponse
+	if err := common.Unmarshal(body, &checkoutResp); err != nil {
 		return "", fmt.Errorf("failed to parse response: %v", err)
+	}
+	if checkoutResp.RequestID != "" && checkoutResp.RequestID != referenceId {
+		return "", errors.New("Creem checkout response refers to a different order")
+	}
+	if checkoutResp.Error != "" || checkoutResp.Status != "" && checkoutResp.Status != "pending" {
+		return "", errors.New("Creem checkout is not awaiting payment")
+	}
+	if mode := checkoutResp.Mode; mode != "" && (testMode && mode != "test" && mode != "sandbox" || !testMode && mode != "prod") {
+		return "", errors.New("Creem checkout environment does not match the request")
+	}
+	// This request omits units, which Creem defines as a single unit.
+	if checkoutResp.Units != nil && *checkoutResp.Units != 1 {
+		return "", errors.New("Creem checkout quantity does not match the request")
+	}
+	var catalogPrice, catalogCurrency json.RawMessage
+	if p := checkoutResp.Product; p != nil {
+		id := p.expanded.ID
+		if p.id != nil {
+			id = *p.id
+		}
+		if id != product.ProductId || oneTimeOnly && p.expanded.BillingType != "" && p.expanded.BillingType != "onetime" {
+			return "", errors.New("Creem checkout product does not match the purchase")
+		}
+		catalogPrice, catalogCurrency = p.expanded.Price, p.expanded.Currency
+	}
+	if oneTimeOnly {
+		// USD/EUR product and custom prices are cents per unit, not the tax- or discount-adjusted order total.
+		expected := decimal.NewFromFloat(product.Price).Shift(2)
+		if catalogPrice != nil && !creemPriceEquals(catalogPrice, expected) ||
+			checkoutResp.CustomPrice != nil && !creemPriceEquals(*checkoutResp.CustomPrice, expected) {
+			return "", errors.New("Creem unit price does not match the wallet offer")
+		}
+		var currency string
+		if catalogCurrency != nil && (common.Unmarshal(catalogCurrency, &currency) != nil || currency != product.Currency) {
+			return "", errors.New("Creem product currency does not match the wallet offer")
+		}
 	}
 
 	if strings.TrimSpace(checkoutResp.CheckoutUrl) == "" {
@@ -498,4 +588,44 @@ func (config creemCheckoutConfig) link(ctx context.Context, referenceId string, 
 
 	logger.LogInfo(ctx, common.LogText("Creem payment link created trade_no=%s response_id=%s", referenceId, checkoutResp.Id))
 	return checkoutResp.CheckoutUrl, nil
+}
+
+func creemCheckoutRejected(status int, body []byte) bool {
+	switch status {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+	default:
+		return false
+	}
+	var refusal struct {
+		CreemCheckoutResponse
+		Status  *int            `json:"status"`
+		Message json.RawMessage `json:"message"`
+	}
+	if common.Unmarshal(body, &refusal) != nil || refusal.Id != "" || refusal.CheckoutUrl != "" || refusal.RequestID != "" || refusal.Product != nil ||
+		refusal.Units != nil || refusal.CustomPrice != nil || refusal.Status != nil && *refusal.Status != status {
+		return false
+	}
+	var messages []string
+	if common.GetJsonType(refusal.Message) == "string" {
+		var text string
+		if common.Unmarshal(refusal.Message, &text) != nil {
+			return false
+		}
+		messages = []string{text}
+	} else if len(refusal.Message) != 0 && common.Unmarshal(refusal.Message, &messages) != nil {
+		return false
+	}
+	if status != http.StatusBadRequest {
+		return strings.TrimSpace(refusal.Error) != "" || len(messages) > 0 && strings.TrimSpace(messages[0]) != ""
+	}
+	// Creem also uses 400/Bad Request for existing resources. Only an explicit
+	// input refusal (including the legacy string form) rules out a checkout.
+	for _, text := range messages {
+		switch strings.TrimSpace(text) {
+		case "Product not found", "The 'product_id' field is required.", "product_id must be a string", "success_url must be a valid URL":
+		default:
+			return false
+		}
+	}
+	return len(messages) != 0
 }
