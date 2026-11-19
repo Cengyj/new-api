@@ -203,6 +203,76 @@ test.each(['GBP', 'INVALID'])(
   }
 )
 
+test('Creem prevents purchase of invalid catalog terms while keeping valid offers available', async () => {
+  const terms = [
+    { price: '10' },
+    { price: 0 },
+    { price: 0.123 },
+    { quota: '100' },
+    { quota: 0 },
+    { quota: Number.MAX_SAFE_INTEGER + 1 },
+  ]
+  const offers = terms.map((term, index) => ({
+    ...creemProduct,
+    productId: `invalid-${index}`,
+    name: `Invalid offer ${index}`,
+    ...term,
+  }))
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...topupInfo, creem_products: [...offers, creemProduct] },
+    },
+  })
+  const post = vi.spyOn(api, 'post')
+  const { result } = renderHook(() => ({
+    catalog: topupInfoHooks.useTopupInfo(),
+    payment: useCreemPayment(),
+  }))
+  await waitFor(() => expect(result.current.catalog.loading).toBe(false))
+  const products = result.current.catalog.topupInfo?.creem_products ?? []
+  expect(products).toHaveLength(offers.length + 1)
+  const select = vi.fn()
+  const catalog = render(
+    <CreemProductsSection products={products} onProductSelect={select} />
+  )
+  expect(screen.getAllByText('Product configuration error')).toHaveLength(
+    offers.length
+  )
+  for (const [index, offer] of offers.entries()) {
+    expect(
+      screen.getByRole('button', { name: new RegExp(offer.name) })
+    ).toBeDisabled()
+    expect(
+      await result.current.payment.processCreemPayment(products[index])
+    ).toBe(false)
+  }
+  expect(post).not.toHaveBeenCalled()
+  await userEvent.click(screen.getByText(creemProduct.name))
+  expect(select).toHaveBeenCalledExactlyOnceWith(creemProduct)
+  catalog.unmount()
+  render(
+    <CreemConfirmDialog
+      open
+      onOpenChange={vi.fn()}
+      onConfirm={vi.fn()}
+      product={products[0]}
+      processing={false}
+    />
+  )
+  expect(screen.getByRole('button', { name: 'Confirm Payment' })).toBeDisabled()
+})
+
+test('Creem offer selection supports keyboard confirmation', async () => {
+  const select = vi.fn()
+  render(
+    <CreemProductsSection products={[creemProduct]} onProductSelect={select} />
+  )
+  await userEvent.tab()
+  await userEvent.keyboard('{Enter}')
+  expect(select).toHaveBeenCalledExactlyOnceWith(creemProduct)
+})
+
 test.each([
   { mode: 'USD', quantity: 10, preset: '10', confirmed: '$10', updated: '$10' },
   {

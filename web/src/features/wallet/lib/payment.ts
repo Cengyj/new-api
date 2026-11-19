@@ -28,6 +28,7 @@ import {
 } from '../constants'
 import type {
   ApiResponse,
+  CreemProduct,
   PaymentMethod,
   PresetAmount,
   TopupInfo,
@@ -68,6 +69,19 @@ export function hasPaymentDeclineResponse(error: unknown): boolean {
 
 export function isValidTopupAmount(amount: number): boolean {
   return Number.isSafeInteger(amount) && amount > 0
+}
+
+export function isPurchasableCreemProduct(
+  product: CreemProduct
+): product is CreemProduct & { currency: 'USD' | 'EUR' } {
+  return (
+    !!product.productId.trim() &&
+    (product.currency === 'USD' || product.currency === 'EUR') &&
+    Number.isFinite(product.price) &&
+    product.price >= 0.01 &&
+    Number(product.price.toFixed(2)) === product.price &&
+    isValidTopupAmount(product.quota)
+  )
 }
 
 export function isSafePaymentUrl(

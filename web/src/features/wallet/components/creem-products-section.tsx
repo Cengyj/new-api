@@ -18,12 +18,12 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { useTranslation } from 'react-i18next'
 
-import { Card, CardContent } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { formatNumber } from '@/lib/format'
-import { cn } from '@/lib/utils'
 
 import { formatCreemPrice } from '../lib/format'
+import { isPurchasableCreemProduct } from '../lib/payment'
 import type { CreemProduct } from '../types'
 
 interface CreemProductsSectionProps {
@@ -55,31 +55,31 @@ export function CreemProductsSection({
 
   return (
     <div className='grid grid-cols-2 gap-2 sm:grid-cols-2 sm:gap-3 md:grid-cols-3'>
-      {products.map((product) => (
-        <Card
-          key={product.productId}
-          data-card-hover='false'
-          className={cn(product.currency !== null && 'cursor-pointer')}
-          aria-disabled={product.currency === null}
-          onClick={
-            product.currency === null
-              ? undefined
-              : () => onProductSelect(product)
-          }
-        >
-          <CardContent className='p-3 text-center sm:p-4'>
-            <div className='mb-2 text-lg font-medium'>{product.name}</div>
-            <div className='text-muted-foreground mb-2 text-sm'>
+      {products.map((product) => {
+        const purchasable = isPurchasableCreemProduct(product)
+        return (
+          <Button
+            key={product.productId}
+            type='button'
+            variant='outline'
+            className='h-auto min-w-0 flex-col gap-2 rounded-xl p-3 text-center whitespace-normal sm:p-4'
+            disabled={!purchasable}
+            onClick={() => onProductSelect(product)}
+          >
+            <span className='max-w-full text-lg font-medium wrap-anywhere'>
+              {product.name}
+            </span>
+            <span className='text-muted-foreground text-sm'>
               {t('Quota')}: {formatNumber(product.quota)}
-            </div>
-            <div className='text-primary text-lg font-semibold'>
-              {product.currency === null
-                ? t('Product configuration error')
-                : formatCreemPrice(product.price, product.currency)}
-            </div>
-          </CardContent>
-        </Card>
-      ))}
+            </span>
+            <span className='text-primary text-lg font-semibold'>
+              {purchasable
+                ? formatCreemPrice(product.price, product.currency)
+                : t('Product configuration error')}
+            </span>
+          </Button>
+        )
+      })}
     </div>
   )
 }

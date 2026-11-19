@@ -23,7 +23,7 @@ import { toast } from 'sonner'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { requestCreemPayment, isApiSuccess } from '../api'
-import { isSafePaymentUrl } from '../lib/payment'
+import { isPurchasableCreemProduct, isSafePaymentUrl } from '../lib/payment'
 import type { CreemProduct } from '../types'
 import { usePaymentOperation } from './use-payment-operation'
 
@@ -33,8 +33,8 @@ export function useCreemPayment(
   const { processing, runPayment } = usePaymentOperation(onUnknownCheckout)
   const processCreemPayment = useCallback(
     async (product: CreemProduct) => {
-      if (!product.productId.trim() || product.currency === null) {
-        toast.error(i18next.t('Payment request failed'))
+      if (!isPurchasableCreemProduct(product)) {
+        toast.error(i18next.t('Product configuration error'))
         return false
       }
       return runPayment(

@@ -24,6 +24,7 @@ import { Button } from '@/components/ui/button'
 import { formatNumber } from '@/lib/format'
 
 import { formatCreemPrice } from '../../lib/format'
+import { isPurchasableCreemProduct } from '../../lib/payment'
 import type { CreemProduct } from '../../types'
 
 interface CreemConfirmDialogProps {
@@ -44,6 +45,7 @@ export function CreemConfirmDialog({
   const { t } = useTranslation()
 
   if (!product) return null
+  const purchasable = isPurchasableCreemProduct(product)
 
   return (
     <Dialog
@@ -66,10 +68,7 @@ export function CreemConfirmDialog({
           >
             {t('Cancel')}
           </Button>
-          <Button
-            onClick={onConfirm}
-            disabled={processing || product.currency === null}
-          >
+          <Button onClick={onConfirm} disabled={processing || !purchasable}>
             {processing && <Loader2 className='mr-2 h-4 w-4 animate-spin' />}
             {t('Confirm Payment')}
           </Button>
@@ -84,9 +83,9 @@ export function CreemConfirmDialog({
         <div className='flex items-center justify-between'>
           <span className='text-muted-foreground'>{t('Price')}</span>
           <span className='text-primary font-medium'>
-            {product.currency === null
-              ? t('Product configuration error')
-              : formatCreemPrice(product.price, product.currency)}
+            {purchasable
+              ? formatCreemPrice(product.price, product.currency)
+              : t('Product configuration error')}
           </span>
         </div>
         <div className='flex items-center justify-between'>

@@ -128,8 +128,8 @@ function parseCreemProducts(data: unknown): CreemProduct[] {
       return {
         name: typeof item.name === 'string' ? item.name : '',
         productId: typeof item.productId === 'string' ? item.productId : '',
-        price: Number(item.price) || 0,
-        quota: Number(item.quota) || 0,
+        price: typeof item.price === 'number' ? item.price : Number.NaN,
+        quota: typeof item.quota === 'number' ? item.quota : Number.NaN,
         currency,
       }
     })
