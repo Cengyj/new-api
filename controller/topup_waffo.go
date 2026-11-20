@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -186,6 +187,53 @@ func RequestWaffoAmount(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "success", "data": paymentAmount})
 }
 
+// Waffo supports app links as well as web pages. Match the wallet's
+// isSafePaymentUrl policy for schemes that load browser-local content.
+func usableWaffoRedirect(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || !u.IsAbs() {
+		return false
+	}
+	switch u.Scheme {
+	case "http", "https":
+		return common.ValidateHTTPEndpoint(u) == nil
+	case "javascript", "data", "vbscript", "file", "blob", "about":
+		return false
+	default:
+		return true
+	}
+}
+
+func waffoCheckoutURLs(notifyURL, returnURL, callbackAddress, serverAddress string) (string, string, error) {
+	if notifyURL == "" {
+		if callbackAddress == "" {
+			callbackAddress = serverAddress
+		}
+		u, err := walletCheckoutURL(callbackAddress, "/api/waffo/webhook")
+		if err != nil {
+			return "", "", err
+		}
+		notifyURL = u.String()
+	} else if _, err := common.ParseHTTPEndpoint(notifyURL); err != nil {
+		return "", "", common.NewMessage("Payment configuration error")
+	}
+
+	if returnURL == "" {
+		u, err := walletCheckoutURL(serverAddress, "/wallet?show_history=true")
+		if err != nil {
+			return "", "", err
+		}
+		returnURL = u.String()
+	} else if !usableWaffoRedirect(returnURL) {
+		return "", "", common.NewMessage("Payment configuration error")
+	}
+	// Waffo's create-order schema limits each URL to 1024 characters.
+	if utf8.RuneCountInString(notifyURL) > 1024 || utf8.RuneCountInString(returnURL) > 1024 {
+		return "", "", common.NewMessage("Payment configuration error")
+	}
+	return notifyURL, returnURL, nil
+}
+
 // RequestWaffoPay 创建 Waffo 支付订单
 func RequestWaffoPay(c *gin.Context) {
 	if !requirePaymentCompliance(c) {
@@ -293,6 +341,12 @@ func RequestWaffoPay(c *gin.Context) {
 		return
 	}
 
+	notifyURL, returnURL, err := waffoCheckoutURLs(configuredNotifyURL, configuredReturnURL, callbackAddress, serverAddress)
+	if err != nil {
+		paymentError(c, err)
+		return
+	}
+
 	// Both IDs share Waffo's 32-character paymentRequestId limit. The user
 	// binding is persisted below; it must not make this identifier grow.
 	merchantOrderId := "WAFFO-" + randstr.String(26)
@@ -333,18 +387,6 @@ func RequestWaffoPay(c *gin.Context) {
 		return
 	}
 
-	if callbackAddress == "" {
-		callbackAddress = serverAddress
-	}
-	notifyUrl := strings.TrimRight(callbackAddress, "/") + "/api/waffo/webhook"
-	if configuredNotifyURL != "" {
-		notifyUrl = configuredNotifyURL
-	}
-	returnUrl := strings.TrimRight(serverAddress, "/") + "/wallet?show_history=true"
-	if configuredReturnURL != "" {
-		returnUrl = configuredReturnURL
-	}
-
 	if currency == "" {
 		currency = "USD"
 	}
@@ -356,7 +398,7 @@ func RequestWaffoPay(c *gin.Context) {
 		OrderCurrency:    currency,
 		OrderDescription: goodsInfo.GoodsName,
 		OrderRequestedAt: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
-		NotifyURL:        notifyUrl,
+		NotifyURL:        notifyURL,
 		MerchantInfo: &order.MerchantInfo{
 			MerchantID: merchantID,
 		},
@@ -371,8 +413,8 @@ func RequestWaffoPay(c *gin.Context) {
 			PayMethodName: resolvedPayMethodName,
 		},
 		GoodsInfo:          goodsInfo,
-		SuccessRedirectURL: returnUrl,
-		FailedRedirectURL:  returnUrl,
+		SuccessRedirectURL: returnURL,
+		FailedRedirectURL:  returnURL,
 	}
 	resp, err := sdk.Order().Create(c.Request.Context(), createParams, nil)
 	if err != nil {
@@ -472,19 +514,21 @@ func resolveWaffoCheckoutResponse(topUp *model.TopUp, resp *core.ApiResponse[ord
 	default:
 		return "", common.NewMessage("Failed to start payment")
 	}
-	paymentURL := orderData.FetchRedirectURL()
-	if paymentURL == "" {
-		// Keep legacy plain URLs, but an incomplete or malformed action JSON
-		// is not a usable payment link and cannot establish checkout success.
-		if legacyURL, err := url.ParseRequestURI(orderData.OrderAction); err == nil && legacyURL.IsAbs() {
-			paymentURL = orderData.OrderAction
+	var action order.OrderAction
+	if err := common.UnmarshalJsonStr(orderData.OrderAction, &action); err != nil {
+		// Older orders carry the redirect itself instead of an action object.
+		if usableWaffoRedirect(orderData.OrderAction) {
+			return orderData.OrderAction, nil
 		}
+	} else if action.ActionType == "DEEPLINK" && action.DeeplinkURL != "" {
+		if usableWaffoRedirect(action.DeeplinkURL) {
+			return action.DeeplinkURL, nil
+		}
+	} else if _, err := common.ParseHTTPEndpoint(action.WebURL); err == nil {
+		// v1.3.2 also falls back to webUrl when a DEEPLINK has no deeplinkUrl.
+		return action.WebURL, nil
 	}
-	if strings.TrimSpace(paymentURL) == "" {
-		// An incomplete response does not prove the provider rejected the order.
-		return "", common.NewMessage("Failed to start payment")
-	}
-	return paymentURL, nil
+	return "", common.NewMessage("Failed to start payment")
 }
 
 type waffoPaymentNotification struct {

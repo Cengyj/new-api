@@ -2288,7 +2288,7 @@ func TestWalletCreemCheckoutBindsConfirmedOffer(t *testing.T) {
 func TestWalletCreemCheckoutHTTPPreservesFrozenOrderAndRecovery(t *testing.T) {
 	for _, scenario := range []string{
 		"success", "explicit_rejection", "malformed_json", "missing_checkout_url",
-		"blank_checkout_url", "mismatched_request_id", "http_401_with_checkout_url", "http_500_with_checkout_url",
+		"blank_checkout_url", "relative_checkout_url", "mismatched_request_id", "http_401_with_checkout_url", "http_500_with_checkout_url",
 		"truncated_body", "response_lost", "response_timeout", "callback_before_response",
 		"callback_before_response_loss", "caller_cancelled_after_acceptance",
 		"http_400_null", "http_400_empty_object", "callback_before_rejection",
@@ -2428,6 +2428,8 @@ func TestWalletCreemCheckoutHTTPPreservesFrozenOrderAndRecovery(t *testing.T) {
 					_, _ = io.WriteString(w, `{"id":"ch_fixture"}`)
 				case "blank_checkout_url":
 					_, _ = io.WriteString(w, `{"id":"ch_fixture","checkout_url":"   "}`)
+				case "relative_checkout_url":
+					_, _ = io.WriteString(w, `{"id":"ch_fixture","checkout_url":"/checkout/session"}`)
 				case "mismatched_request_id":
 					_, _ = io.WriteString(w, `{"id":"ch_fixture","request_id":"another-purchase","checkout_url":"`+checkoutURL+`"}`)
 				case "null_request_id", "empty_request_id":
@@ -2731,6 +2733,7 @@ func TestWalletReferralStripeCheckoutRejectionPreservesCompletionPolicy(t *testi
 		{"missing_checkout_url", http.StatusOK, `{}`, common.TopUpStatusPending},
 		{"empty_checkout_url", http.StatusOK, `{"url":""}`, common.TopUpStatusPending},
 		{"blank_checkout_url", http.StatusOK, `{"url":"   "}`, common.TopUpStatusPending},
+		{"relative_checkout_url", http.StatusOK, `{"id":"cs_fixture","url":"/checkout/session"}`, common.TopUpStatusPending},
 		{"mismatched_reference", http.StatusOK, `{"id":"cs_other","client_reference_id":"another-purchase","url":"https://checkout.example.invalid/other"}`, common.TopUpStatusPending},
 		{"null_reference", http.StatusOK, `{"client_reference_id":null,"url":"https://checkout.example.invalid/unbound"}`, common.TopUpStatusPending},
 		{"empty_reference", http.StatusOK, `{"client_reference_id":"","url":"https://checkout.example.invalid/unbound"}`, common.TopUpStatusPending},
@@ -3140,7 +3143,7 @@ func TestWalletCheckoutContinuesOnlyItsConfirmedInsert(t *testing.T) {
 }
 
 func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.T) {
-	for _, scenario := range []string{"late_callback", "manual_then_callback", "callback_before_response_loss", "non_json_remote_error", "session_http500", "session_http401", "token_http500", "token_http401", "session_timeout", "token_timeout", "missing_session_id", "blank_session_id", "empty_checkout_url", "blank_checkout_url", "empty_buyer_token", "blank_buyer_token", "successful_checkout"} {
+	for _, scenario := range []string{"late_callback", "manual_then_callback", "callback_before_response_loss", "non_json_remote_error", "session_http500", "session_http401", "token_http500", "token_http401", "session_timeout", "token_timeout", "missing_session_id", "blank_session_id", "empty_checkout_url", "blank_checkout_url", "relative_checkout_url", "conflicting_checkout_fragment", "empty_buyer_token", "blank_buyer_token", "successful_checkout"} {
 		t.Run(scenario, func(t *testing.T) {
 			router, keys := walletCheckoutFixture(t)
 			var quoted string
@@ -3250,10 +3253,15 @@ func TestWalletReferralPancakeUnknownCheckoutKeepsFrozenPendingOrder(t *testing.
 				case "blank_session_id":
 					_, _ = w.Write([]byte(`{"data":{"sessionId":"   ","checkoutUrl":"https://checkout.example.invalid/pancake","expiresAt":"2099-01-01T00:00:00Z"}}`))
 					return
-				case "empty_checkout_url", "blank_checkout_url":
+				case "empty_checkout_url", "blank_checkout_url", "relative_checkout_url", "conflicting_checkout_fragment":
 					checkoutURL := ""
-					if scenario == "blank_checkout_url" {
+					switch scenario {
+					case "blank_checkout_url":
 						checkoutURL = "   "
+					case "relative_checkout_url":
+						checkoutURL = "/checkout/session"
+					case "conflicting_checkout_fragment":
+						checkoutURL = "https://checkout.example.invalid/pancake#receipt"
 					}
 					_, _ = fmt.Fprintf(w, `{"data":{"sessionId":"CS_fixture","checkoutUrl":%q,"expiresAt":"2099-01-01T00:00:00Z"}}`, checkoutURL)
 					return
@@ -5972,6 +5980,9 @@ func TestWalletCallbacksRetryPostCommitCacheFailure(t *testing.T) {
 }
 
 func TestWalletStripeProductQuantityQuoteAndFrozenCredit(t *testing.T) {
+	oldServer := system_setting.ServerAddress
+	system_setting.ServerAddress = "https://console.example.invalid/gateway/"
+	t.Cleanup(func() { system_setting.ServerAddress = oldServer })
 	for _, scenario := range []struct {
 		display         string
 		ratio, discount float64
@@ -6021,6 +6032,8 @@ func TestWalletStripeProductQuantityQuoteAndFrozenCredit(t *testing.T) {
 					return
 				}
 				assert.Equal(t, "1", request.Form.Get("line_items[0][quantity]"))
+				assert.Equal(t, "https://console.example.invalid/gateway/usage-logs", request.Form.Get("success_url"))
+				assert.Equal(t, "https://console.example.invalid/gateway/wallet", request.Form.Get("cancel_url"))
 				assert.Equal(t, "price_fixture", request.Form.Get("line_items[0][price]"))
 				assert.Equal(t, "line_items", request.Form.Get("expand[0]"))
 				assert.Equal(t, "true", request.Form.Get("allow_promotion_codes"))
@@ -8058,21 +8071,141 @@ func TestWalletWaffoInquiryBindsMerchantOrderBeforeSettlement(t *testing.T) {
 	}
 }
 
-func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
+func TestWalletCheckoutRejectsUnroutableConfiguredAddresses(t *testing.T) {
+	const site = "https://site.example"
+	longBase := site + "/" + strings.Repeat("a", 1024-len(site+"/"))
 	for _, tc := range []struct {
-		name           string
-		status         int
-		signature      string
-		code           string
-		accepted       bool
-		rejected       bool
-		customCallback string
-		notifyOverride string
-		wantNotify     string
+		name, provider, server, callback, notify, returnURL string
+	}{
+		{"waffo_callback_base_with_query", model.PaymentProviderWaffo, site, "https://pay.example/gateway?lang=en", "", ""},
+		{"waffo_relative_notification", model.PaymentProviderWaffo, site, "", "/notify", ""},
+		{"waffo_return_base_with_fragment", model.PaymentProviderWaffo, site + "/#dashboard", "", "https://pay.example/notify", ""},
+		{"waffo_relative_return", model.PaymentProviderWaffo, site, "", "", "/wallet"},
+		{"waffo_browser_local_return", model.PaymentProviderWaffo, site, "", "", "about:blank"},
+		{"waffo_return_with_invalid_port", model.PaymentProviderWaffo, site, "", "", "https://site.example:65536/wallet"},
+		{"waffo_non_http_notification", model.PaymentProviderWaffo, site, "", "merchantapp://payments/notify", ""},
+		{"waffo_long_notification", model.PaymentProviderWaffo, site, "", longBase + "a", ""},
+		{"waffo_long_derived_return", model.PaymentProviderWaffo, longBase, "", site + "/notify", ""},
+		{"stripe_default_redirect_with_query", model.PaymentProviderStripe, site + "/gateway?lang=en", "", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, _ := walletCheckoutFixture(t)
+			oldServer, oldCallback := system_setting.ServerAddress, operation_setting.CustomCallbackAddress
+			oldNotify, oldReturn := setting.WaffoNotifyUrl, setting.WaffoReturnUrl
+			t.Cleanup(func() {
+				system_setting.ServerAddress, operation_setting.CustomCallbackAddress = oldServer, oldCallback
+				setting.WaffoNotifyUrl, setting.WaffoReturnUrl = oldNotify, oldReturn
+			})
+			system_setting.ServerAddress, operation_setting.CustomCallbackAddress = tc.server, tc.callback
+			setting.WaffoNotifyUrl, setting.WaffoReturnUrl = tc.notify, tc.returnURL
+
+			requests := 0
+			handler := RequestWaffoPay
+			if tc.provider == model.PaymentProviderStripe {
+				handler = RequestStripePay
+				previous := stripe.GetBackend(stripe.APIBackend)
+				stripe.SetBackend(stripe.APIBackend, stripe.GetBackendWithConfig(stripe.APIBackend, &stripe.BackendConfig{
+					MaxNetworkRetries: stripe.Int64(0),
+					HTTPClient: &http.Client{Transport: walletCheckoutTransport(func(*http.Request) (*http.Response, error) {
+						requests++
+						return nil, errors.New("local checkout fixture")
+					})},
+				}))
+				t.Cleanup(func() { stripe.SetBackend(stripe.APIBackend, previous) })
+			} else {
+				service.WaffoHTTPTransport = walletWaffoSDKTransport(func(context.Context, *waffonet.HttpRequest) (*waffonet.HttpResponse, error) {
+					requests++
+					return nil, errors.New("local checkout fixture")
+				})
+			}
+			router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, handler)
+			request := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(fmt.Sprintf(`{"amount":100,"payment_method":%q}`, tc.provider)))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			assert.Equal(t, http.StatusOK, response.Code)
+			assert.Contains(t, response.Body.String(), "Payment configuration error")
+			assert.Zero(t, requests)
+			var count int64
+			require.NoError(t, model.DB.Model(&model.TopUp{}).Count(&count).Error)
+			assert.Zero(t, count)
+		})
+	}
+}
+
+func TestWalletStripeCheckoutCustomRedirects(t *testing.T) {
+	const base = "https://site.example/gate%2Fway"
+	const success = "https://shop.example:8443/orders?session={CHECKOUT_SESSION_ID}#done"
+	const cancel = "https://shop.example/billing/%2F?view=wallet"
+	oldDomains, oldServer := constant.TrustedRedirectDomains, system_setting.ServerAddress
+	t.Cleanup(func() { constant.TrustedRedirectDomains, system_setting.ServerAddress = oldDomains, oldServer })
+	constant.TrustedRedirectDomains = []string{"shop.example"}
+	for _, tc := range []struct {
+		name, server, success, cancel, wantSuccess, wantCancel, errorKey string
+	}{
+		{"custom_success", base + "/", success, "", success, base + "/wallet", ""},
+		{"custom_cancel", base, "", cancel, base + "/usage-logs", cancel, ""},
+		{"both_custom", "/unused", success, cancel, success, cancel, ""},
+		{"invalid_success_port", base, "https://shop.example:65536/p", cancel, "", "", "Payment success redirect URL is not in the trusted domain list"},
+		{"invalid_cancel_port", base, "", "https://shop.example:0/p", "", "", "Payment cancel redirect URL is not in the trusted domain list"},
+		{"untrusted_override", base, success, "https://elsewhere.example/p", "", "", "Payment cancel redirect URL is not in the trusted domain list"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			router, _ := walletCheckoutFixture(t)
+			system_setting.ServerAddress = tc.server
+			var sent url.Values
+			previous := stripe.GetBackend(stripe.APIBackend)
+			t.Cleanup(func() { stripe.SetBackend(stripe.APIBackend, previous) })
+			stripe.SetBackend(stripe.APIBackend, stripe.GetBackendWithConfig(stripe.APIBackend, &stripe.BackendConfig{
+				MaxNetworkRetries: stripe.Int64(0),
+				HTTPClient: &http.Client{Transport: walletCheckoutTransport(func(r *http.Request) (*http.Response, error) {
+					require.NoError(t, r.ParseForm())
+					sent = r.PostForm
+					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"id":"cs_fixture","url":"https://checkout.example/session"}`))}, nil
+				})},
+			}))
+			router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestStripePay)
+			body, err := common.Marshal(StripePayRequest{Amount: 100, PaymentMethod: model.PaymentMethodStripe, SuccessURL: tc.success, CancelURL: tc.cancel})
+			require.NoError(t, err)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/checkout", bytes.NewReader(body)))
+			var orders int64
+			require.NoError(t, model.DB.Model(&model.TopUp{}).Count(&orders).Error)
+			if tc.errorKey != "" {
+				assert.Equal(t, http.StatusBadRequest, w.Code)
+				assert.Contains(t, w.Body.String(), tc.errorKey)
+				assert.Nil(t, sent)
+				assert.Zero(t, orders)
+				return
+			}
+			require.Contains(t, w.Body.String(), `"message":"success"`)
+			assert.Equal(t, tc.wantSuccess, sent.Get("success_url"))
+			assert.Equal(t, tc.wantCancel, sent.Get("cancel_url"))
+			assert.EqualValues(t, 1, orders)
+		})
+	}
+}
+
+func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
+	const returnPrefix = "https://merchant.example/checkout%2Fdone?lang=zh#"
+	returnAtLimit := returnPrefix + strings.Repeat("界", 1024-len(returnPrefix))
+	for _, tc := range []struct {
+		name                               string
+		status                             int
+		signature                          string
+		code                               string
+		accepted                           bool
+		rejected                           bool
+		customCallback                     string
+		notifyOverride                     string
+		wantNotify                         string
+		server, returnOverride, wantReturn string
 	}{
 		{name: "valid_signed", status: 200, signature: "valid", code: "0", accepted: true},
-		{name: "default_callback_trailing_slash", status: 200, signature: "valid", code: "0", accepted: true, customCallback: "https://callback.example.invalid/", wantNotify: "https://callback.example.invalid/api/waffo/webhook"},
-		{name: "explicit_callback_override", status: 200, signature: "valid", code: "0", accepted: true, customCallback: "https://callback.example.invalid/", notifyOverride: "https://waffo.example.invalid/explicit-webhook/", wantNotify: "https://waffo.example.invalid/explicit-webhook/"},
+		{name: "default_callback_trailing_slash", status: 200, signature: "valid", code: "0", accepted: true, customCallback: "https://callback.example.invalid/gateway/", wantNotify: "https://callback.example.invalid/gateway/api/waffo/webhook",
+			server: "https://merchant.example/shop%2Ffront/", wantReturn: "https://merchant.example/shop%2Ffront/wallet?show_history=true"},
+		{name: "explicit_callback_override", status: 200, signature: "valid", code: "0", accepted: true, customCallback: "/unused", notifyOverride: "https://waffo.example.invalid/explicit-webhook/?site=local", wantNotify: "https://waffo.example.invalid/explicit-webhook/?site=local",
+			server: "/unused", returnOverride: returnAtLimit, wantReturn: returnAtLimit},
 		{name: "lowercase_signature", status: 200, signature: "lowercase", code: "0", accepted: true},
 		{name: "mixed_case_signature", status: 200, signature: "mixed_case", code: "0", accepted: true},
 		{name: "other_payment_request", status: 200, signature: "valid", code: "0"},
@@ -8080,9 +8213,15 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 		{name: "missing_payment_request", status: 200, signature: "valid", code: "0"},
 		{name: "missing_merchant_order", status: 200, signature: "valid", code: "0"},
 		{name: "blank_checkout_url", status: 200, signature: "valid", code: "0"},
+		{name: "relative_web_action", status: 200, signature: "valid", code: "0"},
+		{name: "app_link_in_web_action", status: 200, signature: "valid", code: "0"},
+		{name: "browser_local_deep_link", status: 200, signature: "valid", code: "0"},
+		{name: "legacy_plain_link", status: 200, signature: "valid", code: "0", accepted: true},
+		{name: "deep_link_web_fallback", status: 200, signature: "valid", code: "0", accepted: true},
 		{name: "missing_action_url", status: 200, signature: "valid", code: "0"},
 		{name: "malformed_action_json", status: 200, signature: "valid", code: "0"},
-		{name: "valid_deep_link", status: 200, signature: "valid", code: "0", accepted: true},
+		{name: "valid_deep_link", status: 200, signature: "valid", code: "0", accepted: true,
+			server: "https://merchant.example", returnOverride: "merchantapp://wallet/receipt?id=1", wantReturn: "merchantapp://wallet/receipt?id=1"},
 		{name: "paid_with_old_action", status: 200, signature: "valid", code: "0"},
 		{name: "closed_with_old_action", status: 200, signature: "valid", code: "0"},
 		{name: "nil_response", status: 200, signature: "valid", code: "0"},
@@ -8113,15 +8252,20 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 			oldPrice, oldMin := setting.WaffoUnitPrice, setting.WaffoMinTopUp
 			oldMerchant, oldCurrency := setting.WaffoMerchantId, setting.WaffoCurrency
 			oldCustom, oldNotify := operation_setting.CustomCallbackAddress, setting.WaffoNotifyUrl
+			oldServer, oldReturn := system_setting.ServerAddress, setting.WaffoReturnUrl
 			t.Cleanup(func() {
 				setting.WaffoUnitPrice, setting.WaffoMinTopUp = oldPrice, oldMin
 				setting.WaffoMerchantId, setting.WaffoCurrency = oldMerchant, oldCurrency
 				operation_setting.CustomCallbackAddress, setting.WaffoNotifyUrl = oldCustom, oldNotify
+				system_setting.ServerAddress, setting.WaffoReturnUrl = oldServer, oldReturn
 			})
 			setting.WaffoUnitPrice, setting.WaffoMinTopUp = 1, 1
 			setting.WaffoMerchantId, setting.WaffoCurrency = "merchant_checkout", "USD"
 			if tc.wantNotify != "" {
 				operation_setting.CustomCallbackAddress, setting.WaffoNotifyUrl = tc.customCallback, tc.notifyOverride
+			}
+			if tc.wantReturn != "" {
+				system_setting.ServerAddress, setting.WaffoReturnUrl = tc.server, tc.returnOverride
 			}
 			inquiryTransport := service.WaffoHTTPTransport
 			var outgoing order.CreateOrderParams
@@ -8144,6 +8288,16 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 					created.MerchantOrderID = ""
 				case "blank_checkout_url":
 					created.OrderAction = `{"actionType":"WEB","webUrl":"   "}`
+				case "relative_web_action":
+					created.OrderAction = `{"actionType":"WEB","webUrl":"/checkout/session"}`
+				case "app_link_in_web_action":
+					created.OrderAction = `{"actionType":"WEB","webUrl":"merchantapp://checkout/receipt"}`
+				case "browser_local_deep_link":
+					created.OrderAction = `{"actionType":"DEEPLINK","deeplinkUrl":"about:blank"}`
+				case "legacy_plain_link":
+					created.OrderAction = "https://checkout.example.invalid/legacy?order=1#payment"
+				case "deep_link_web_fallback":
+					created.OrderAction = `{"actionType":"DEEPLINK","webUrl":"https://checkout.example.invalid/fallback"}`
 				case "missing_action_url":
 					created.OrderAction = `{"actionType":"WEB"}`
 				case "malformed_action_json":
@@ -8202,6 +8356,10 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 			if tc.wantNotify != "" {
 				assert.Equal(t, tc.wantNotify, outgoing.NotifyURL)
 			}
+			if tc.wantReturn != "" {
+				assert.Equal(t, tc.wantReturn, outgoing.SuccessRedirectURL)
+				assert.Equal(t, tc.wantReturn, outgoing.FailedRedirectURL)
+			}
 			var decoded struct {
 				Message    string
 				MessageKey string `json:"message_key"`
@@ -8213,6 +8371,10 @@ func TestWalletWaffoCreateRequiresAuthenticHTTPResponse(t *testing.T) {
 				assert.Equal(t, "success", decoded.Message)
 				if tc.name == "valid_deep_link" {
 					assert.Contains(t, string(decoded.Data), `"payment_url":"alipays://platformapi/startapp?appId=20000067"`)
+				} else if tc.name == "legacy_plain_link" {
+					assert.Contains(t, string(decoded.Data), `"payment_url":"https://checkout.example.invalid/legacy?order=1#payment"`)
+				} else if tc.name == "deep_link_web_fallback" {
+					assert.Contains(t, string(decoded.Data), `"payment_url":"https://checkout.example.invalid/fallback"`)
 				}
 			} else {
 				assert.Equal(t, "error", decoded.Message)
@@ -8853,6 +9015,41 @@ func TestEpayCheckoutCallbackBasePreservesReachablePaths(t *testing.T) {
 			var rebates int64
 			require.NoError(t, model.DB.Model(&model.ReferralRebate{}).Count(&rebates).Error)
 			assert.Zero(t, rebates, "checkout alone must not award a wallet rebate")
+		})
+	}
+}
+
+func TestWalletEpayCheckoutPreservesEscapedGatewayPath(t *testing.T) {
+	for _, tc := range []struct{ mode, path string }{
+		{operation_setting.EpaySignTypeMD5, "/submit.php"},
+		{operation_setting.EpaySignTypeRSA, "/api/pay/submit"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			router, _ := walletCheckoutFixture(t)
+			const gateway = "https://cashier.example/tenant%2Fone"
+			operation_setting.PayAddress = gateway + "/?shop=1"
+			payment := operation_setting.GetPaymentSetting()
+			payment.EpaySignType = tc.mode
+			if tc.mode == operation_setting.EpaySignTypeRSA {
+				payment.EpayMerchantPrivateKey, payment.EpayPlatformPublicKey = newEpayRSAKeyPairForTest(t)
+			}
+			router.POST("/checkout", func(c *gin.Context) { c.Set("id", 902) }, RequestEpay)
+			r := httptest.NewRequest(http.MethodPost, "/checkout", strings.NewReader(`{"amount":100,"payment_method":"alipay"}`))
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, r)
+			var reply struct {
+				Message, URL string
+				Data         map[string]string
+			}
+			require.NoError(t, common.Unmarshal(w.Body.Bytes(), &reply))
+			require.Equal(t, "success", reply.Message)
+			assert.Equal(t, gateway+tc.path+"?shop=1", reply.URL)
+			stored, err := model.GetTopUpByTradeNoWithError(reply.Data["out_trade_no"])
+			require.NoError(t, err)
+			assert.Equal(t, common.TopUpStatusPending, stored.Status)
+			verified, err := GetEpayClient().Verify(reply.Data)
+			require.NoError(t, err)
+			assert.True(t, verified.VerifyStatus)
 		})
 	}
 }

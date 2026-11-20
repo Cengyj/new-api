@@ -119,6 +119,11 @@ func (*StripeAdaptor) RequestPay(c *gin.Context, req *StripePayRequest) {
 		common.ApiErrorStatus(c, http.StatusBadRequest, common.NewMessage("Payment cancel redirect URL is not in the trusted domain list"), gin.H{"data": ""})
 		return
 	}
+	successURL, cancelURL, err := checkoutConfig.redirectURLs(req.SuccessURL, req.CancelURL)
+	if err != nil {
+		paymentError(c, err)
+		return
+	}
 
 	id := c.GetInt("id")
 	user, err := model.GetUserById(id, false)
@@ -162,7 +167,7 @@ func (*StripeAdaptor) RequestPay(c *gin.Context, req *StripePayRequest) {
 		paymentOrderCreateError(c, referenceId, err)
 		return
 	}
-	payLink, err := checkoutConfig.link(referenceId, user.StripeCustomer, user.Email, req.Amount, req.SuccessURL, req.CancelURL)
+	payLink, err := checkoutConfig.link(referenceId, user.StripeCustomer, user.Email, req.Amount, successURL, cancelURL)
 	if err != nil {
 		knownRejection := false
 		if stripeCheckoutRejected(err) {
@@ -570,6 +575,23 @@ func stripeCheckoutConfigLocked() stripeCheckoutConfig {
 		serverAddress: system_setting.ServerAddress, allowPromotionCodes: setting.StripePromotionCodesEnabled}
 }
 
+func (config stripeCheckoutConfig) redirectURLs(successURL, cancelURL string) (string, string, error) {
+	if successURL != "" && cancelURL != "" {
+		return successURL, cancelURL, nil
+	}
+	base, err := walletCheckoutURL(config.serverAddress, "/")
+	if err != nil {
+		return "", "", err
+	}
+	if successURL == "" {
+		successURL = base.String() + "usage-logs"
+	}
+	if cancelURL == "" {
+		cancelURL = base.String() + "wallet"
+	}
+	return successURL, cancelURL, nil
+}
+
 // genStripeLink generates a Stripe Checkout session URL for payment.
 // It creates a new checkout session with the specified parameters and returns the payment URL.
 //
@@ -586,19 +608,15 @@ func genStripeLink(referenceId string, customerId string, email string, amount i
 	common.OptionMapRWMutex.RLock()
 	config := stripeCheckoutConfigLocked()
 	common.OptionMapRWMutex.RUnlock()
+	successURL, cancelURL, err := config.redirectURLs(successURL, cancelURL)
+	if err != nil {
+		return "", err
+	}
 	return config.link(referenceId, customerId, email, amount, successURL, cancelURL)
 }
 
 func (config stripeCheckoutConfig) link(referenceId, customerId, email string, amount int64, successURL, cancelURL string) (string, error) {
 	priceID, apiSecret, allowPromotionCodes := config.priceID, config.apiSecret, config.allowPromotionCodes
-	// Use custom URLs if provided, otherwise use defaults
-	if successURL == "" {
-		successURL = strings.TrimRight(config.serverAddress, "/") + "/usage-logs"
-	}
-	if cancelURL == "" {
-		cancelURL = strings.TrimRight(config.serverAddress, "/") + "/wallet"
-	}
-
 	params := &stripe.CheckoutSessionParams{
 		ClientReferenceID: stripe.String(referenceId),
 		SuccessURL:        stripe.String(successURL),
@@ -629,11 +647,8 @@ func (config stripeCheckoutConfig) link(referenceId, customerId, email string, a
 	if err != nil {
 		return "", err
 	}
-	if result == nil || strings.TrimSpace(result.URL) == "" {
-		return "", errors.New("Stripe checkout response is missing a payment URL")
-	}
 	// With redirects disabled v81 can still decode a 3xx body as a session.
-	if result.LastResponse == nil || result.LastResponse.StatusCode/100 != 2 {
+	if result == nil || result.LastResponse == nil || result.LastResponse.StatusCode/100 != 2 {
 		return "", errors.New("Stripe did not confirm checkout creation")
 	}
 	// The SDK ignores an error alongside a session and maps an omitted livemode
@@ -676,6 +691,9 @@ func (config stripeCheckoutConfig) link(referenceId, customerId, email string, a
 		return "", errors.New("Stripe did not return an open wallet checkout")
 	}
 
+	if _, err := common.ParseHTTPEndpoint(result.URL); err != nil {
+		return "", errors.New("Stripe returned an invalid checkout URL")
+	}
 	return result.URL, nil
 }
 

@@ -404,22 +404,11 @@ func rejectInvalidTopUpQuota(c *gin.Context, userId int, amount int64, displayTy
 	return creditedQuota, false
 }
 
-// Epay signs these addresses as supplied. A relative path or a path appended
-// after a query/fragment cannot route the provider to the configured endpoint.
-func usableEpayHTTPEndpoint(u *url.URL) bool {
-	if (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
-		return false
-	}
-	if port := u.Port(); port != "" {
-		n, err := strconv.ParseUint(port, 10, 16)
-		return err == nil && n != 0
-	}
-	return true
-}
-
-func epayCheckoutURL(base, route string) (*url.URL, error) {
-	u, err := url.Parse(strings.TrimRight(base, "/") + route)
-	if err != nil || !usableEpayHTTPEndpoint(u) || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+// Appending a route to a query or fragment would send the provider to a
+// different path. Keep valid site prefixes and their existing escaping.
+func walletCheckoutURL(base, route string) (*url.URL, error) {
+	u, err := common.ParseHTTPEndpoint(strings.TrimRight(base, "/") + route)
+	if err != nil || u.User != nil || strings.ContainsAny(base, "?#") {
 		return nil, common.NewMessage("Payment configuration error")
 	}
 	return u, nil
@@ -493,12 +482,12 @@ func RequestEpay(c *gin.Context) {
 	if callbackAddress == "" {
 		callbackAddress = serverAddress
 	}
-	returnUrl, err := epayCheckoutURL(serverAddress, "/usage-logs")
+	returnUrl, err := walletCheckoutURL(serverAddress, "/usage-logs")
 	if err != nil {
 		paymentError(c, err)
 		return
 	}
-	notifyUrl, err := epayCheckoutURL(callbackAddress, "/api/user/epay/notify")
+	notifyUrl, err := walletCheckoutURL(callbackAddress, "/api/user/epay/notify")
 	if err != nil {
 		paymentError(c, err)
 		return
@@ -512,7 +501,7 @@ func RequestEpay(c *gin.Context) {
 	}
 	// The SDK also accepts relative and opaque base URLs. They cannot deliver
 	// this checkout form; this is a new-sale check, not a callback prerequisite.
-	if !usableEpayHTTPEndpoint(client.BaseUrl) {
+	if common.ValidateHTTPEndpoint(client.BaseUrl) != nil {
 		paymentError(c, common.NewMessage("Payment configuration error"))
 		return
 	}
@@ -530,6 +519,15 @@ func RequestEpay(c *gin.Context) {
 		logger.LogError(c.Request.Context(), common.LogText("Epay failed to start payment user_id=%d trade_no=%s payment_method=%s amount=%d error=%q", id, tradeNo, req.PaymentMethod, req.Amount, err.Error()))
 		paymentError(c, common.NewMessage("Failed to start payment"))
 		return
+	}
+	// go-epay v0.0.6 joins the decoded Path. Preserve escaped tenant paths
+	// in the form action while retaining the SDK's signed parameters.
+	if client.BaseUrl.RawPath != "" {
+		submitPath := epay.PurchaseUrl
+		if config.SignType == epay.SignTypeRSA {
+			submitPath = epay.PurchaseRSAUrl
+		}
+		uri = client.BaseUrl.JoinPath(submitPath).String()
 	}
 	amount := req.Amount
 	if displayType == operation_setting.QuotaDisplayTypeTokens {

@@ -669,8 +669,8 @@ func (config creemCheckoutConfig) link(ctx context.Context, referenceId string, 
 		}
 	}
 
-	if strings.TrimSpace(checkoutResp.CheckoutUrl) == "" {
-		return "", fmt.Errorf("Creem API resp no checkout url ")
+	if _, err := common.ParseHTTPEndpoint(checkoutResp.CheckoutUrl); err != nil {
+		return "", errors.New("Creem returned an invalid checkout URL")
 	}
 
 	logger.LogInfo(ctx, common.LogText("Creem payment link created trade_no=%s response_id=%s", referenceId, checkoutResp.Id))
